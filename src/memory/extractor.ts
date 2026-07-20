@@ -1,6 +1,7 @@
 import type { ChatMessage, DeepSeekClient } from '../llm/deepseek.ts';
 import type { ConversationHistory } from '../context/history.ts';
 import type { MemoryService } from './service.ts';
+import { loadMemoryConfig } from './config.ts';
 
 /**
  * 会话结束自动抽取用户偏好（Phase 3）：把一次会话里「跨会话稳定、可复用」的用户偏好
@@ -135,7 +136,10 @@ export async function extractUserMemories(
       const dup = await store.isDuplicate(it.content).catch(() => false);
       if (dup) continue;
       if (it.kind === 'fact') {
-        store.addFact(it.content);
+        // P1b（M4）：硬事实默认写项目级（flag=false 与旧路径逐字节一致）；
+        // factScopeUser=true 时写用户级 ~/.dsa/memory，跨任务/跨项目可见。
+        const scope = loadMemoryConfig().factScopeUser ? 'user' : 'project';
+        store.addFact(it.content, scope);
       } else {
         await store.addEntry(it.content, it.tags);
       }
