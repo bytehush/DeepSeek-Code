@@ -1,4 +1,11 @@
-import { ChatMessage, DeepSeekClient, ToolCall } from '../llm/deepseek.ts';
+import { ChatMessage, DeepSeekClient, ToolCall, Role } from '../llm/deepseek.ts';
+
+/**
+ * 内部消息类型：在公共 ChatMessage 之上附一个可选的 `_marker`，
+ * 用于「每轮注入、下一轮替换」的带标记消息（M5 · P2a 记忆召回）。
+ * 仅本文件内部使用，对外 getMessages() 仍返回纯 ChatMessage[]（_marker 不泄露）。
+ */
+type DsaMessage = ChatMessage & { _marker?: string };
 
 /**
  * Token 估算启发式（无需 tokenizer，快速估算）。
@@ -80,7 +87,7 @@ function estimateMessageTokens(msg: ChatMessage): number {
  * 4. **回退机制**：若无 LLM client 可用（构造时未传入），降级为旧的轮数截断策略。
  */
 export class ConversationHistory {
-  private messages: ChatMessage[] = [];
+  private messages: DsaMessage[] = [];
   private systemPrompt: string;
   private maxTokens: number;
   private keepRecentRounds: number;
@@ -126,6 +133,25 @@ export class ConversationHistory {
 
   addToolResult(toolCallId: string, name: string, content: string): void {
     this.messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+    this.invalidateCache();
+  }
+
+  /**
+   * 移除所有带指定 marker 的消息（M5 · P2a 记忆召回：下一轮替换上一轮注入，
+   * 避免历史无限膨胀）。无匹配则不变。
+   */
+  removeMarked(marker: string): void {
+    const before = this.messages.length;
+    this.messages = this.messages.filter((m) => m._marker !== marker);
+    if (this.messages.length !== before) this.invalidateCache();
+  }
+
+  /**
+   * 追加一条带 marker 的消息（M5 · P2a 记忆召回注入点）。
+   * 调用方应先 removeMarked 同 marker 移除旧条，再 addMarked 新条。
+   */
+  addMarked(role: Role, content: string, marker: string): void {
+    this.messages.push({ role, content, _marker: marker });
     this.invalidateCache();
   }
 
@@ -182,9 +208,14 @@ export class ConversationHistory {
     }
     out = cleaned;
 
-    this._cached = out;
+    // 脱敏：移除内部 _marker（API 不认此字段），返回纯 ChatMessage[]。
+    const stripped = out.map((m) => {
+      const { _marker, ...rest } = m as DsaMessage;
+      return rest;
+    });
+    this._cached = stripped;
     this._dirty = false;
-    return out;
+    return stripped;
   }
 
   /**
