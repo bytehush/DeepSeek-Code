@@ -22,6 +22,8 @@ import type { StreamErrorCategory } from '../llm/deepseek.ts';
 import type { OutputStyle } from '../agent/output-style.ts';
 import { styleLabel, styleInstruction, parseStyle, saveStyle } from '../agent/output-style.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
+import { loadMemoryConfig } from '../memory/config.ts';
+import { MEMORY_RECALL_MARKER } from '../memory/pipeline.ts';
 import type { ReviseResult } from '../memory/revise.ts';
 import { msgOf } from '../utils/logger.ts';
 import { handleMemory, handleSkills, applyMemoryIntent } from './commands.ts';
@@ -540,6 +542,22 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
   const abortController = new AbortController();
   ctx.setActiveAbort(abortController);
   taskStart = Date.now();
+
+  // M5 · P2a：每轮重算语义召回并注入为带标记消息（perTurnCompose 开启时）。
+  // 先移除上一轮的同标记消息、再注入本轮召回块，避免历史无限膨胀（冲突 D）。
+  // flag 关闭（默认）不注入，行为与原 boot-only compose 逐字节一致。
+  if (!isCommand && loadMemoryConfig().perTurnCompose) {
+    try {
+      const base = ctx.props.history.systemPromptText;
+      const recall = await ctx.props.memoryStore.composeForTurn(base, runText, 5);
+      if (recall) {
+        ctx.props.history.removeMarked(MEMORY_RECALL_MARKER);
+        ctx.props.history.addMarked('system', recall, MEMORY_RECALL_MARKER);
+      }
+    } catch {
+      /* 召回失败安全降级：不注入，不影响本轮对话 */
+    }
+  }
 
   try {
     for await (const ev of runAgent(runText, {
