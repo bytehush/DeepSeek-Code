@@ -22,8 +22,7 @@ import type { StreamErrorCategory } from '../llm/deepseek.ts';
 import type { OutputStyle } from '../agent/output-style.ts';
 import { styleLabel, styleInstruction, parseStyle, saveStyle } from '../agent/output-style.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
-import { extractUserMemories } from '../memory/extractor.ts';
-import { reviseMemories, type ReviseResult } from '../memory/revise.ts';
+import type { ReviseResult } from '../memory/revise.ts';
 import { msgOf } from '../utils/logger.ts';
 import { handleMemory, handleSkills, applyMemoryIntent } from './commands.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
@@ -92,8 +91,6 @@ export interface ChatContext {
 }
 
 // ── 模块级可变状态（单活跃对话假设，骨架阶段够用） ──
-/** 会话结束自动抽取记忆的守卫，确保 /exit 与 waitUntilExit 两个退出路径只跑一次 */
-let extractionRan = false;
 /** 本轮任务起点（毫秒），用于结束后回显耗时 */
 let taskStart = 0;
 
@@ -152,11 +149,10 @@ function chatMessagesToUi(msgs: ChatMessage[]): UiMessage[] {
   return out;
 }
 
-/** 会话结束抽取用户偏好到记忆库（幂等守卫） */
+/** 会话结束抽取用户偏好到记忆库（幂等守卫已上移到 MemoryService 实例级） */
 export async function runExtraction(props: AppProps): Promise<number> {
-  if (extractionRan || !props.cfg.apiKey) return 0;
-  extractionRan = true;
-  return extractUserMemories(props.client, props.history, props.memoryStore).catch(() => 0);
+  if (!props.cfg.apiKey) return 0;
+  return props.memoryStore.extractAtTurnEnd(props.history, props.client);
 }
 
 /** 从对话历史取尾部片段，供记忆体检发现「用户已改变主意」。 */
@@ -173,16 +169,12 @@ function recentContextOf(history: AppProps['history']): string {
 
 /**
  * 会话结束自动整理记忆（陈旧性治理，带节流 + 幂等守卫）。
- * 复用 extractionRan 同款语义，确保退出路径只跑一次。无 key / 失败安全降级为 null。
+ * 守卫已上移到 MemoryService 实例级；无 key / 失败安全降级为 null。
  */
-let revisionRan = false;
 export async function runRevision(props: AppProps): Promise<ReviseResult | null> {
-  if (revisionRan || !props.cfg.apiKey) return null;
-  revisionRan = true;
+  if (!props.cfg.apiKey) return null;
   const transcript = recentContextOf(props.history);
-  return reviseMemories(props.client, props.memoryStore, { recentContext: transcript, force: false }).catch(
-    () => null,
-  );
+  return props.memoryStore.revise(props.client, { recentContext: transcript, force: false });
 }
 
 /**
@@ -379,10 +371,10 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     }
     ctx.push('system', '正在对记忆库做体检（检测过期 / 矛盾 / 冗余）…');
     const transcript = recentContextOf(ctx.props.history);
-    const rev = await reviseMemories(ctx.props.client, ctx.props.memoryStore, {
+    const rev = await ctx.props.memoryStore.revise(ctx.props.client, {
       recentContext: transcript,
       force: true,
-    }).catch(() => null);
+    });
     if (!rev) ctx.push('system', '记忆体检失败（模型调用异常），已跳过');
     else if (rev.skipped) ctx.push('system', rev.reason ?? '本次无需整理');
     else
