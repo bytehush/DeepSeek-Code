@@ -1,7 +1,8 @@
 import os from 'node:os';
 import { join } from 'node:path';
 import type { MemoryEntry, TrashItem } from './types.ts';
-import { MemoryStore } from './store.ts';
+import { createMemoryBackend } from './backend.ts';
+import type { MemoryBackend } from './backend.ts';
 import type { Embedder } from './embedder.ts';
 import { composeSystemPrompt } from './composer.ts';
 import type { ScoredMemory } from './retriever.ts';
@@ -25,13 +26,13 @@ export type Scope = 'user' | 'project';
  * - 无 API key / 嵌入失败时，两层都自动降级为关键词检索，不报错。
  */
 export class MemoryManager {
-  readonly user: MemoryStore;
-  readonly project: MemoryStore;
+  readonly user: MemoryBackend;
+  readonly project: MemoryBackend;
 
   constructor(cwd: string, embedder: Embedder) {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
-    this.user = new MemoryStore(join(home, '.dsa', 'memory'), embedder);
-    this.project = new MemoryStore(join(cwd, '.dsa', 'memory'), embedder);
+    this.user = createMemoryBackend(join(home, '.dsa', 'memory'), embedder);
+    this.project = createMemoryBackend(join(cwd, '.dsa', 'memory'), embedder);
   }
 
   /** 读取两层的常驻事实（MEMORY.md）。 */

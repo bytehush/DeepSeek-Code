@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from '
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MemoryEntry, TrashItem } from './types.ts';
-import type { Embedder } from './embedder.ts';
+import type { EmbedderBackend } from './embedder-backend.ts';
+import type { MemoryBackend } from './backend.ts';
 import { retrieve, retrieveScored, keywordScore, type ScoredMemory } from './retriever.ts';
 
 /**
@@ -29,9 +30,9 @@ const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  * - 用户级全局 = ~/.dsa/memory
  * 两层由 MemoryManager 聚合（见 manager.ts）。
  */
-export class MemoryStore {
+export class FileMemoryBackend implements MemoryBackend {
   private dir: string;
-  private embedder: Embedder;
+  private embedder: EmbedderBackend;
 
   /** ✅ 性能：readIndex 内存缓存，避免每次操作都从磁盘全量重读+解析 JSON */
   private _indexCache: MemoryEntry[] | null = null;
@@ -40,7 +41,7 @@ export class MemoryStore {
   private _factsCache: string | null = null;
   private _factsDirty = true;
 
-  constructor(baseDir: string, embedder: Embedder) {
+  constructor(baseDir: string, embedder: EmbedderBackend) {
     this.dir = baseDir;
     this.embedder = embedder;
   }
@@ -307,3 +308,6 @@ export class MemoryStore {
     return false;
   }
 }
+
+/** 兼容别名：保留旧名 MemoryStore，避免大范围改调用方（M1 零行为变更）。 */
+export { FileMemoryBackend as MemoryStore };

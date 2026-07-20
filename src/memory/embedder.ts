@@ -18,11 +18,13 @@
  * 记忆条目在写入时嵌入一次并缓存，避免每次检索都重算。
  */
 
+import type { EmbedderBackend } from './embedder-backend.ts';
+
 const LOCAL_MODEL = 'Xenova/bge-base-zh-v1.5';
 
 export type EmbedMode = 'local' | 'off';
 
-export class Embedder {
+export class BgeEmbedder implements EmbedderBackend {
   private mode: EmbedMode;
   private extractorPromise: Promise<unknown> | null = null;
 
@@ -67,3 +69,13 @@ export class Embedder {
     }
   }
 }
+
+/** 关闭嵌入：embed 恒返回 null，调用方据此退化为关键词召回。供后续阶段经工厂注入。 */
+export class NullEmbedder implements EmbedderBackend {
+  async embed(_text: string): Promise<number[] | null> {
+    return null;
+  }
+}
+
+/** 兼容别名：保留旧名 Embedder，避免大范围改调用方（M1 零行为变更）。 */
+export { BgeEmbedder as Embedder };
