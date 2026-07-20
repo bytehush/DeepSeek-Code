@@ -49,6 +49,13 @@ export interface MemoryService {
   compose(base: string, query: string, k?: number): Promise<string>;
 
   /**
+   * 每轮重算语义召回（M5 · P2a 修复 L2 boot-only 冻结）。
+   * 返回与当前 query 最相关的语义记忆召回块文本；query 空 / 无召回返回空串。
+   * 调用方（runChatTurn）每轮调用并把结果作为带标记消息注入对话，不重写 system 提示词。
+   */
+  composeForTurn(base: string, query: string, k?: number): Promise<string>;
+
+  /**
    * 会话结束自动抽取用户偏好（幂等实例守卫）。
    * 同实例重复调用只抽取一次；无 client 直接返回 0。返回新增条数。
    */

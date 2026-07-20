@@ -7,6 +7,7 @@ import type { EmbedderBackend } from './embedder-backend.ts';
 import { composeSystemPrompt } from './composer.ts';
 import type { ScoredMemory } from './retriever.ts';
 import type { MemoryService } from './service.ts';
+import { MemoryPipeline } from './pipeline.ts';
 import { extractUserMemories } from './extractor.ts';
 import { reviseMemories, type ReviseResult } from './revise.ts';
 import type { DeepSeekClient } from '../llm/deepseek.ts';
@@ -35,6 +36,9 @@ export class MemoryOrchestrator implements MemoryService {
   private _revised = false;
   /** 资源已释放标记：onDispose 后置位，阻止后续任何抽取/整理。 */
   private _disposed = false;
+
+  /** 每轮语义召回管线（M5 · P2a 修复 L2 boot-only 冻结）。 */
+  private readonly pipeline = new MemoryPipeline(this);
 
   constructor(cwd: string, embedder: EmbedderBackend) {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
@@ -104,6 +108,11 @@ export class MemoryOrchestrator implements MemoryService {
       .filter((s) => s.mode === 'keyword' || s.score >= VECTOR_MIN_SCORE)
       .map((s) => s.entry);
     return composeSystemPrompt(base, facts.user, facts.project, retrieved);
+  }
+
+  /** 每轮重算语义召回（M5 · P2a 修复 L2 boot-only 冻结）。 */
+  async composeForTurn(base: string, query: string, k = 5): Promise<string> {
+    return this.pipeline.composeForTurn(base, query, k);
   }
 
   /** 会话结束自动抽取用户偏好（幂等实例守卫；释放后不再抽取）。 */

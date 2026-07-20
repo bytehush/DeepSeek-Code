@@ -7,6 +7,7 @@ import type { Embedder } from './embedder.ts';
 import { composeSystemPrompt } from './composer.ts';
 import type { ScoredMemory } from './retriever.ts';
 import type { MemoryService } from './service.ts';
+import { MemoryPipeline } from './pipeline.ts';
 import { extractUserMemories } from './extractor.ts';
 import { reviseMemories, type ReviseResult } from './revise.ts';
 import type { DeepSeekClient } from '../llm/deepseek.ts';
@@ -37,6 +38,9 @@ export class MemoryManager implements MemoryService {
   /** 实例级守卫：抽取/整理只跑一次（替代旧 chat.ts 模块级守卫）。 */
   private _extracted = false;
   private _revised = false;
+
+  /** 每轮语义召回管线（M5 · P2a 修复 L2 boot-only 冻结）。 */
+  private readonly pipeline = new MemoryPipeline(this);
 
   constructor(cwd: string, embedder: Embedder) {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
@@ -130,6 +134,11 @@ export class MemoryManager implements MemoryService {
       .filter((s) => s.mode === 'keyword' || s.score >= VECTOR_MIN_SCORE)
       .map((s) => s.entry);
     return composeSystemPrompt(base, facts.user, facts.project, retrieved);
+  }
+
+  /** 每轮重算语义召回（M5 · P2a 修复 L2 boot-only 冻结）。 */
+  async composeForTurn(base: string, query: string, k = 5): Promise<string> {
+    return this.pipeline.composeForTurn(base, query, k);
   }
 
   /**
