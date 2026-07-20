@@ -13,6 +13,8 @@ import { SYSTEM_PROMPT } from '../agent/system-prompt.ts';
 import type { ChatMessage } from '../llm/deepseek.ts';
 import { Embedder } from '../memory/embedder.ts';
 import { MemoryManager } from '../memory/manager.ts';
+import { MemoryOrchestrator } from '../memory/orchestrator.ts';
+import { loadMemoryConfig } from '../memory/config.ts';
 import { createDelegateTool } from '../agent/subagent.ts';
 import { createTools, isDestructive } from '../tools/index.ts';
 import { ToolProviderManager } from '../mcp/manager.ts';
@@ -76,7 +78,10 @@ export async function assembleAppProps(
   const client = new DeepSeekClient(cfg);
 
   const embedder = new Embedder();
-  const memory = new MemoryManager(cwd, embedder);
+  const memoryConfig = loadMemoryConfig();
+  const memory = memoryConfig.useOrchestrator
+    ? new MemoryOrchestrator(cwd, embedder)
+    : new MemoryManager(cwd, embedder);
 
   // 技能目录用应用根（projectRoot），不随账号 dataDir 变化——技能是应用级能力
   const skillManager = new SkillManager(projectRoot);
