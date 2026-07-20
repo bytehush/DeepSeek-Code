@@ -118,3 +118,25 @@ export function detectMemoryIntent(input: string): MemoryIntent | null {
 
   return { content, scope, kind, rest };
 }
+
+/**
+ * 意图识别器接口（M2 架构抽象 · P0b 纯函数收口）。
+ * 当前实现 DefaultIntentDetector 直接委托 detectMemoryIntent，零逻辑改动；
+ * 后续阶段可替换为带缓存 / 批处理的实现。
+ */
+export interface IntentDetector {
+  /** 识别一句用户输入是否是「让我记住某事」的指令；命中返回 MemoryIntent，否则 null。 */
+  detect(input: string): MemoryIntent | null;
+}
+
+/** 默认意图识别器：委托 detectMemoryIntent。 */
+export class DefaultIntentDetector implements IntentDetector {
+  detect(input: string): MemoryIntent | null {
+    return detectMemoryIntent(input);
+  }
+}
+
+/** 工厂：默认意图识别器（依赖注入点）。 */
+export function createIntentDetector(): IntentDetector {
+  return new DefaultIntentDetector();
+}

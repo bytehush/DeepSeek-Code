@@ -44,3 +44,25 @@ export function composeSystemPrompt(
 
   return blocks.join('\n');
 }
+
+/**
+ * 拼接器接口（M2 架构抽象 · P0b 纯函数收口）。
+ * 当前实现 DefaultComposer 直接委托 composeSystemPrompt，零逻辑改动；
+ * 后续阶段（M5/P2a）可替换为「每轮重算」的编排实现。
+ */
+export interface Composer {
+  /** 把记忆组装进系统提示词，返回拼接后的完整 base。 */
+  compose(base: string, userFacts: string, projectFacts: string, retrieved: MemoryEntry[]): string;
+}
+
+/** 默认拼接器：委托 composeSystemPrompt。 */
+export class DefaultComposer implements Composer {
+  compose(base: string, userFacts: string, projectFacts: string, retrieved: MemoryEntry[]): string {
+    return composeSystemPrompt(base, userFacts, projectFacts, retrieved);
+  }
+}
+
+/** 工厂：默认拼接器（依赖注入点）。 */
+export function createComposer(): Composer {
+  return new DefaultComposer();
+}
