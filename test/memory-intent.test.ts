@@ -12,6 +12,19 @@ test('detectMemoryIntent: 仅语气句返回 null', () => {
   assert.equal(detectMemoryIntent('记住了吗'), null);
 });
 
+test('detectMemoryIntent: 「记住」前缀被识别', () => {
+  const r = detectMemoryIntent('记住 我用 pnpm');
+  assert.ok(r !== null, '应识别为记忆指令');
+  assert.ok(r!.content.includes('我用 pnpm'), `content 应含正文，实际: ${r?.content}`);
+});
+
+test('detectMemoryIntent: 「记一下」与「记住」等价', () => {
+  const a = detectMemoryIntent('记一下 项目用 TypeScript');
+  const b = detectMemoryIntent('记住 项目用 TypeScript');
+  assert.ok(a !== null && b !== null);
+  assert.equal(a!.content, b!.content);
+});
+
 test('detectMemoryIntent: 无内容返回 null', () => {
   assert.equal(detectMemoryIntent('记一下'), null);
   assert.equal(detectMemoryIntent('记一下   '), null);
