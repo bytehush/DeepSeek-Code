@@ -678,18 +678,20 @@ wss.on('connection', (ws, req) => {
       pushSystem(`当前保存的 API Key 无效：${v.error}。请打开顶栏 ⚙ API 重新配置。`);
       return;
     }
+    const activeId = activeTaskId;
+    if (!activeId) return;
     try {
-      const props = await ensureKernel(u, taskStore.dir(activeTaskId), creds, fileRoot(guiSettings));
+      const props = await ensureKernel(u, taskStore.dir(activeId), creds, fileRoot(guiSettings));
       host = makeHost(props);
       wireHost(host);
       // 自动恢复活跃任务的上一轮上下文（与 switch_task 同逻辑）。
       // 这样登录/刷新后 Agent 内核即带上历史，可「接着干」。
-      const replayed = await TraceLogger.replay(taskStore.dir(activeTaskId));
+      const replayed = await TraceLogger.replay(taskStore.dir(activeId));
       if (replayed && replayed.length) {
         props.history.loadMessages(replayed as never);
         props.client.resetUsage();
         replayToUi(replayed, fwd, host);
-        const activeMeta = await taskStore.get(activeTaskId);
+        const activeMeta = await taskStore.get(activeId);
         host.push('system', `已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.filter(m => m.role !== 'system').length} 条历史消息，可继续对话`);
       } else {
         host.welcome();
