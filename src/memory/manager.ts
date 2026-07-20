@@ -6,6 +6,11 @@ import type { MemoryBackend } from './backend.ts';
 import type { Embedder } from './embedder.ts';
 import { composeSystemPrompt } from './composer.ts';
 import type { ScoredMemory } from './retriever.ts';
+import type { MemoryService } from './service.ts';
+import { extractUserMemories } from './extractor.ts';
+import { reviseMemories, type ReviseResult } from './revise.ts';
+import type { DeepSeekClient } from '../llm/deepseek.ts';
+import type { ConversationHistory } from '../context/history.ts';
 
 /**
  * 记忆作用域：
@@ -25,9 +30,13 @@ export type Scope = 'user' | 'project';
  * - 子 Agent 不加载本管理器（隔离，保持 delegate 现状）。
  * - 无 API key / 嵌入失败时，两层都自动降级为关键词检索，不报错。
  */
-export class MemoryManager {
+export class MemoryManager implements MemoryService {
   readonly user: MemoryBackend;
   readonly project: MemoryBackend;
+
+  /** 实例级守卫：抽取/整理只跑一次（替代旧 chat.ts 模块级守卫）。 */
+  private _extracted = false;
+  private _revised = false;
 
   constructor(cwd: string, embedder: Embedder) {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
@@ -122,4 +131,35 @@ export class MemoryManager {
       .map((s) => s.entry);
     return composeSystemPrompt(base, facts.user, facts.project, retrieved);
   }
+
+  /**
+   * 会话结束自动抽取用户偏好（幂等实例守卫）。
+   * 复刻旧 chat.ts 模块级 `extractionRan` 语义：同实例只抽一次，无 client 返回 0。
+   */
+  async extractAtTurnEnd(history: ConversationHistory, client: DeepSeekClient): Promise<number> {
+    if (this._extracted || !client) return 0;
+    this._extracted = true;
+    return extractUserMemories(client, history, this).catch(() => 0);
+  }
+
+  /**
+   * 会话结束自动整理记忆（陈旧性治理，带节流 + 幂等实例守卫）。
+   * `force=true` 跳过守卫与节流（/dream 手动整理用）；否则守卫保证自动路径只跑一次。
+   * 复刻旧 chat.ts `revisionRan` 语义：`force` 不置守卫（/dream 与自动路径互不阻断）。
+   */
+  async revise(
+    client: DeepSeekClient,
+    opts: { recentContext?: string; force?: boolean } = {},
+  ): Promise<ReviseResult | null> {
+    if (!opts.force) {
+      if (this._revised || !client) return null;
+      this._revised = true;
+    }
+    return reviseMemories(client, this, { recentContext: opts.recentContext, force: opts.force }).catch(
+      () => null,
+    );
+  }
+
+  /** 资源释放钩子（M8 异步 I/O 前为空操作）。 */
+  onDispose(): void {}
 }
