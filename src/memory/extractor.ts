@@ -1,6 +1,6 @@
 import type { ChatMessage, DeepSeekClient } from '../llm/deepseek.ts';
 import type { ConversationHistory } from '../context/history.ts';
-import type { MemoryManager } from './manager.ts';
+import type { MemoryService } from './service.ts';
 
 /**
  * 会话结束自动抽取用户偏好（Phase 3）：把一次会话里「跨会话稳定、可复用」的用户偏好
@@ -110,7 +110,7 @@ function parseItems(raw: string): ExtractedItem[] {
 export async function extractUserMemories(
   client: DeepSeekClient,
   history: ConversationHistory,
-  store: MemoryManager,
+  store: MemoryService,
 ): Promise<number> {
   try {
     const transcript = buildTranscript(history);

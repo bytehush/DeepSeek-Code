@@ -5,7 +5,8 @@
  * 由 CLI（ink）与 网页后端（Node）共用——它们都只通过 `push(role, text)` 回调把结果
  * 回写给各自的 UI 层，自身不碰任何渲染。
  */
-import type { MemoryManager, Scope } from '../memory/manager.ts';
+import type { MemoryService } from '../memory/service.ts';
+import type { Scope } from '../memory/manager.ts';
 import type { SkillManager } from '../skills/loader.ts';
 import type { MemoryIntent } from '../memory/intent.ts';
 import type { MsgRole } from './types.ts';
@@ -17,7 +18,7 @@ import type { MsgRole } from './types.ts';
  */
 export async function handleMemory(
   raw: string,
-  manager: MemoryManager,
+  manager: MemoryService,
   push: (role: MsgRole, text: string) => void,
 ): Promise<void> {
   const parts = raw.trim().split(/\s+/);
@@ -200,7 +201,7 @@ export async function handleSkills(
  */
 export async function applyMemoryIntent(
   intent: MemoryIntent,
-  manager: MemoryManager,
+  manager: MemoryService,
   push: (role: MsgRole, text: string) => void,
 ): Promise<void> {
   const { content, scope, kind } = intent;

@@ -1,5 +1,6 @@
 import type { DeepSeekClient } from '../llm/deepseek.ts';
-import type { MemoryManager, Scope } from './manager.ts';
+import type { MemoryService } from './service.ts';
+import type { Scope } from './manager.ts';
 import type { MemoryEntry } from './types.ts';
 
 /**
@@ -132,7 +133,7 @@ export interface ReviseResult {
  */
 export async function proposeRevise(
   client: DeepSeekClient,
-  store: MemoryManager,
+  store: MemoryService,
   opts: { recentContext?: string; force?: boolean } = {},
 ): Promise<ReviseProposal> {
   const entries = store.list();
@@ -230,7 +231,7 @@ export async function proposeRevise(
  * 执行一份体检提案：删除/合并动作落盘（删除项先进回收站，可撤销），并刷新整理时间戳。
  * 与 proposeRevise 解耦，使 Web 端可以先预览、用户确认后再 apply。
  */
-export function applyProposal(store: MemoryManager, proposal: ReviseProposal): ReviseResult {
+export function applyProposal(store: MemoryService, proposal: ReviseProposal): ReviseResult {
   let deleted = 0;
   let merged = 0;
   for (const a of proposal.actions) {
@@ -255,7 +256,7 @@ export function applyProposal(store: MemoryManager, proposal: ReviseProposal): R
  */
 export async function reviseMemories(
   client: DeepSeekClient,
-  store: MemoryManager,
+  store: MemoryService,
   opts: { recentContext?: string; force?: boolean } = {},
 ): Promise<ReviseResult> {
   const proposal = await proposeRevise(client, store, opts);

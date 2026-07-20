@@ -9,7 +9,7 @@ import type { ConversationHistory } from '../context/history.ts';
 import type { TraceLogger } from '../context/trace.ts';
 import type { ToolDef } from '../tools/index.ts';
 import type { SessionManager } from '../agent/session.ts';
-import type { MemoryManager } from '../memory/manager.ts';
+import type { MemoryService } from '../memory/service.ts';
 import type { SkillManager } from '../skills/loader.ts';
 
 /** 消息角色（UI 与内核共用） */
@@ -40,7 +40,7 @@ export interface AppProps {
   /** P5: 启动时从磁盘恢复的历史会话数量（>0 时首屏提示） */
   restoredSessions?: number;
   /** 记忆层：跨会话用户记忆 + 轻量 RAG 预取 */
-  memoryStore: MemoryManager;
+  memoryStore: MemoryService;
   /** 应用版本号（来自 package.json，避免与 package.json 多处不一致） */
   version: string;
   /** 技能子系统管理器（项目级 + 全局级，白名单过滤） */
