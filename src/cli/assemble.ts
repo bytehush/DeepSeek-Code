@@ -78,9 +78,14 @@ export async function assembleAppProps(
   const client = new DeepSeekClient(cfg);
 
   const memoryConfig = loadMemoryConfig();
+  // 测试/离线环境可通过 DSA_EMBEDDER=off 跳过本地 BGE 模型加载（用 NullEmbedder，
+  // embed 恒返回 null → 关键词召回），让 assemble 在无法下载模型时也能跑通；
+  // 默认行为不变（embedderMirror 开 → remote，否则 local BGE）。
+  const embedderMode =
+    process.env.DSA_EMBEDDER === 'off' ? 'off' : memoryConfig.embedderMirror ? 'remote' : 'local';
   // M7: embedderMirror 开启 → 走 RemoteEmbedder（有 key 远程 / 无 key 本地降级 + 镜像）；
   // 关闭（默认）→ 等价于 new BgeEmbedder()，与 baseline 逐字节一致。
-  const embedder = createEmbedder(memoryConfig.embedderMirror ? 'remote' : 'local', {
+  const embedder = createEmbedder(embedderMode, {
     mirror: memoryConfig.embedderMirror,
   });
   // M8: 启动预热——提前加载嵌入模型，使首条记忆检索不卡顿；fire-and-forget，
