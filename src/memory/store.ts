@@ -14,6 +14,7 @@ import type { MemoryBackend } from './backend.ts';
 import { keywordScore, type ScoredMemory } from './retriever.ts';
 import { DefaultRetriever, type Retriever } from './retriever-iface.ts';
 import { VectorIndexRetriever } from './vector-retriever.ts';
+import { FileLock } from './lock.ts';
 
 /**
  * 记忆库：单作用域（baseDir 指定目录）双轨记忆的落盘与 CRUD。
@@ -36,6 +37,8 @@ import { VectorIndexRetriever } from './vector-retriever.ts';
 const FACTS_FILE = 'MEMORY.md';
 const INDEX_FILE = 'memories.json';
 const TRASH_FILE = 'trash.json';
+/** M10 跨进程 advisory lock 锁文件（仅 crossProcLock 开时创建/删除）。 */
+const LOCK_FILE = '.dsa-lock';
 /** 回收站保留时长（ms）：30 天后超期项在下次读取时自动清理。 */
 const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** 后台回收站 sweep 默认周期（ms）：6 小时。仅 bgTrashSweep 开时启用。 */
@@ -48,6 +51,8 @@ export interface FileMemoryBackendOpts {
   vectorIndex?: boolean;
   /** 后台回收站清理开关（M10）。true=setInterval 后台周期 sweep trash.json 超期项，读路径不再内联重写；false=读时清理现状（默认）。 */
   bgTrashSweep?: boolean;
+  /** 跨进程 advisory lock 开关（M10）。true=GUI+CLI 同写一 scope 时加文件锁包裹读-改-写临界区，防相互覆盖；false=无锁现状（默认）。 */
+  crossProcLock?: boolean;
 }
 
 /**
@@ -73,6 +78,10 @@ export class FileMemoryBackend implements MemoryBackend {
   private _bgSweep: boolean;
   /** M10 后台 sweep 定时器句柄（bgSweep 开时存在；unref 以免阻止进程退出）。 */
   private _sweepTimer: ReturnType<typeof setInterval> | undefined;
+  /** M10 跨进程 advisory lock 开关（crossProcLock）。true=加文件锁包裹临界区；false=无锁（默认）。 */
+  private _crossProcLock: boolean;
+  /** M10 跨进程锁实例（crossProcLock 开时创建）。 */
+  private _lock: FileLock | undefined;
 
   /** ✅ 性能：readIndex 内存缓存，避免每次操作都从磁盘全量重读+解析 JSON */
   private _indexCache: MemoryEntry[] | null = null;
@@ -96,6 +105,8 @@ export class FileMemoryBackend implements MemoryBackend {
     this._async = opts?.async ?? false;
     this._vectorIndex = opts?.vectorIndex ?? false;
     this._bgSweep = opts?.bgTrashSweep ?? false;
+    this._crossProcLock = opts?.crossProcLock ?? false;
+    if (this._crossProcLock) this._lock = new FileLock(join(this.dir, LOCK_FILE));
     this.retriever = this._vectorIndex
       ? new VectorIndexRetriever(new DefaultRetriever(), { versionProvider: () => this._version })
       : new DefaultRetriever();
@@ -119,16 +130,36 @@ export class FileMemoryBackend implements MemoryBackend {
    * 重入时就地执行可彻底解除该循环：opB 在 opA 的执行体内同步顺序跑完，opA 继续。
    */
   private enqueue<T>(op: () => Promise<T>): Promise<T> {
-    if (!this._async) return op();
+    if (!this._async) {
+      // 同步回退路径：直接用同步 fs，锁也走同步获取（临界区前后加/解）。
+      if (this._crossProcLock && !this._inOp) {
+        this._lock!.acquireSync();
+        // 跨进程：获取锁后强制从磁盘重读，避免读到另一进程写入前的陈旧内存缓存
+        this.invalidateIndex();
+        this._factsDirty = true;
+      }
+      try {
+        return op();
+      } finally {
+        if (this._crossProcLock && !this._inOp) this._lock!.releaseSync();
+      }
+    }
     if (this._inOp) return op();
     const prev = this._chain;
     const run = (async () => {
       await prev;
+      // M10 跨进程锁：获取锁后强制从磁盘重读，保证 read-modify-write 看到的是最新磁盘状态
+      if (this._crossProcLock) {
+        await this._lock!.acquire();
+        this.invalidateIndex();
+        this._factsDirty = true;
+      }
       this._inOp = true;
       try {
         return await op();
       } finally {
         this._inOp = false;
+        if (this._crossProcLock) await this._lock!.release();
       }
     })();
     // 链尾 = run 的状态（run 即调用方 await 的对象，无额外悬挂 tail）

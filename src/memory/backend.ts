@@ -58,10 +58,11 @@ export interface MemoryBackend {
 /**
  * 工厂：按 baseDir + embedder 构造文件后端。
  * 作为依赖注入点，后续阶段可在此切换实现而不动调用方。
- * asyncBackend / vectorIndex / bgTrashSweep flag 经 loadMemoryConfig 读取并透传给 FileMemoryBackend
- * （asyncBackend：true=异步 I/O 不阻塞事件循环，默认；false=同步回退，输出逐字节一致。
+ * asyncBackend / vectorIndex / bgTrashSweep / crossProcLock flag 经 loadMemoryConfig 读取并透传给
+ * FileMemoryBackend（asyncBackend：true=异步 I/O 不阻塞事件循环，默认；false=同步回退，输出逐字节一致。
  *  vectorIndex：true=预计算归一化矩阵向量化余弦 + 版本缓存，默认 false=线性扫描现状。
- *  bgTrashSweep：true=后台周期 sweep trash.json，默认 false=读时清理现状）。
+ *  bgTrashSweep：true=后台周期 sweep trash.json，默认 false=读时清理现状。
+ *  crossProcLock：true=跨进程文件锁包裹读-改-写临界区，默认 false=无锁现状）。
  */
 export function createMemoryBackend(
   baseDir: string,
@@ -72,5 +73,6 @@ export function createMemoryBackend(
   const async = opts?.async ?? cfg.asyncBackend;
   const vectorIndex = opts?.vectorIndex ?? cfg.vectorIndex;
   const bgTrashSweep = opts?.bgTrashSweep ?? cfg.bgTrashSweep;
-  return new FileMemoryBackend(baseDir, embedder, { async, vectorIndex, bgTrashSweep });
+  const crossProcLock = opts?.crossProcLock ?? cfg.crossProcLock;
+  return new FileMemoryBackend(baseDir, embedder, { async, vectorIndex, bgTrashSweep, crossProcLock });
 }
