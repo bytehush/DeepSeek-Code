@@ -120,7 +120,7 @@ type ServerMsg =
   | { type: 'auth_error'; message: string }
   | { type: 'message'; id: number; role: MsgRole; text: string; thinkingId?: number }
   | { type: 'update'; id: number; text: string }
-  | { type: 'reset'; messages: UiMessage[] }
+  | { type: 'reset'; messages: UiMessage[]; thinkings?: ThinkingTurn[] }
   | { type: 'state'; busy: boolean; mode: string; planMode: boolean; outputStyle: string; model?: string; currentIteration?: number; maxIterations?: number; browserWatch?: boolean }
   | { type: 'thinking_start'; turnId: number }
   | { type: 'thinking_entry'; id: number; kind: 'reason' | 'tool' | 'tool_result'; title?: string; text: string }
@@ -174,6 +174,25 @@ export interface ThinkingTurn {
   status: 'thinking' | 'outputting' | 'done' | 'interrupted';
   collapsed: boolean;
   entries: ThinkingEntry[];
+}
+
+/** 把服务端 reset 携带的 thinking（ReplayedThinkingTurn 形状）规整为前端 ThinkingTurn。 */
+function normalizeThinkings(raw: unknown): ThinkingTurn[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as Array<Record<string, unknown>>).map((t) => ({
+    turnId: Number(t.turnId),
+    status: String(t.status ?? 'done') as ThinkingTurn['status'],
+    collapsed: t.collapsed === undefined ? true : Boolean(t.collapsed),
+    entries: Array.isArray(t.entries)
+      ? (t.entries as Array<Record<string, unknown>>).map((e) => ({
+          id: Number(e.id),
+          kind: String(e.kind ?? 'reason') as ThinkingEntry['kind'],
+          title: e.title === undefined ? undefined : String(e.title),
+          text: String(e.text ?? ''),
+          status: String(e.status ?? 'done') as ThinkingEntry['status'],
+        }))
+      : [],
+  }));
 }
 
 /** API 设置浮层状态 */
@@ -310,6 +329,7 @@ export function App() {
   const messagesCacheRef = useRef<Map<string, { messages: UiMessage[]; thinkings: ThinkingTurn[] }>>(new Map());
   /** 当前激活任务 ID（从任务列表推导，用于缓存 key） */
   const activeTaskIdRef = useRef<string | null>(null);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   /** 思考盒：每轮对话的智能体思考过程（观察条目累积），与最终答案气泡分开 */
   const [thinkings, setThinkings] = useState<ThinkingTurn[]>([]);
   /** 是否正处于「输出最终答案」阶段（答案气泡显示「输出中…」） */
@@ -560,14 +580,15 @@ export function App() {
           break;
         case 'reset':
           clearPending();
-          setMessages(msg.messages.filter(Boolean));
-          setThinkings([]);
+          setMessages(msg.messages ? (msg.messages.filter(Boolean) as UiMessage[]) : []);
+          // 原子恢复思考盒：若 reset 携带 thinkings（服务端已从 trace 解析），整体恢复，
+          // 不再依赖后续 thinking 事件重发（断点①修复：消除「清空后等重发」的脆弱链）。
+          setThinkings(normalizeThinkings(msg.thinkings));
           setOutputting(false);
-          // 同步缓存：服务端 reset = 当前任务的最新消息快照（含已完成的思考过程）
           {
-            const ms = msg.messages.filter(Boolean) as UiMessage[];
+            const ms = msg.messages ? (msg.messages.filter(Boolean) as UiMessage[]) : [];
             const tid = activeTaskIdRef.current;
-            if (tid) messagesCacheRef.current.set(tid, { messages: ms, thinkings: [] });
+            if (tid) messagesCacheRef.current.set(tid, { messages: ms, thinkings: normalizeThinkings(msg.thinkings) });
           }
           break;
         case 'state':
@@ -1131,6 +1152,7 @@ export function App() {
     }
     clearPending(); // 切走旧任务的窗口内增量，避免串到新任务
     activeTaskIdRef.current = id;
+    setActiveTaskId(id);
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
     wsSend(JSON.stringify({ type: 'switch_task', id }));
@@ -1147,7 +1169,10 @@ export function App() {
     const id = deleteDialog.id;
     setDeleteDialog((d) => ({ ...d, open: false }));
     messagesCacheRef.current.delete(id);
-    if (activeTaskIdRef.current === id) activeTaskIdRef.current = null;
+    if (activeTaskIdRef.current === id) {
+      activeTaskIdRef.current = null;
+      setActiveTaskId(null);
+    }
     wsSend(JSON.stringify({ type: 'delete_task', id }));
   };
 
@@ -1473,7 +1498,7 @@ export function App() {
             </div>
           )}
           <div className="chat-module-body">
-            <ChatArea ref={scrollRef} messages={messages} busy={state.busy} outputting={outputting} thinkings={thinkings} onToggleThinking={toggleThinking} username={username} />
+            <ChatArea key={activeTaskId ?? 'none'} ref={scrollRef} messages={messages} busy={state.busy} outputting={outputting} thinkings={thinkings} onToggleThinking={toggleThinking} username={username} />
 
             {agentPrompt && (
               <AgentPrompt
