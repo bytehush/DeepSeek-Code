@@ -11,7 +11,7 @@ import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger } from '../context/trace.ts';
 import { SYSTEM_PROMPT } from '../agent/system-prompt.ts';
 import type { ChatMessage } from '../llm/deepseek.ts';
-import { Embedder } from '../memory/embedder.ts';
+import { createEmbedder } from '../memory/embedder-backend.ts';
 import { MemoryManager } from '../memory/manager.ts';
 import { MemoryOrchestrator } from '../memory/orchestrator.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
@@ -77,8 +77,12 @@ export async function assembleAppProps(
   const version = `v${(createRequire(import.meta.url)('../../package.json').version as string) ?? '0.1.0'}`;
   const client = new DeepSeekClient(cfg);
 
-  const embedder = new Embedder();
   const memoryConfig = loadMemoryConfig();
+  // M7: embedderMirror 开启 → 走 RemoteEmbedder（有 key 远程 / 无 key 本地降级 + 镜像）；
+  // 关闭（默认）→ 等价于 new BgeEmbedder()，与 baseline 逐字节一致。
+  const embedder = createEmbedder(memoryConfig.embedderMirror ? 'remote' : 'local', {
+    mirror: memoryConfig.embedderMirror,
+  });
   const memory = memoryConfig.useOrchestrator
     ? new MemoryOrchestrator(cwd, embedder)
     : new MemoryManager(cwd, embedder);

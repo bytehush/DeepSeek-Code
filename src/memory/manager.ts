@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { MemoryEntry, TrashItem } from './types.ts';
 import { createMemoryBackend } from './backend.ts';
 import type { MemoryBackend } from './backend.ts';
-import type { Embedder } from './embedder.ts';
+import type { EmbedderBackend } from './embedder-backend.ts';
 import { composeSystemPrompt } from './composer.ts';
 import type { ScoredMemory } from './retriever.ts';
 import type { MemoryService } from './service.ts';
@@ -42,7 +42,7 @@ export class MemoryManager implements MemoryService {
   /** 每轮语义召回管线（M5 · P2a 修复 L2 boot-only 冻结）。 */
   private readonly pipeline = new MemoryPipeline(this);
 
-  constructor(cwd: string, embedder: Embedder) {
+  constructor(cwd: string, embedder: EmbedderBackend) {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
     this.user = createMemoryBackend(join(home, '.dsa', 'memory'), embedder);
     this.project = createMemoryBackend(join(cwd, '.dsa', 'memory'), embedder);
