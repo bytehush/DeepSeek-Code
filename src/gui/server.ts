@@ -288,16 +288,19 @@ async function promoteTaskMemories(
   store: TaskStore,
   taskId: string,
   username: string,
+  userBackend?: MemoryBackend,
+  projBackend?: MemoryBackend,
 ): Promise<{ title: string; facts: number; entries: number }> {
   const meta = await store.get(taskId);
   if (!meta) throw new Error('任务不存在');
   if (!isTaskIsolated(store.dir(taskId), username)) throw new Error('任务隔离校验失败');
   const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
-  const userStore = new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
-  const projStore = new MemoryStore(
-    join(store.dir(taskId), '.dsa', 'memory'),
-    new Embedder({ mode: 'off' }),
-  );
+  // 优先复用调用方注入的共享后端（sharedGuiBackend），否则构建离线模式独立实例（旧行为）。
+  const userStore =
+    userBackend ?? new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+  const projStore =
+    projBackend ??
+    new MemoryStore(join(store.dir(taskId), '.dsa', 'memory'), new Embedder({ mode: 'off' }));
   let facts = 0;
   let entries = 0;
   // 常驻事实
@@ -1199,7 +1202,13 @@ wss.on('connection', (ws, req) => {
       }
       const taskId = String(msg.taskId ?? '');
       try {
-        const r = await promoteTaskMemories(taskStore, taskId, username);
+        // sharedGuiBackend：注入 agent 同一实例的后端，使沉淀走真实嵌入；非活跃任务不复用（防错配）。
+        const svc = host?.props.memoryStore;
+        const shared = svc && loadMemoryConfig().sharedGuiBackend;
+        const userBackend = shared ? svc.user : undefined;
+        const projBackend =
+          shared && taskId === activeTaskId ? svc.project : undefined;
+        const r = await promoteTaskMemories(taskStore, taskId, username, userBackend, projBackend);
         fwd('memory_promoted', { taskId, title: r.title, facts: r.facts, entries: r.entries });
         // 刷新记忆清单（用户级新增了沉淀项）与回收站（保持同步）
         sendMemoryList();
