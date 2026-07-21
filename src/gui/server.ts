@@ -37,7 +37,7 @@ import {
 } from './accounts.ts';
 import { TaskStore } from './thread-store.ts';
 import { DeepSeekClient, type ChatMessage } from '../llm/deepseek.ts';
-import { TraceLogger } from '../context/trace.ts';
+import { TraceLogger, type ReplayedConversation, type ReplayedMessage } from '../context/trace.ts';
 import { createMemoryBackend } from '../memory/backend.ts';
 import type { MemoryBackend } from '../memory/backend.ts';
 import { Embedder } from '../memory/embedder.ts';
@@ -473,11 +473,11 @@ wss.on('connection', (ws, req) => {
     if (activeToken && host.telemetryHub) telemetryHubs.set(activeToken, host.telemetryHub);
     wireHost(host);
     const replayed = await TraceLogger.replayAll(taskStore.dir(id));
-    if (replayed) {
-      props.history.loadMessages(replayed as never);
+    if (replayed && replayed.messages.length > 0) {
+      props.history.loadMessages(replayed.messages as never);
       props.client.resetUsage();
       replayToUi(replayed, fwd, host);
-      host.push('system', `已切换到「${meta.title}」，共 ${replayed.filter(m => m.role !== 'system').length} 条历史消息`);
+      host.push('system', `已切换到「${meta.title}」，共 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息`);
     } else {
       host.welcome();
     }
@@ -705,12 +705,12 @@ wss.on('connection', (ws, req) => {
       // 自动恢复活跃任务的上一轮上下文（与 switch_task 同逻辑）。
       // 这样登录/刷新后 Agent 内核即带上历史，可「接着干」。
       const replayed = await TraceLogger.replayAll(taskStore.dir(activeId));
-      if (replayed && replayed.length) {
-        props.history.loadMessages(replayed as never);
+      if (replayed && replayed.messages.length > 0) {
+        props.history.loadMessages(replayed.messages as never);
         props.client.resetUsage();
         replayToUi(replayed, fwd, host);
         const activeMeta = await taskStore.get(activeId);
-        host.push('system', `已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.filter(m => m.role !== 'system').length} 条历史消息，可继续对话`);
+        host.push('system', `已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息，可继续对话`);
       } else {
         host.welcome();
       }
@@ -1515,11 +1515,11 @@ async function uniqueUploadPath(p: string): Promise<string> {
 type FwdFn = (type: string, payload: Record<string, unknown>) => void;
 
 function replayToUi(
-  replayed: ChatMessage[],
+  replayed: ReplayedConversation,
   fwd: (type: string, payload: Record<string, unknown>) => void,
   host: AgentHost | null,
-) {
-  let turnId = 0;
+): void {
+  const msgs = replayed.messages;
   let msgId = 0;
 
   const pushMsg = (role: MsgRole, text: string, thinkingId?: number) => {
@@ -1528,9 +1528,58 @@ function replayToUi(
     fwd('message', m as unknown as Record<string, unknown>);
   };
 
+  if (replayed.thinking.length === 0) {
+    // ── 旧数据（无持久化思考盒）：走原重建逻辑，保证历史 trace 仍可回放 ──
+    legacyReplay(msgs, fwd, pushMsg);
+  } else {
+    // ── 方案 A：从持久化的思考事件原样重建（与实时显示完全同形）──
+    // 每个最终答复（assistant_message 无 tool_calls）已绑定 thinkingId，
+    // 发射其思考轮次后再发射气泡，顺序与实时一致（盒在上、泡在下）。
+    const emittedTurns = new Set<number>();
+    for (const m of msgs) {
+      if (m.role === 'system') continue;
+      if (m.role === 'user') {
+        pushMsg('user', typeof m.content === 'string' ? m.content : '');
+        continue;
+      }
+      if (m.role === 'assistant') {
+        const hasTool = m.tool_calls && m.tool_calls.length > 0;
+        if (hasTool) continue; // 工具轮不单独成泡，其过程已并入思考盒
+        const tid = m.thinkingId;
+        if (tid !== undefined && !emittedTurns.has(tid)) {
+          const turn = replayed.thinking.find((t) => t.turnId === tid);
+          if (turn) {
+            emittedTurns.add(tid);
+            fwd('thinking_start', { turnId: turn.turnId });
+            for (const e of turn.entries) {
+              fwd('thinking_entry', { id: e.id, kind: e.kind, title: e.title, text: e.text });
+            }
+            fwd('thinking_status', { status: turn.status });
+            fwd('thinking_end', { turnId: turn.turnId });
+          }
+        }
+        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', tid);
+      }
+      // tool 角色：跳过（其完整输出已作为 tool_result 条目并入思考盒）
+    }
+  }
+
+  // 回填 host 的消息数组（供后续内核追加）
+  if (host) {
+    host.setMessagesSilent(replayedToUiSimple(msgs));
+  }
+}
+
+/** 旧数据回放（无持久化思考盒）：从 assistant_message.tool_calls + 后续 tool 消息重建思考卡。 */
+function legacyReplay(
+  msgs: ReplayedMessage[],
+  fwd: (type: string, payload: Record<string, unknown>) => void,
+  pushMsg: (role: MsgRole, text: string, thinkingId?: number) => void,
+): void {
+  let turnId = 0;
   let i = 0;
-  while (i < replayed.length) {
-    const m = replayed[i];
+  while (i < msgs.length) {
+    const m = msgs[i];
     if (m.role === 'system') { i++; continue; }
     if (m.role === 'user') {
       pushMsg('user', typeof m.content === 'string' ? m.content : '');
@@ -1540,51 +1589,33 @@ function replayToUi(
     if (m.role === 'assistant') {
       const hasToolCalls = m.tool_calls && m.tool_calls.length > 0;
       const content = typeof m.content === 'string' ? m.content : '';
-
       if (hasToolCalls) {
-        // ── 复合轮次：tool_calls 阶段 ──
         const curTurnId = turnId++;
         fwd('thinking_start', { turnId: curTurnId });
-
-        // 推理文字（思考过程）
-        if (content.trim()) {
-          fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
-        }
-
-        // 工具调用宣告
-        fwd('thinking_entry', { id: 1, kind: 'tool', title: '工具调用', text: (m.tool_calls ?? []).map(t => t.function.name).join(', ') });
-
+        if (content.trim()) fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
+        fwd('thinking_entry', { id: 1, kind: 'tool', title: '工具调用', text: (m.tool_calls ?? []).map((t) => t.function.name).join(', ') });
         i++;
-
-        // 后续 tool 消息作为工具结果（同一轮）
         let toolId = 2;
-        while (i < replayed.length && replayed[i].role === 'tool') {
-          const tm = replayed[i];
+        while (i < msgs.length && msgs[i].role === 'tool') {
+          const tm = msgs[i];
           const tName = tm.name ?? '工具';
           const tContent = typeof tm.content === 'string' ? tm.content : '';
           fwd('thinking_entry', { id: toolId++, kind: 'tool_result', title: tName, text: tContent });
           i++;
         }
-
-        // 思考卡片结束
         fwd('thinking_end', { turnId: curTurnId });
-
-        // 最终回答（下一个 assistant 无 tool_calls）
-        if (i < replayed.length && replayed[i].role === 'assistant' && (!(replayed[i] as unknown as Record<string, unknown>).tool_calls || ((replayed[i] as unknown as Record<string, unknown>).tool_calls as unknown[]).length === 0)) {
-          const raw = replayed[i].content;
-          const finalText = typeof raw === 'string' ? raw : '';
-          pushMsg('assistant', finalText, curTurnId);
-          i++;
+        if (i < msgs.length) {
+          const nx = msgs[i];
+          if (nx.role === 'assistant' && (!nx.tool_calls || nx.tool_calls.length === 0)) {
+            const raw = nx.content;
+            pushMsg('assistant', typeof raw === 'string' ? raw : '', curTurnId);
+            i++;
+          }
         }
       } else {
-        // ── 简单 QA：重建思考盒（与实时呈现一致），气泡绑定 thinkingId ──
-        // 落盘的 assistant_message.content 即为实时阶段的 reason 推理文字，
-        // 直接作为思考条目文本，便切回任务后思考盒与气泡都能原样恢复。
         const curTurnId = turnId++;
         fwd('thinking_start', { turnId: curTurnId });
-        if (content.trim()) {
-          fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
-        }
+        if (content.trim()) fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
         fwd('thinking_end', { turnId: curTurnId });
         pushMsg('assistant', content, curTurnId);
         i++;
@@ -1593,15 +1624,10 @@ function replayToUi(
       i++;
     }
   }
-
-  // 回填 host 的消息数组（供后续内核追加）
-  if (host) {
-    host.setMessagesSilent(replayedToUiSimple(replayed));
-  }
 }
 
 /** 简化版：只转 UiMessage[]，不重建思考卡（供 setMessagesSilent 回填用） */
-function replayedToUiSimple(messages: ChatMessage[]): UiMessage[] {
+function replayedToUiSimple(messages: ReplayedMessage[]): UiMessage[] {
   const out: UiMessage[] = [];
   let id = 0;
   for (const m of messages) {
