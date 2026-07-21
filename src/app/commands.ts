@@ -7,13 +7,14 @@
  */
 import type { MemoryService } from '../memory/service.ts';
 import type { Scope } from '../memory/manager.ts';
+import { memoryMetrics, formatMetrics } from '../memory/metrics.ts';
 import type { SkillManager } from '../skills/loader.ts';
 import type { MemoryIntent } from '../memory/intent.ts';
 import type { MsgRole } from './types.ts';
 
 /**
  * /memory 命令：管理跨会话记忆（双轨：用户级全局 + 项目级）。
- * 子命令：add <文本> / fact <文本> / list / forget <id前缀> / help
+ * 子命令：add <文本> / fact <文本> / list / forget <id前缀> / stats / help
  * 任意子命令后可加 `--global` 作用于用户级全局记忆（默认项目级）。
  */
 export async function handleMemory(
@@ -36,6 +37,7 @@ export async function handleMemory(
         '  /memory fact <文本> [--global]   新增一条常驻事实（每次会话注入系统提示词）',
         '  /memory list                     列出所有记忆（标注 项目/全局）',
         '  /memory forget <id> [--global]   删除一条语义记忆（id 取 list 中前 8 位；--global 删全局层）',
+        '  /memory stats                    查看记忆系统监控指标（延迟/命中率/抽取治理/I/O）',
         '  /memory help                     显示本帮助',
         '',
         '自然语言快捷写入（无需命令）：',
@@ -94,6 +96,10 @@ export async function handleMemory(
     const ok = await manager.forget(arg, scope);
     const tag = isGlobal ? '（全局）' : '（项目）';
     push('system', ok ? `已删除记忆${tag} [#${arg.slice(0, 8)}]` : `未找到匹配的记忆 [#${arg.slice(0, 8)}]`);
+    return;
+  }
+  if (sub === 'stats') {
+    push('system', formatMetrics(memoryMetrics.snapshot()));
     return;
   }
   push('system', '未知子命令，输入 /memory help 查看用法');

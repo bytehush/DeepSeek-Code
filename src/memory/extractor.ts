@@ -2,6 +2,7 @@ import type { ChatMessage, DeepSeekClient } from '../llm/deepseek.ts';
 import type { ConversationHistory } from '../context/history.ts';
 import type { MemoryService } from './service.ts';
 import { loadMemoryConfig } from './config.ts';
+import { memoryMetrics } from './metrics.ts';
 
 /**
  * 会话结束自动抽取用户偏好（Phase 3）：把一次会话里「跨会话稳定、可复用」的用户偏好
@@ -145,6 +146,8 @@ export async function extractUserMemories(
       }
       added++;
     }
+    // M10 监控：累加抽取新增条数
+    memoryMetrics.recordExtract(added);
     return added;
   } catch {
     return 0;

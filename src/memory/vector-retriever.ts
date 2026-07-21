@@ -28,6 +28,8 @@ import type { Retriever } from './retriever-iface.ts';
 export interface VectorIndexRetrieverOpts {
   /** 返回当前 scope 的单调版本号；变更时重建归一化矩阵。 */
   versionProvider: () => number;
+  /** M10 监控回调：矩阵缓存命中（true=复用 / false=重建）时上报。 */
+  onCache?: (hit: boolean) => void;
 }
 
 /** 归一化向量：返回单位向量（模长 1）；零向量返回全 0（点积为 0，与 cosine 的 denom=0→0 一致）。 */
@@ -92,7 +94,9 @@ export class VectorIndexRetriever implements Retriever {
 
     // 重建条件：版本变更 或 entries 引用变化（内容换了一份）。二者任一满足即重建，
     // 保证「仅变更时重检索」且绝不对不同内容复用旧矩阵。
-    if (!this._cache || this._cache.version !== version || this._cache.entriesRef !== entries) {
+    const cacheHit = !!this._cache && this._cache.version === version && this._cache.entriesRef === entries;
+    this.opts.onCache?.(cacheHit);
+    if (!cacheHit) {
       const matrix = new Float32Array(embeddedIdx.length * dim);
       const rowOf = new Int32Array(entries.length).fill(-1);
       embeddedIdx.forEach((entryIdx, r) => {
@@ -103,8 +107,9 @@ export class VectorIndexRetriever implements Retriever {
       this._cache = { version, entriesRef: entries, matrix, rowOf, dim };
     }
 
+    const cache = this._cache!;
     const qNorm = normalize(queryEmbedding);
-    const { matrix, rowOf } = this._cache;
+    const { matrix, rowOf } = cache;
 
     // 逐条打分：有向量走向量化余弦；无向量走关键词降级；长度不匹配的嵌入式条目 score=0（与 cosine denom=0 一致）
     const scored: ScoredMemory[] = entries.map((e, i) => {

@@ -2,6 +2,7 @@ import type { DeepSeekClient } from '../llm/deepseek.ts';
 import type { MemoryService } from './service.ts';
 import type { Scope } from './manager.ts';
 import type { MemoryEntry } from './types.ts';
+import { memoryMetrics } from './metrics.ts';
 
 /**
  * 陈旧性治理（Dreaming 式后台修订）：定期用模型审查记忆库，清理
@@ -245,6 +246,9 @@ export async function applyProposal(store: MemoryService, proposal: RevisePropos
   // 记录整理时间（两层都写，保证节流一致）
   await store.user.setMeta({ lastReviseAt: Date.now() });
   await store.project.setMeta({ lastReviseAt: Date.now() });
+
+  // M10 监控：累加治理删除/合并组数
+  memoryMetrics.recordRevise(deleted, merged);
 
   const summary = proposal.summary || `记忆体检完成：删除 ${deleted} 条、合并 ${merged} 组。`;
   return { deleted, merged, summary, skipped: false };

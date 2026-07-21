@@ -15,6 +15,7 @@ import { keywordScore, type ScoredMemory } from './retriever.ts';
 import { DefaultRetriever, type Retriever } from './retriever-iface.ts';
 import { VectorIndexRetriever } from './vector-retriever.ts';
 import { FileLock } from './lock.ts';
+import { memoryMetrics } from './metrics.ts';
 
 /**
  * 记忆库：单作用域（baseDir 指定目录）双轨记忆的落盘与 CRUD。
@@ -108,7 +109,11 @@ export class FileMemoryBackend implements MemoryBackend {
     this._crossProcLock = opts?.crossProcLock ?? false;
     if (this._crossProcLock) this._lock = new FileLock(join(this.dir, LOCK_FILE));
     this.retriever = this._vectorIndex
-      ? new VectorIndexRetriever(new DefaultRetriever(), { versionProvider: () => this._version })
+      ? new VectorIndexRetriever(new DefaultRetriever(), {
+          versionProvider: () => this._version,
+          // M10 监控：向量索引矩阵缓存命中率
+          onCache: (hit) => memoryMetrics.recordVectorIndex(hit),
+        })
       : new DefaultRetriever();
     // M10 bgTrashSweep：开→启动后台周期 sweep（unref，不阻止进程退出）；关→不启动（读时清理现状）。
     if (this._bgSweep) this.startBackgroundSweep();
@@ -186,6 +191,8 @@ export class FileMemoryBackend implements MemoryBackend {
   private async writeText(p: string, data: string): Promise<void> {
     this.ensureDir();
     const tmp = `${p}.tmp`;
+    // M10 监控：记录写盘字节数（旁路，不影响主流程）
+    memoryMetrics.recordIo(Buffer.byteLength(data, 'utf8'));
     if (this._async) {
       await writeFile(tmp, data, 'utf8');
       await rename(tmp, p);
@@ -268,6 +275,7 @@ export class FileMemoryBackend implements MemoryBackend {
     contents: string[],
     tagsList?: Array<string[] | undefined>,
   ): Promise<MemoryEntry[]> {
+    const t0 = performance.now();
     this._version++;
     const embeddings = await Promise.all(contents.map((c) => this.embedder.embed(c)));
     const now = Date.now();
@@ -282,6 +290,9 @@ export class FileMemoryBackend implements MemoryBackend {
     const all = await this.readIndex();
     all.push(...entries);
     await this.writeIndex(all);
+    // M10 监控：嵌入调用次数 + addEntry 延迟（旁路）
+    memoryMetrics.recordEmbed(false, contents.length);
+    memoryMetrics.recordLatency('addEntry', performance.now() - t0);
     return entries;
   }
 
@@ -484,25 +495,38 @@ export class FileMemoryBackend implements MemoryBackend {
   /** 启动语义预取：用 query 检索 top-K 相关记忆（无向量时自动关键词降级）。 */
   async retrieve(query: string, k = 5): Promise<MemoryEntry[]> {
     const qEmbed = await this.embedQuery(query);
-    return this.retriever.retrieve(qEmbed, query, await this.readIndex(), k);
+    const t0 = performance.now();
+    const res = await this.retriever.retrieve(qEmbed, query, await this.readIndex(), k);
+    memoryMetrics.recordLatency('retrieve', performance.now() - t0);
+    return res;
   }
 
   /** 带分数的召回（去重用，需要分数阈值判断是否重复）。 */
   async queryScored(query: string, k = 5): Promise<ScoredMemory[]> {
     const qEmbed = await this.embedQuery(query);
-    return this.retriever.retrieveScored(qEmbed, query, await this.readIndex(), k);
+    const t0 = performance.now();
+    const res = await this.retriever.retrieveScored(qEmbed, query, await this.readIndex(), k);
+    memoryMetrics.recordLatency('queryScored', performance.now() - t0);
+    return res;
   }
 
   /** 计算 query 向量（M9：vectorIndex 开时按 query 字符串缓存复用，省重复 embed）。 */
   private async embedQuery(query: string): Promise<number[] | null> {
     if (this._vectorIndex) {
       const cached = this._queryVecCache.get(query);
-      if (cached !== undefined) return cached;
+      if (cached !== undefined) {
+        // M10 监控：命中 query 向量缓存 = 省一次 embed
+        memoryMetrics.recordEmbed(true);
+        return cached;
+      }
       const v = await this.embedder.embed(query);
       this._queryVecCache.set(query, v);
+      memoryMetrics.recordEmbed(false);
       return v;
     }
-    return this.embedder.embed(query);
+    const v = await this.embedder.embed(query);
+    memoryMetrics.recordEmbed(false);
+    return v;
   }
 
   /**
@@ -512,7 +536,9 @@ export class FileMemoryBackend implements MemoryBackend {
    * 常驻事实（MEMORY.md）无向量，仅按关键词重叠判定。
    */
   async isDuplicate(content: string): Promise<boolean> {
+    const t0 = performance.now();
     const top = (await this.queryScored(content, 1))[0];
+    memoryMetrics.recordLatency('isDuplicate', performance.now() - t0);
     if (top && top.score >= (top.mode === 'vector' ? 0.82 : 0.6)) return true;
     // 常驻事实逐行比较（避免整坨 MEMORY.md 越攒越稀释相似度）
     const facts = await this.loadFacts();
