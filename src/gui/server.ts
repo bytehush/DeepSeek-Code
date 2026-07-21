@@ -681,10 +681,11 @@ wss.on('connection', (ws, req) => {
   async function bootWithUser(u: string, threadId?: string): Promise<void> {
     // 先初始化任务存储（即使没配 Key，也应展示任务列表）
     taskStore = new TaskStore(userDataDir(u));
-    // 激活任务优先级：指定 threadId → default（若未被删除）→ 第一个现存任务 → 兜底强制重建 default。
-    // 这样用户主动删掉的 default 不会在刷新时被 ensureDefault 强行复活。
+    // 激活任务优先级：指定 threadId（刷新前持久化的上次激活任务）→ default → 第一个现存任务 → 兜底强制重建 default。
+    // 这样刷新后能回到用户上次正在看的对话（含思考盒），而非落到空默认任务。
+    // threadId 须经 taskStore.get 校验归属当前用户，避免客户端伪造他人任务 id。
     activeTaskId =
-      threadId ??
+      (threadId && (await taskStore.get(threadId)) ? threadId : undefined) ??
       (await taskStore.ensureDefault()) ??
       (await taskStore.firstExisting()) ??
       (await taskStore.ensureDefault(true));
@@ -712,7 +713,10 @@ wss.on('connection', (ws, req) => {
       if (replayed && replayed.messages.length > 0) {
         props.history.loadMessages(replayed.messages as never);
         props.client.resetUsage();
-        replayToUi(replayed, fwd, host);
+        // 与 switch_task 同逻辑：思考盒随 reset 原子恢复（emitThinking=false 仅重发消息并保留 thinkingId），
+        // 避免旧事件流重建路径在刷新场景下的脆弱性，保证「刷新=切换」行为一致。
+        pushReset(replayed.thinking);
+        replayToUi(replayed, fwd, host, false);
         const activeMeta = await taskStore.get(activeId);
         host.push('system', `已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息，可继续对话`);
       } else {
@@ -797,7 +801,7 @@ wss.on('connection', (ws, req) => {
     activeToken = token; // 供 /api/telemetry（外部浏览器）按 token 找到本连接集线器
     guiSettings = await loadGuiSettings(username); // 加载本项目目录等 GUI 设置
     fwd('auth_ok', { token, username: username });
-    void bootWithUser(username!);
+    void bootWithUser(username!, msg.threadId ? String(msg.threadId) : undefined);
   }
 
   ws.on('message', async (raw) => {
