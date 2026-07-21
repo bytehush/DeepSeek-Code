@@ -19,6 +19,7 @@ import { ChevronRight, ChevronDown, MessageSquare } from 'lucide-react';
 import type { UiMessage } from '../../app/types.ts';
 import type { ThinkingTurn, ThinkingEntry } from './App.tsx';
 import { computeOrphans } from './thinkingLayout.ts';
+import { ThinkingCard, ThinkingStep } from './ThinkingCard.tsx';
 import { useTypewriter } from './useTypewriter.ts';
 import './ChatArea.css';
 
@@ -223,62 +224,7 @@ const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
   return <>{node}</>;
 });
 
-/** 单条观察（推理 / 工具 / 工具结果） */
-const ThinkingStep = memo(function ThinkingStep({ entry }: { entry: ThinkingEntry }) {
-  // 流式条目（status==='streaming'）逐字揭示；已完成/历史条目立即完整显示
-  const live = entry.status === 'streaming';
-  const shown = useTypewriter(entry.text, live);
-  if (entry.kind === 'tool') {
-    return (
-      <div className="think-step tool">
-        <div className="think-step-head">
-          <ToolIcon />
-          <span className="think-tool-name">{entry.title}</span>
-        </div>
-        {entry.text.trim() && <pre className="think-text">{shown.trim()}</pre>}
-      </div>
-    );
-  }
-  if (entry.kind === 'tool_result') {
-    return (
-      <div className="think-step result">
-        <div className="think-step-label">↳ 工具结果</div>
-        <pre className="think-text muted">{shown.trim()}</pre>
-      </div>
-    );
-  }
-  return (
-    <div className="think-step reason">
-      <pre className="think-text">{shown.trim()}</pre>
-    </div>
-  );
-});
-
-/** 一轮对话的「思考过程」卡片：可折叠，展开显示全部观察条目 */
-const ThinkingCard = memo(function ThinkingCard({ turn, onToggle }: { turn: ThinkingTurn; onToggle: (id: number) => void }) {
-  const isActive = turn.status === 'thinking' || turn.status === 'outputting';
-  const isInterrupted = turn.status === 'interrupted';
-  const stepCount = turn.entries.length;
-  return (
-    <div className={`thinking-card ${turn.collapsed ? 'collapsed' : ''} ${isActive ? 'active' : ''} ${isInterrupted ? 'interrupted' : ''}`}>
-      <button className="thinking-head" onClick={() => onToggle(turn.turnId)} aria-expanded={!turn.collapsed}>
-        <span className="thinking-ico" aria-hidden>
-          {isActive ? <span className="spinner" /> : isInterrupted ? <StopIcon /> : <CheckIcon />}
-        </span>
-        <span className="thinking-title">{isActive ? '思考中…' : isInterrupted ? '生成中断' : `思考过程 · ${stepCount} 步`}</span>
-        <span className="thinking-count">{stepCount}</span>
-        <span className="thinking-caret" aria-hidden>{turn.collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}</span>
-      </button>
-      {!turn.collapsed && stepCount > 0 && (
-        <div className="thinking-body">
-          {turn.entries.map((e) => (
-            <ThinkingStep key={e.id} entry={e} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-});
+/** 单条观察（推理 / 工具 / 工具结果）—— 见 ./ThinkingCard.tsx（已抽出，自包含便于渲染测试） */
 
 /**
  * 助手「最终答案」气泡：统一接入 useTypewriter 做逐字揭示。
