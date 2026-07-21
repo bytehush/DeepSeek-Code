@@ -1577,8 +1577,16 @@ function replayToUi(
           i++;
         }
       } else {
-        // ── 简单 QA：直接渲染 ──
-        pushMsg('assistant', content);
+        // ── 简单 QA：重建思考盒（与实时呈现一致），气泡绑定 thinkingId ──
+        // 落盘的 assistant_message.content 即为实时阶段的 reason 推理文字，
+        // 直接作为思考条目文本，便切回任务后思考盒与气泡都能原样恢复。
+        const curTurnId = turnId++;
+        fwd('thinking_start', { turnId: curTurnId });
+        if (content.trim()) {
+          fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
+        }
+        fwd('thinking_end', { turnId: curTurnId });
+        pushMsg('assistant', content, curTurnId);
         i++;
       }
     } else {
