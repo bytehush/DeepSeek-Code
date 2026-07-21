@@ -192,26 +192,42 @@ try {
   const bTexts = capB.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => m.text!);
   const noLeak = !bTexts.some((t) => t.includes('闭包') || t.includes('你好'));
 
-  // 切回 A（模拟点击任务卡片重新进入）→ 应恢复 user + assistant 历史
-  const capA: Array<{ role: string; text?: string }> = [];
+  // 切回 A（模拟点击任务卡片重新进入）→ 应恢复 user + assistant 历史 + 思考盒
+  const capA: Array<{ role: string; text?: string; thinkingId?: number }> = [];
   const hA = (raw: WebSocket.RawData) => {
     const m = JSON.parse(raw.toString());
-    if (m.type === 'message') capA.push({ role: m.role as string, text: m.text as string });
+    if (m.type === 'message') capA.push({ role: m.role as string, text: m.text as string, thinkingId: m.thinkingId as number | undefined });
+  };
+  // 同时捕获思考盒事件，验证「思考盒随历史原样恢复」（方案 B：纯问答也重建 thinking 卡）
+  const thinkingRounds: Array<{ turnId?: number; entries: Array<{ id: number; kind: string; text?: string }> }> = [];
+  let curThinking: { turnId?: number; entries: Array<{ id: number; kind: string; text?: string }> } | null = null;
+  const hThink = (raw: WebSocket.RawData) => {
+    const m = JSON.parse(raw.toString());
+    if (m.type === 'thinking_start') { curThinking = { turnId: m.turnId as number, entries: [] }; thinkingRounds.push(curThinking); }
+    else if (m.type === 'thinking_entry' && curThinking) { curThinking.entries.push({ id: m.id as number, kind: m.kind as string, text: m.text as string }); }
   };
   ws.on('message', hA);
+  ws.on('message', hThink);
   send(ws, { type: 'switch_task', id: idA });
   await waitMsg(ws, (m) => m.type === 'reset');
   await new Promise<void>((r) => setTimeout(r, 3000));
   ws.off('message', hA);
+  ws.off('message', hThink);
   const aMsgs = capA.filter((m) => m.role === 'user' || m.role === 'assistant');
   const hasUser = aMsgs.some((m) => m.role === 'user' && (m.text ?? '').includes('你好'));
   const hasAsst = aMsgs.some((m) => m.role === 'assistant' && (m.text ?? '').includes('闭包'));
   const historyRecovered = hasUser && hasAsst;
 
-  console.log('A 恢复消息:', aMsgs.map((m) => `[${m.role}] ${m.text}`));
+  // 思考盒恢复断言：存在 reason 条目(文本=agent 最终答复) 且 assistant 气泡已绑定 thinkingId
+  const reasonEntry = thinkingRounds.flatMap((r) => r.entries).find((e) => e.kind === 'reason' && (e.text ?? '').includes('闭包'));
+  const asstBound = aMsgs.some((m) => m.role === 'assistant' && m.thinkingId !== undefined);
+  const hasThinkingBox = !!reasonEntry && asstBound;
+
+  console.log('A 恢复消息:', aMsgs.map((m) => `[${m.role}] ${m.text}` + (m.thinkingId !== undefined ? ` (thinkingId=${m.thinkingId})` : '')));
+  console.log('A 思考盒 reason 条目数:', thinkingRounds.flatMap((r) => r.entries).filter((e) => e.kind === 'reason').length);
   console.log('B 显示(应无 A 历史):', bTexts);
-  console.log(`\n=== E2E: historyRecovery=${historyRecovered} isolation=${noLeak} ===`);
-  exitCode = historyRecovered && noLeak ? 0 : 1;
+  console.log(`\n=== E2E: historyRecovery=${historyRecovered} hasThinkingBox=${hasThinkingBox} isolation=${noLeak} ===`);
+  exitCode = historyRecovered && hasThinkingBox && noLeak ? 0 : 1;
   console.log(exitCode === 0 ? 'E2E_OK' : 'E2E_FAIL');
 
   ws.close();
