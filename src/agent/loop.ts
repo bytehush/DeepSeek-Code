@@ -588,6 +588,8 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
         yield { type: 'assistant_phase', phase: 'final' };
         if (accContent.trim()) {
           opts.history.addAssistant(accContent, undefined);
+          // 修复：中断时的部分答复也落盘，避免回放时丢失（与正常最终答复一致）。
+          if (trace) await trace.log('assistant_message', { content: accContent });
           yield { type: 'assistant_text', text: accContent };
         }
         yield { type: 'done', reason: 'user_abort' };
@@ -713,6 +715,8 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
         yield { type: 'assistant_text', text: warn };
       }
       await opts.history.compact({ signal: opts.signal });
+      // 修复：最终纯文本答复必须落盘，否则回放时 agent 输出整体丢失（用户消息在、agent 输出消失）。
+      if (trace) await trace.log('assistant_message', { content: accContent });
       yield { type: 'done', reason: 'model_stop' };
       return;
     }
