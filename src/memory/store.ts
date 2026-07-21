@@ -11,7 +11,9 @@ import { randomUUID } from 'node:crypto';
 import type { MemoryEntry, TrashItem } from './types.ts';
 import type { EmbedderBackend } from './embedder-backend.ts';
 import type { MemoryBackend } from './backend.ts';
-import { retrieve, retrieveScored, keywordScore, type ScoredMemory } from './retriever.ts';
+import { keywordScore, type ScoredMemory } from './retriever.ts';
+import { DefaultRetriever, type Retriever } from './retriever-iface.ts';
+import { VectorIndexRetriever } from './vector-retriever.ts';
 
 /**
  * 记忆库：单作用域（baseDir 指定目录）双轨记忆的落盘与 CRUD。
@@ -40,6 +42,8 @@ const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export interface FileMemoryBackendOpts {
   /** 异步 I/O 开关（M8）。true=fs/promises 不阻塞事件循环；false=同步 fs 回退（输出逐字节一致）。 */
   async?: boolean;
+  /** 向量化检索开关（M9）。true=预计算归一化矩阵向量化余弦 + 版本缓存；false=线性扫描现状（默认）。 */
+  vectorIndex?: boolean;
 }
 
 /**
@@ -53,6 +57,14 @@ export class FileMemoryBackend implements MemoryBackend {
   private embedder: EmbedderBackend;
   /** M8 异步 I/O 开关；false = 同步回退（逐字节一致）。 */
   private _async: boolean;
+  /** M9 向量化检索开关；false = 线性扫描（默认，与旧路径一致）。 */
+  private _vectorIndex: boolean;
+  /** M9 scope 版本计数器：索引内容变更时自增，供 VectorIndexRetriever 门控矩阵重建。 */
+  private _version = 0;
+  /** 检索器实例（M9 接线点）：默认 DefaultRetriever；vectorIndex 开→VectorIndexRetriever。 */
+  private retriever: Retriever;
+  /** M9 query 向量缓存（仅 vectorIndex 开时启用）：同 query 字符串复用嵌入，省重复 embed。 */
+  private _queryVecCache = new Map<string, number[] | null>();
 
   /** ✅ 性能：readIndex 内存缓存，避免每次操作都从磁盘全量重读+解析 JSON */
   private _indexCache: MemoryEntry[] | null = null;
@@ -74,6 +86,10 @@ export class FileMemoryBackend implements MemoryBackend {
     this.dir = baseDir;
     this.embedder = embedder;
     this._async = opts?.async ?? false;
+    this._vectorIndex = opts?.vectorIndex ?? false;
+    this.retriever = this._vectorIndex
+      ? new VectorIndexRetriever(new DefaultRetriever(), { versionProvider: () => this._version })
+      : new DefaultRetriever();
   }
 
   /** 确保目录存在（同步 mkdir，幂等，两种模式通用）。 */
@@ -210,6 +226,7 @@ export class FileMemoryBackend implements MemoryBackend {
     contents: string[],
     tagsList?: Array<string[] | undefined>,
   ): Promise<MemoryEntry[]> {
+    this._version++;
     const embeddings = await Promise.all(contents.map((c) => this.embedder.embed(c)));
     const now = Date.now();
     const entries: MemoryEntry[] = contents.map((c, i) => ({
@@ -236,6 +253,7 @@ export class FileMemoryBackend implements MemoryBackend {
     return this.enqueue(async () => {
       const all = await this.readIndex();
       if (all.length > 0) await this.pushTrash(all.map((entry) => this.entryTrash(entry)));
+      this._version++;
       await this.writeIndex([]);
     });
   }
@@ -248,6 +266,7 @@ export class FileMemoryBackend implements MemoryBackend {
       if (removed.length === 0) return false;
       const next = all.filter((e) => !e.id.startsWith(idPrefix));
       await this.pushTrash(removed.map((entry) => this.entryTrash(entry)));
+      this._version++;
       await this.writeIndex(next);
       return true;
     });
@@ -277,6 +296,7 @@ export class FileMemoryBackend implements MemoryBackend {
       const idx = all.findIndex((e) => e.id === id);
       if (idx === -1) return false;
       all[idx] = { ...all[idx], content: content.trim(), updatedAt: Date.now() };
+      this._version++;
       await this.writeIndex(all);
       return true;
     });
@@ -334,6 +354,7 @@ export class FileMemoryBackend implements MemoryBackend {
         // 避免重复恢复：同 id 已存在则跳过写入
         if (!all.some((e) => e.id === item.entry!.id)) {
           all.push({ ...item.entry, updatedAt: Date.now() });
+          this._version++;
           await this.writeIndex(all);
         }
       } else if (item.kind === 'fact' && item.fact) {
@@ -377,14 +398,26 @@ export class FileMemoryBackend implements MemoryBackend {
 
   /** 启动语义预取：用 query 检索 top-K 相关记忆（无向量时自动关键词降级）。 */
   async retrieve(query: string, k = 5): Promise<MemoryEntry[]> {
-    const qEmbed = await this.embedder.embed(query);
-    return retrieve(qEmbed, query, await this.readIndex(), k);
+    const qEmbed = await this.embedQuery(query);
+    return this.retriever.retrieve(qEmbed, query, await this.readIndex(), k);
   }
 
   /** 带分数的召回（去重用，需要分数阈值判断是否重复）。 */
   async queryScored(query: string, k = 5): Promise<ScoredMemory[]> {
-    const qEmbed = await this.embedder.embed(query);
-    return retrieveScored(qEmbed, query, await this.readIndex(), k);
+    const qEmbed = await this.embedQuery(query);
+    return this.retriever.retrieveScored(qEmbed, query, await this.readIndex(), k);
+  }
+
+  /** 计算 query 向量（M9：vectorIndex 开时按 query 字符串缓存复用，省重复 embed）。 */
+  private async embedQuery(query: string): Promise<number[] | null> {
+    if (this._vectorIndex) {
+      const cached = this._queryVecCache.get(query);
+      if (cached !== undefined) return cached;
+      const v = await this.embedder.embed(query);
+      this._queryVecCache.set(query, v);
+      return v;
+    }
+    return this.embedder.embed(query);
   }
 
   /**
@@ -416,6 +449,11 @@ export class FileMemoryBackend implements MemoryBackend {
    */
   async onDispose(): Promise<void> {
     await this._chain;
+  }
+
+  /** M9 scope 版本号：索引每次变更（add/forget/update/restore/clear）自增，供向量化检索门控矩阵重建。 */
+  getVersion(): number {
+    return this._version;
   }
 }
 

@@ -51,19 +51,24 @@ export interface MemoryBackend {
   isDuplicate(content: string): Promise<boolean>;
   /** 资源释放钩子（M8 异步 I/O：冲刷写链确保落盘）。 */
   onDispose(): Promise<void>;
+  /** 返回 scope 版本号（M9：索引每次变更自增，供向量化检索门控矩阵重建）。 */
+  getVersion(): number;
 }
 
 /**
  * 工厂：按 baseDir + embedder 构造文件后端。
  * 作为依赖注入点，后续阶段可在此切换实现而不动调用方。
- * asyncBackend flag 经 loadMemoryConfig 读取并透传给 FileMemoryBackend
- * （true=异步 I/O 不阻塞事件循环，默认；false=同步回退，输出逐字节一致）。
+ * asyncBackend / vectorIndex flag 经 loadMemoryConfig 读取并透传给 FileMemoryBackend
+ * （asyncBackend：true=异步 I/O 不阻塞事件循环，默认；false=同步回退，输出逐字节一致。
+ *  vectorIndex：true=预计算归一化矩阵向量化余弦 + 版本缓存，默认 false=线性扫描现状）。
  */
 export function createMemoryBackend(
   baseDir: string,
   embedder: EmbedderBackend,
   opts?: FileMemoryBackendOpts,
 ): MemoryBackend {
-  const async = opts?.async ?? loadMemoryConfig().asyncBackend;
-  return new FileMemoryBackend(baseDir, embedder, { async });
+  const cfg = loadMemoryConfig();
+  const async = opts?.async ?? cfg.asyncBackend;
+  const vectorIndex = opts?.vectorIndex ?? cfg.vectorIndex;
+  return new FileMemoryBackend(baseDir, embedder, { async, vectorIndex });
 }
