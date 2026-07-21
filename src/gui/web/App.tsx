@@ -212,6 +212,7 @@ const ROLE_COLOR: Record<MsgRole, string> = {
 };
 
 const TOKEN_KEY = 'dsa_token';
+const ACTIVE_TASK_KEY = 'dsa_active_task'; // 当前激活任务 id：刷新后据此恢复「回到哪个对话」，思考内容本身由服务端磁盘持久化
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -465,7 +466,12 @@ export function App() {
     ws.onopen = () => {
       setConnected(true);
       const t = sessionStorage.getItem(TOKEN_KEY);
-      if (t) ws.send(JSON.stringify({ type: 'resume', token: t }));
+      if (t) {
+        // 刷新/重连时把「上次激活的任务」带回，让服务端直接 boot 该任务（恢复含思考盒的历史）
+        let threadId: string | undefined;
+        try { threadId = localStorage.getItem(ACTIVE_TASK_KEY) ?? undefined; } catch { /* ignore */ }
+        ws.send(JSON.stringify({ type: 'resume', token: t, threadId }));
+      }
     };
     ws.onclose = () => {
       setConnected(false);
@@ -1155,6 +1161,8 @@ export function App() {
     setActiveTaskId(id);
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
+    // 持久化当前激活任务：刷新/重连后据此恢复「回到哪个对话」（不存思考内容本身，避免与服务端磁盘分叉）
+    try { localStorage.setItem(ACTIVE_TASK_KEY, id); } catch { /* 隐私模式忽略写入失败 */ }
     wsSend(JSON.stringify({ type: 'switch_task', id }));
   };
 
@@ -1172,6 +1180,7 @@ export function App() {
     if (activeTaskIdRef.current === id) {
       activeTaskIdRef.current = null;
       setActiveTaskId(null);
+      try { localStorage.removeItem(ACTIVE_TASK_KEY); } catch { /* ignore */ }
     }
     wsSend(JSON.stringify({ type: 'delete_task', id }));
   };
