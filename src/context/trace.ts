@@ -233,6 +233,36 @@ export class TraceLogger {
   }
 
   /**
+   * 聚合版会话恢复：解析目录下【全部】 trace 文件，按文件名升序（=时间序）拼接重建对话消息数组。
+   * 与 `replay` 只取最新单文件不同，本方法合并该任务所有历史会话，
+   * 避免切换/重启后早期会话被新开空文件孤立而丢失历史。
+   * 仅 Web 的「切任务 / 登录恢复」入口使用；CLI 仍走 `replay`，不受影响。
+   */
+  static async replayAll(workspaceDir?: string): Promise<ChatMessage[] | null> {
+    const traceDir = join(workspaceDir ?? process.cwd(), '.dsa', 'traces');
+    let files: string[];
+    try {
+      files = await readdir(traceDir);
+    } catch {
+      return null; // 目录不存在：无历史
+    }
+    const jsonlFiles = files.filter((f) => f.endsWith('.jsonl')).sort(); // 升序 = 时间序
+    if (jsonlFiles.length === 0) return null;
+    const all: ChatMessage[] = [];
+    for (const f of jsonlFiles) {
+      try {
+        const content = await readFile(join(traceDir, f), 'utf8');
+        const part = TraceLogger.parseReplay(content);
+        if (part) all.push(...part);
+      } catch {
+        // 单个文件读取失败（如被 TraceLogger 刷盘锁临时占用）跳过，不拖累整体聚合
+        continue;
+      }
+    }
+    return all.length > 0 ? all : null;
+  }
+
+  /**
    * P6 断点续跑：解析最近的 trace，返回可恢复的会话消息 + 已落盘文件清单 + 任务目标。
    * - messages：复用 parseReplay 重建的对话历史（不含 system）。
    * - filesWritten：从 tool_result 输出抽取「已创建文件 / 已修改 / 已删除」的路径，

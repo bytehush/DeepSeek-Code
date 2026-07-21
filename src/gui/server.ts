@@ -472,7 +472,7 @@ wss.on('connection', (ws, req) => {
     host = makeHost(props);
     if (activeToken && host.telemetryHub) telemetryHubs.set(activeToken, host.telemetryHub);
     wireHost(host);
-    const replayed = await TraceLogger.replay(taskStore.dir(id));
+    const replayed = await TraceLogger.replayAll(taskStore.dir(id));
     if (replayed) {
       props.history.loadMessages(replayed as never);
       props.client.resetUsage();
@@ -704,7 +704,7 @@ wss.on('connection', (ws, req) => {
       wireHost(host);
       // 自动恢复活跃任务的上一轮上下文（与 switch_task 同逻辑）。
       // 这样登录/刷新后 Agent 内核即带上历史，可「接着干」。
-      const replayed = await TraceLogger.replay(taskStore.dir(activeId));
+      const replayed = await TraceLogger.replayAll(taskStore.dir(activeId));
       if (replayed && replayed.length) {
         props.history.loadMessages(replayed as never);
         props.client.resetUsage();
