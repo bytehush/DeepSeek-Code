@@ -691,6 +691,21 @@ wss.on('connection', (ws, req) => {
       (await taskStore.ensureDefault(true));
     await sendTaskList();
 
+    const activeId = activeTaskId;
+    if (!activeId) return;
+
+    // ① 历史回放（展示层，与 API Key 解耦）：无论是否配 Key，都把「消息 + 思考盒」推给前端。
+    //    无 Key / Key 失效时刷新，历史记录（含思考盒）仍完整显示，仅不能真正发起对话。
+    const replayed = await TraceLogger.replayAll(taskStore.dir(activeId));
+    if (replayed && replayed.messages.length > 0) {
+      // host 可能尚未装配（无 Key 时不进内核分支），replayToUi 在 host=null 时仅走 fwd 通道，安全。
+      pushReset(replayed.thinking);
+      replayToUi(replayed, fwd, null, false);
+      const activeMeta = await taskStore.get(activeId);
+      pushSystem(`已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter((m) => m.role !== 'system').length} 条历史消息，可继续对话`);
+    }
+
+    // ② API Key 校验：仅决定内核是否装配（能否真正对话），不再阻断上面的历史展示。
     const creds = await loadUserCredentials(u);
     if (!creds) {
       pushSystem('你尚未配置 DeepSeek API Key。点击顶栏 ⚙ API 进行配置后，即可开始对话。');
@@ -701,24 +716,15 @@ wss.on('connection', (ws, req) => {
       pushSystem(`当前保存的 API Key 无效：${v.error}。请打开顶栏 ⚙ API 重新配置。`);
       return;
     }
-    const activeId = activeTaskId;
-    if (!activeId) return;
+
     try {
       const props = await ensureKernel(u, taskStore.dir(activeId), creds, fileRoot(guiSettings));
       host = makeHost(props);
       wireHost(host);
-      // 自动恢复活跃任务的上一轮上下文（与 switch_task 同逻辑）。
-      // 这样登录/刷新后 Agent 内核即带上历史，可「接着干」。
-      const replayed = await TraceLogger.replayAll(taskStore.dir(activeId));
+      // 内核装配后把历史灌入，使 Agent 可「接着干」（前端展示已在 ① 完成，这里只喂内核上下文）
       if (replayed && replayed.messages.length > 0) {
         props.history.loadMessages(replayed.messages as never);
         props.client.resetUsage();
-        // 与 switch_task 同逻辑：思考盒随 reset 原子恢复（emitThinking=false 仅重发消息并保留 thinkingId），
-        // 避免旧事件流重建路径在刷新场景下的脆弱性，保证「刷新=切换」行为一致。
-        pushReset(replayed.thinking);
-        replayToUi(replayed, fwd, host, false);
-        const activeMeta = await taskStore.get(activeId);
-        host.push('system', `已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息，可继续对话`);
       } else {
         host.welcome();
       }
