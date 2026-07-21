@@ -18,9 +18,12 @@ import { join } from 'node:path';
  * - `perTurnCompose`    M5 每轮重算语义召回（默认 false = 仅启动预取）
  * - `sharedGuiBackend`  M6 GUI 复用同一后端实例（默认 false = 独立实例）
  * - `embedderMirror`    M7 embedder 走中科大写像/远程（默认 false = 直连 HF）
+ * - `asyncBackend`      M8 记忆库异步 I/O（默认 true = fs/promises 不阻塞事件循环；
+ *                        false = 同步 fs 回退，输出逐字节一致，作安全锚点）
  *
- * 默认全 false（除 memoryInterfaces），保证每个行为变更阶段在 flag 关闭时
- * 与旧路径逐字节一致，可作安全回退锚点。
+ * 默认全 false（除 memoryInterfaces / asyncBackend），保证每个行为变更阶段在 flag 关闭时
+ * 与旧路径逐字节一致，可作安全回退锚点。asyncBackend 默认 true 是因为它只改变 I/O 实现、
+ * 不改变可观察行为，M8 的全部收益（不阻塞事件循环 / 批量嵌入 / 预热）都来自异步路径。
  */
 export interface MemoryConfig {
   memoryInterfaces: boolean;
@@ -29,6 +32,7 @@ export interface MemoryConfig {
   perTurnCompose: boolean;
   sharedGuiBackend: boolean;
   embedderMirror: boolean;
+  asyncBackend: boolean;
 }
 
 const DEFAULTS: MemoryConfig = {
@@ -38,6 +42,7 @@ const DEFAULTS: MemoryConfig = {
   perTurnCompose: false,
   sharedGuiBackend: false,
   embedderMirror: false,
+  asyncBackend: true,
 };
 
 const ENV_KEY = 'DSA_MEMORY_FLAGS';

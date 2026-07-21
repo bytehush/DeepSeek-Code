@@ -38,7 +38,7 @@ import {
 import { TaskStore } from './thread-store.ts';
 import { DeepSeekClient, type ChatMessage } from '../llm/deepseek.ts';
 import { TraceLogger } from '../context/trace.ts';
-import { MemoryStore } from '../memory/store.ts';
+import { createMemoryBackend } from '../memory/backend.ts';
 import type { MemoryBackend } from '../memory/backend.ts';
 import { Embedder } from '../memory/embedder.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
@@ -297,26 +297,25 @@ async function promoteTaskMemories(
   const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
   // 优先复用调用方注入的共享后端（sharedGuiBackend），否则构建离线模式独立实例（旧行为）。
   const userStore =
-    userBackend ?? new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+    userBackend ?? createMemoryBackend(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
   const projStore =
     projBackend ??
-    new MemoryStore(join(store.dir(taskId), '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+    createMemoryBackend(join(store.dir(taskId), '.dsa', 'memory'), new Embedder({ mode: 'off' }));
   let facts = 0;
   let entries = 0;
   // 常驻事实
-  const factLines = projStore
-    .loadFacts()
+  const factLines = (await projStore.loadFacts())
     .split('\n')
     .map((l) => l.replace(/^- /, '').trim())
     .filter(Boolean);
   for (const f of factLines) {
     if (!(await userStore.isDuplicate(f))) {
-      userStore.addFact(f);
+      await userStore.addFact(f);
       facts++;
     }
   }
   // 语义记忆
-  for (const e of projStore.list()) {
+  for (const e of await projStore.list()) {
     if (!(await userStore.isDuplicate(e.content))) {
       await userStore.addEntry(e.content, e.tags);
       entries++;
@@ -507,10 +506,10 @@ wss.on('connection', (ws, req) => {
     // 回退：离线模式独立实例（旧行为，逐字节一致）
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
     if (scope === 'user') {
-      return new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+      return createMemoryBackend(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
     }
     if (!taskDir) return null;
-    return new MemoryStore(join(taskDir, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+    return createMemoryBackend(join(taskDir, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
   }
 
   function makeStores(): { user: MemoryBackend; project: MemoryBackend | null } {
@@ -535,14 +534,14 @@ wss.on('connection', (ws, req) => {
   }
 
   /** 构造导出包：读 MEMORY.md 原文 + memories.json 语义记忆（不含回收站，回收站为临时态不导出）。 */
-  function buildExportBundle(store: MemoryBackend, scope: 'user' | 'project'): MemoryExportBundle {
+  async function buildExportBundle(store: MemoryBackend, scope: 'user' | 'project'): Promise<MemoryExportBundle> {
     return {
       kind: 'dsa-memory-export',
       version: 1,
       scope,
       exportedAt: new Date().toISOString(),
-      facts: store.loadFacts(),
-      entries: store.list().map((e) => ({ content: e.content, tags: e.tags })),
+      facts: await store.loadFacts(),
+      entries: (await store.list()).map((e) => ({ content: e.content, tags: e.tags })),
     };
   }
 
@@ -557,8 +556,8 @@ wss.on('connection', (ws, req) => {
     // 导入采用精确归一化去重：仅当与已有事实/记忆逐字相同时跳过，
     // 避免 isDuplicate 的模糊匹配把用户刻意新增的近相似项静默丢弃。
     const norm = (s: string): string => s.replace(/^- /, '').trim();
-    const existingFacts = new Set(store.loadFacts().split('\n').map(norm).filter(Boolean));
-    const existingEntries = new Set(store.list().map((e) => norm(e.content)));
+    const existingFacts = new Set((await store.loadFacts()).split('\n').map(norm).filter(Boolean));
+    const existingEntries = new Set((await store.list()).map((e) => norm(e.content)));
     const factLines = (bundle.facts ?? '')
       .split('\n')
       .map(norm)
@@ -568,7 +567,7 @@ wss.on('connection', (ws, req) => {
         skipped++;
         continue;
       }
-      store.addFact(f);
+      await store.addFact(f);
       existingFacts.add(f);
       factsAdded++;
     }
@@ -590,7 +589,7 @@ wss.on('connection', (ws, req) => {
   }
 
   /** 读取两层记忆清单并向前端推送（MEMORY.md 事实 + memories.json 语义记忆）。 */
-  function sendMemoryList(): void {
+  async function sendMemoryList(): Promise<void> {
     const { user, project } = makeStores();
     const normFacts = (s: string): string[] =>
       s
@@ -599,21 +598,21 @@ wss.on('connection', (ws, req) => {
         .filter(Boolean);
     fwd('memory_list', {
       data: {
-        user: { facts: normFacts(user.loadFacts()), entries: user.list() },
+        user: { facts: normFacts(await user.loadFacts()), entries: await user.list() },
         project: project
-          ? { facts: normFacts(project.loadFacts()), entries: project.list() }
+          ? { facts: normFacts(await project.loadFacts()), entries: await project.list() }
           : { facts: [], entries: [] },
       },
     });
   }
 
   /** 读取两层回收站并推送前端（软删除的记忆，可恢复）。 */
-  function sendTrashList(): void {
+  async function sendTrashList(): Promise<void> {
     const { user, project } = makeStores();
     fwd('trash_list', {
       data: {
-        user: user.listTrash(),
-        project: project ? project.listTrash() : [],
+        user: await user.listTrash(),
+        project: project ? await project.listTrash() : [],
       },
     });
   }
@@ -1029,7 +1028,7 @@ wss.on('connection', (ws, req) => {
         fwd('auth_error', { message: '请先登录' });
         return;
       }
-      sendMemoryList();
+      await sendMemoryList();
       return;
     }
 
@@ -1043,11 +1042,11 @@ wss.on('connection', (ws, req) => {
         fwd('memory_error', { message: '任务级记忆不可用（当前没有活动任务）' });
         return;
       }
-      const ok = store.forget(String(msg.id ?? ''));
+      const ok = await store.forget(String(msg.id ?? ''));
       if (!ok) fwd('memory_error', { message: '未找到该记忆条目' });
       else {
-        sendMemoryList();
-        sendTrashList();
+        await sendMemoryList();
+        await sendTrashList();
       }
       return;
     }
@@ -1062,9 +1061,9 @@ wss.on('connection', (ws, req) => {
         fwd('memory_error', { message: '任务级记忆不可用（当前没有活动任务）' });
         return;
       }
-      store.clear();
-      sendMemoryList();
-      sendTrashList();
+      await store.clear();
+      await sendMemoryList();
+      await sendTrashList();
       return;
     }
 
@@ -1078,11 +1077,11 @@ wss.on('connection', (ws, req) => {
         fwd('memory_error', { message: '任务级记忆不可用（当前没有活动任务）' });
         return;
       }
-      const ok = store.forgetFact(String(msg.content ?? ''));
+      const ok = await store.forgetFact(String(msg.content ?? ''));
       if (!ok) fwd('memory_error', { message: '未找到该事实' });
       else {
-        sendMemoryList();
-        sendTrashList();
+        await sendMemoryList();
+        await sendTrashList();
       }
       return;
     }
@@ -1103,7 +1102,7 @@ wss.on('connection', (ws, req) => {
         fwd('memory_error', { message: '任务级记忆不可用（当前没有活动任务）' });
         return;
       }
-      const bundle = buildExportBundle(store, scope as 'user' | 'project');
+      const bundle = await buildExportBundle(store, scope as 'user' | 'project');
       fwd('memory_export', { scope, bundle });
       return;
     }
@@ -1140,8 +1139,8 @@ wss.on('connection', (ws, req) => {
           entriesAdded: r.entriesAdded,
           skipped: r.skipped,
         });
-        sendMemoryList();
-        sendTrashList();
+        await sendMemoryList();
+        await sendTrashList();
       } catch (e) {
         fwd('memory_error', { message: e instanceof Error ? e.message : '导入失败' });
       }
@@ -1168,11 +1167,11 @@ wss.on('connection', (ws, req) => {
         fwd('memory_error', { message: '任务级记忆不可用（当前没有活动任务）' });
         return;
       }
-      const ok = store.restore(String(msg.trashId ?? ''));
+      const ok = await store.restore(String(msg.trashId ?? ''));
       if (!ok) fwd('memory_error', { message: '未找到该回收项（可能已恢复或超期清理）' });
       else {
-        sendMemoryList();
-        sendTrashList();
+        await sendMemoryList();
+        await sendTrashList();
       }
       return;
     }
@@ -1184,13 +1183,13 @@ wss.on('connection', (ws, req) => {
       }
       const { user, project } = makeStores();
       const scope = String(msg.scope ?? '');
-      if (scope === 'user') user.purgeTrash();
-      else if (scope === 'project') project?.purgeTrash();
+      if (scope === 'user') await user.purgeTrash();
+      else if (scope === 'project') await project?.purgeTrash();
       else {
-        user.purgeTrash();
-        project?.purgeTrash();
+        await user.purgeTrash();
+        await project?.purgeTrash();
       }
-      sendTrashList();
+      await sendTrashList();
       return;
     }
 

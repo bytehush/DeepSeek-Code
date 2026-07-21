@@ -100,6 +100,15 @@ export class BgeEmbedder implements EmbedderBackend {
       return null;
     }
   }
+
+  /**
+   * 预热（M8）：提前加载 transformers 特征抽取管线，使首次 embed 不卡顿。
+   * off 模式无需模型，直接返回；local/remote 模式触发 getExtractor（懒加载、幂等）。
+   */
+  async warmup(): Promise<void> {
+    if (this.mode === 'off') return;
+    await this.getExtractor();
+  }
 }
 
 /** 关闭嵌入：embed 恒返回 null，调用方据此退化为关键词召回。供后续阶段经工厂注入。 */
@@ -165,6 +174,11 @@ export class RemoteEmbedder implements EmbedderBackend {
     const json = (await resp.json()) as { data?: { embedding: number[] }[] };
     const vec = json.data?.[0]?.embedding;
     return Array.isArray(vec) && vec.length > 0 ? vec : null;
+  }
+
+  /** 预热：提前加载本地降级用 BGE 模型（远程无需预载，但本地降级路径需要）。 */
+  async warmup(): Promise<void> {
+    await this.local.warmup();
   }
 }
 

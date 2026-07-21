@@ -494,7 +494,7 @@ export class AgentHost extends EventEmitter {
       return { deleted: 0, merged: 0, summary: '', skipped: true, reason: proposal.reason };
     }
     try {
-      return applyProposal(this.props.memoryStore, proposal);
+      return await applyProposal(this.props.memoryStore, proposal);
     } catch {
       return { deleted: 0, merged: 0, summary: '', skipped: true, reason: '记忆体检执行失败（写入异常），已跳过' };
     }

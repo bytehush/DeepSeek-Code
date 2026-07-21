@@ -46,43 +46,45 @@ export class MemoryOrchestrator implements MemoryService {
     this.project = createMemoryBackend(join(cwd, '.dsa', 'memory'), embedder);
   }
 
-  loadFacts(): { user: string; project: string } {
-    return { user: this.user.loadFacts(), project: this.project.loadFacts() };
+  async loadFacts(): Promise<{ user: string; project: string }> {
+    return { user: await this.user.loadFacts(), project: await this.project.loadFacts() };
   }
 
-  addFact(text: string, scope: 'user' | 'project' = 'project'): void {
-    (scope === 'user' ? this.user : this.project).addFact(text);
+  async addFact(text: string, scope: 'user' | 'project' = 'project'): Promise<void> {
+    await (scope === 'user' ? this.user : this.project).addFact(text);
   }
 
   async addEntry(content: string, tags?: string[], scope: 'user' | 'project' = 'project'): Promise<MemoryEntry> {
     return (scope === 'user' ? this.user : this.project).addEntry(content, tags);
   }
 
-  list(): Array<{ scope: 'user' | 'project'; entry: MemoryEntry }> {
+  async list(): Promise<Array<{ scope: 'user' | 'project'; entry: MemoryEntry }>> {
+    const [p, u] = await Promise.all([this.project.list(), this.user.list()]);
     return [
-      ...this.project.list().map((entry) => ({ scope: 'project' as const, entry })),
-      ...this.user.list().map((entry) => ({ scope: 'user' as const, entry })),
+      ...p.map((entry) => ({ scope: 'project' as const, entry })),
+      ...u.map((entry) => ({ scope: 'user' as const, entry })),
     ];
   }
 
-  forget(idPrefix: string, scope: 'user' | 'project'): boolean {
+  async forget(idPrefix: string, scope: 'user' | 'project'): Promise<boolean> {
     return (scope === 'user' ? this.user : this.project).forget(idPrefix);
   }
 
-  listTrash(): Array<{ scope: 'user' | 'project'; item: TrashItem }> {
+  async listTrash(): Promise<Array<{ scope: 'user' | 'project'; item: TrashItem }>> {
+    const [p, u] = await Promise.all([this.project.listTrash(), this.user.listTrash()]);
     return [
-      ...this.project.listTrash().map((item) => ({ scope: 'project' as const, item })),
-      ...this.user.listTrash().map((item) => ({ scope: 'user' as const, item })),
+      ...p.map((item) => ({ scope: 'project' as const, item })),
+      ...u.map((item) => ({ scope: 'user' as const, item })),
     ];
   }
 
-  restore(trashId: string, scope: 'user' | 'project'): boolean {
+  async restore(trashId: string, scope: 'user' | 'project'): Promise<boolean> {
     return (scope === 'user' ? this.user : this.project).restore(trashId);
   }
 
-  purgeTrash(scope?: 'user' | 'project'): void {
-    if (!scope || scope === 'user') this.user.purgeTrash();
-    if (!scope || scope === 'project') this.project.purgeTrash();
+  async purgeTrash(scope?: 'user' | 'project'): Promise<void> {
+    if (!scope || scope === 'user') await this.user.purgeTrash();
+    if (!scope || scope === 'project') await this.project.purgeTrash();
   }
 
   async retrieve(query: string, k = 5): Promise<MemoryEntry[]> {
@@ -100,7 +102,7 @@ export class MemoryOrchestrator implements MemoryService {
   }
 
   async compose(base: string, query: string, k = 5): Promise<string> {
-    const facts = this.loadFacts();
+    const facts = await this.loadFacts();
     if (!query) return composeSystemPrompt(base, facts.user, facts.project, []);
     const scored = await this.queryScored(query, k);
     const VECTOR_MIN_SCORE = 0.3;
@@ -139,8 +141,9 @@ export class MemoryOrchestrator implements MemoryService {
     return reviseMemories(client, this, { recentContext: opts.recentContext, force: opts.force }).catch(() => null);
   }
 
-  /** 资源释放：置 disposed，阻止后续抽取/整理（M8 异步 I/O 阶段扩展落盘 flush）。 */
-  onDispose(): void {
+  /** 资源释放：置 disposed，冲刷两层写链确保落盘，阻止后续抽取/整理。 */
+  async onDispose(): Promise<void> {
     this._disposed = true;
+    await Promise.all([this.user.onDispose().catch(() => {}), this.project.onDispose().catch(() => {})]);
   }
 }

@@ -136,14 +136,14 @@ export async function proposeRevise(
   store: MemoryService,
   opts: { recentContext?: string; force?: boolean } = {},
 ): Promise<ReviseProposal> {
-  const entries = store.list();
+  const entries = await store.list();
   const skippedBase: ReviseProposal = { actions: [], summary: '', skipped: true };
 
   if (!opts.force) {
     if (entries.length < MIN_ENTRIES) {
       return { ...skippedBase, reason: `记忆条目不足 ${MIN_ENTRIES} 条，暂无需整理` };
     }
-    const last = store.user.getMeta().lastReviseAt ?? 0;
+    const last = (await store.user.getMeta()).lastReviseAt ?? 0;
     if (Date.now() - last < REVISE_INTERVAL_MS) {
       return { ...skippedBase, reason: '距上次整理不足 24 小时，已跳过（可输入 /dream 强制整理）' };
     }
@@ -231,20 +231,20 @@ export async function proposeRevise(
  * 执行一份体检提案：删除/合并动作落盘（删除项先进回收站，可撤销），并刷新整理时间戳。
  * 与 proposeRevise 解耦，使 Web 端可以先预览、用户确认后再 apply。
  */
-export function applyProposal(store: MemoryService, proposal: ReviseProposal): ReviseResult {
+export async function applyProposal(store: MemoryService, proposal: ReviseProposal): Promise<ReviseResult> {
   let deleted = 0;
   let merged = 0;
   for (const a of proposal.actions) {
     if (a.kind === 'delete' || a.kind === 'merge_remove') {
-      if (store.forget(a.id.slice(0, 8), a.scope)) deleted++;
+      if (await store.forget(a.id.slice(0, 8), a.scope)) deleted++;
     } else if (a.kind === 'merge_keep') {
       const target = a.scope === 'user' ? store.user : store.project;
-      if (target.updateEntry(a.id, a.target ?? a.content)) merged++;
+      if (await target.updateEntry(a.id, a.target ?? a.content)) merged++;
     }
   }
   // 记录整理时间（两层都写，保证节流一致）
-  store.user.setMeta({ lastReviseAt: Date.now() });
-  store.project.setMeta({ lastReviseAt: Date.now() });
+  await store.user.setMeta({ lastReviseAt: Date.now() });
+  await store.project.setMeta({ lastReviseAt: Date.now() });
 
   const summary = proposal.summary || `记忆体检完成：删除 ${deleted} 条、合并 ${merged} 组。`;
   return { deleted, merged, summary, skipped: false };

@@ -11,6 +11,8 @@ import { BgeEmbedder, NullEmbedder, RemoteEmbedder } from './embedder.ts';
 export interface EmbedderBackend {
   /** 文本 → 向量（长度 768）；失败 / 离线 / 关闭 → 返回 null。 */
   embed(text: string): Promise<number[] | null>;
+  /** 预热：提前加载嵌入模型（M8），使首次 embed 不卡顿。可选，未实现则调用方可跳过。 */
+  warmup?(): Promise<void>;
 }
 
 export interface CreateEmbedderOpts {

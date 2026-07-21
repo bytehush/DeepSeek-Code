@@ -24,21 +24,21 @@ export interface MemoryService {
   readonly project: MemoryBackend;
 
   /** 读取两层的常驻事实（MEMORY.md）。 */
-  loadFacts(): { user: string; project: string };
+  loadFacts(): Promise<{ user: string; project: string }>;
   /** 追加一条常驻事实；scope 默认项目级。 */
-  addFact(text: string, scope?: 'user' | 'project'): void;
+  addFact(text: string, scope?: 'user' | 'project'): Promise<void>;
   /** 新增一条语义记忆（写入时即嵌入缓存）；scope 默认项目级。 */
   addEntry(content: string, tags?: string[], scope?: 'user' | 'project'): Promise<MemoryEntry>;
   /** 列出两层全部语义记忆，标注作用域。 */
-  list(): Array<{ scope: 'user' | 'project'; entry: MemoryEntry }>;
+  list(): Promise<Array<{ scope: 'user' | 'project'; entry: MemoryEntry }>>;
   /** 删除一条语义记忆；scope 指定删哪一层。 */
-  forget(idPrefix: string, scope: 'user' | 'project'): boolean;
+  forget(idPrefix: string, scope: 'user' | 'project'): Promise<boolean>;
   /** 列出两层回收站条目，标注作用域（最新删除的在前）。 */
-  listTrash(): Array<{ scope: 'user' | 'project'; item: TrashItem }>;
+  listTrash(): Promise<Array<{ scope: 'user' | 'project'; item: TrashItem }>>;
   /** 从指定作用域的回收站恢复一条。 */
-  restore(trashId: string, scope: 'user' | 'project'): boolean;
+  restore(trashId: string, scope: 'user' | 'project'): Promise<boolean>;
   /** 永久清空回收站；不传 scope 时两层都清。 */
-  purgeTrash(scope?: 'user' | 'project'): void;
+  purgeTrash(scope?: 'user' | 'project'): Promise<void>;
   /** 合并两层语义预取（各取 top-K 再合并截断，项目级优先）。 */
   retrieve(query: string, k?: number): Promise<MemoryEntry[]>;
   /** 合并两层带分数召回（去重判定用）。 */
@@ -71,6 +71,6 @@ export interface MemoryService {
     opts?: { recentContext?: string; force?: boolean },
   ): Promise<ReviseResult | null>;
 
-  /** 资源释放钩子（异步 I/O 阶段 M8 扩展；当前实现为空操作或置 disposed 标记）。 */
-  onDispose(): void;
+  /** 资源释放钩子（异步 I/O 阶段 M8 扩展；冲刷写链确保落盘，再置 disposed 标记）。 */
+  onDispose(): Promise<void>;
 }

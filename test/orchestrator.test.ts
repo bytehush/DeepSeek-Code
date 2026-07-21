@@ -89,7 +89,7 @@ test('MemoryOrchestrator: onDispose 后不再抽取', async () => {
   try {
     const orch = new MemoryOrchestrator(cwd, new Embedder({ mode: 'off' }));
     const client = makeClient();
-    orch.onDispose();
+    await orch.onDispose();
     const n = await orch.extractAtTurnEnd(makeHistory(), client);
     assert.strictEqual(n, 0, '释放后应直接降级为 0');
     assert.strictEqual(client._calls.length, 0, '释放后不应调用模型');

@@ -139,7 +139,7 @@ export async function extractUserMemories(
         // P1b（M4）：硬事实默认写项目级（flag=false 与旧路径逐字节一致）；
         // factScopeUser=true 时写用户级 ~/.dsa/memory，跨任务/跨项目可见。
         const scope = loadMemoryConfig().factScopeUser ? 'user' : 'project';
-        store.addFact(it.content, scope);
+        await store.addFact(it.content, scope);
       } else {
         await store.addEntry(it.content, it.tags);
       }

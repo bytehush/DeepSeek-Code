@@ -1,7 +1,8 @@
 import type { MemoryEntry, TrashItem } from './types.ts';
 import type { EmbedderBackend } from './embedder-backend.ts';
 import type { ScoredMemory } from './retriever.ts';
-import { FileMemoryBackend } from './store.ts';
+import { FileMemoryBackend, type FileMemoryBackendOpts } from './store.ts';
+import { loadMemoryConfig } from './config.ts';
 
 /**
  * 单作用域记忆后端接口（M1 架构抽象 · 解决 L7「无接口抽象」）。
@@ -15,43 +16,54 @@ import { FileMemoryBackend } from './store.ts';
  */
 export interface MemoryBackend {
   /** 读取常驻事实全文（MEMORY.md），不存在返回空串。 */
-  loadFacts(): string;
+  loadFacts(): Promise<string>;
   /** 追加一条常驻事实。 */
-  addFact(text: string): void;
+  addFact(text: string): Promise<void>;
   /** 新增一条语义记忆（写入时即嵌入缓存）。 */
   addEntry(content: string, tags?: string[]): Promise<MemoryEntry>;
+  /** 批量新增语义记忆（写入时并发嵌入、单次写盘，M8 批量嵌入复用）。 */
+  addEntries(contents: string[], tagsList?: Array<string[] | undefined>): Promise<MemoryEntry[]>;
   /** 列出全部语义记忆。 */
-  list(): MemoryEntry[];
+  list(): Promise<MemoryEntry[]>;
   /** 清空全部语义记忆（进回收站）。 */
-  clear(): void;
+  clear(): Promise<void>;
   /** 按 id 前缀删除一条语义记忆（进回收站）。 */
-  forget(idPrefix: string): boolean;
+  forget(idPrefix: string): Promise<boolean>;
   /** 按内容删除一条常驻事实（进回收站）。 */
-  forgetFact(content: string): boolean;
+  forgetFact(content: string): Promise<boolean>;
   /** 更新一条语义记忆内容（保留 id/createdAt）。 */
-  updateEntry(id: string, content: string): boolean;
+  updateEntry(id: string, content: string): Promise<boolean>;
   /** 列出回收站（已过滤超期项）。 */
-  listTrash(): TrashItem[];
+  listTrash(): Promise<TrashItem[]>;
   /** 从回收站恢复一条。 */
-  restore(trashId: string): boolean;
+  restore(trashId: string): Promise<boolean>;
   /** 永久清空回收站。 */
-  purgeTrash(): void;
+  purgeTrash(): Promise<void>;
   /** 读取作用域元数据。 */
-  getMeta(): { lastReviseAt?: number };
+  getMeta(): Promise<{ lastReviseAt?: number }>;
   /** 合并写入作用域元数据。 */
-  setMeta(patch: { lastReviseAt?: number }): void;
+  setMeta(patch: { lastReviseAt?: number }): Promise<void>;
   /** 启动语义预取：top-K 相关记忆（无向量自动关键词降级）。 */
   retrieve(query: string, k?: number): Promise<MemoryEntry[]>;
   /** 带分数的召回（去重判定用）。 */
   queryScored(query: string, k?: number): Promise<ScoredMemory[]>;
   /** 内容是否与现有记忆重复（语义 + 常驻事实，阈值 0.82 / 0.6）。 */
   isDuplicate(content: string): Promise<boolean>;
+  /** 资源释放钩子（M8 异步 I/O：冲刷写链确保落盘）。 */
+  onDispose(): Promise<void>;
 }
 
 /**
  * 工厂：按 baseDir + embedder 构造文件后端。
  * 作为依赖注入点，后续阶段可在此切换实现而不动调用方。
+ * asyncBackend flag 经 loadMemoryConfig 读取并透传给 FileMemoryBackend
+ * （true=异步 I/O 不阻塞事件循环，默认；false=同步回退，输出逐字节一致）。
  */
-export function createMemoryBackend(baseDir: string, embedder: EmbedderBackend): MemoryBackend {
-  return new FileMemoryBackend(baseDir, embedder);
+export function createMemoryBackend(
+  baseDir: string,
+  embedder: EmbedderBackend,
+  opts?: FileMemoryBackendOpts,
+): MemoryBackend {
+  const async = opts?.async ?? loadMemoryConfig().asyncBackend;
+  return new FileMemoryBackend(baseDir, embedder, { async });
 }

@@ -61,18 +61,18 @@ export async function handleMemory(
       push('system', '用法: /memory fact <文本> [--global]');
       return;
     }
-    manager.addFact(arg, scope);
+    await manager.addFact(arg, scope);
     const tag = isGlobal ? '（全局）' : '（项目）';
     push('system', `已新增常驻事实${tag}: ${arg}`);
     return;
   }
   if (sub === 'list') {
-    const { user, project } = manager.loadFacts();
+    const { user, project } = await manager.loadFacts();
     const factBlock =
       `=== 常驻事实 ===\n` +
       `[项目 .dsa/memory]\n${project || '（空）'}\n` +
       `[全局 ~/.dsa/memory]\n${user || '（空）'}`;
-    const entries = manager.list();
+    const entries = await manager.list();
     const memBlock = `=== 语义记忆（${entries.length}）===\n${
       entries.length === 0
         ? '（空）'
@@ -91,7 +91,7 @@ export async function handleMemory(
       push('system', '用法: /memory forget <id> [--global]');
       return;
     }
-    const ok = manager.forget(arg, scope);
+    const ok = await manager.forget(arg, scope);
     const tag = isGlobal ? '（全局）' : '（项目）';
     push('system', ok ? `已删除记忆${tag} [#${arg.slice(0, 8)}]` : `未找到匹配的记忆 [#${arg.slice(0, 8)}]`);
     return;
@@ -212,7 +212,7 @@ export async function applyMemoryIntent(
     return;
   }
   if (kind === 'fact') {
-    manager.addFact(content, scope);
+    await manager.addFact(content, scope);
     push('system', `🧠 已记住（${scopeTag}·常驻事实）：${content}\n（撤销：/memory list 查看，暂不支持删事实行）`);
   } else {
     const e = await manager.addEntry(content, undefined, scope);

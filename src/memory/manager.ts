@@ -49,13 +49,13 @@ export class MemoryManager implements MemoryService {
   }
 
   /** 读取两层的常驻事实（MEMORY.md）。 */
-  loadFacts(): { user: string; project: string } {
-    return { user: this.user.loadFacts(), project: this.project.loadFacts() };
+  async loadFacts(): Promise<{ user: string; project: string }> {
+    return { user: await this.user.loadFacts(), project: await this.project.loadFacts() };
   }
 
   /** 追加一条常驻事实；scope 默认项目级。 */
-  addFact(text: string, scope: Scope = 'project'): void {
-    (scope === 'user' ? this.user : this.project).addFact(text);
+  async addFact(text: string, scope: Scope = 'project'): Promise<void> {
+    await (scope === 'user' ? this.user : this.project).addFact(text);
   }
 
   /** 新增一条语义记忆（写入时即嵌入缓存）；scope 默认项目级。 */
@@ -64,35 +64,37 @@ export class MemoryManager implements MemoryService {
   }
 
   /** 列出两层全部语义记忆，标注作用域。 */
-  list(): Array<{ scope: Scope; entry: MemoryEntry }> {
+  async list(): Promise<Array<{ scope: Scope; entry: MemoryEntry }>> {
+    const [p, u] = await Promise.all([this.project.list(), this.user.list()]);
     return [
-      ...this.project.list().map((entry) => ({ scope: 'project' as Scope, entry })),
-      ...this.user.list().map((entry) => ({ scope: 'user' as Scope, entry })),
+      ...p.map((entry) => ({ scope: 'project' as Scope, entry })),
+      ...u.map((entry) => ({ scope: 'user' as Scope, entry })),
     ];
   }
 
   /** 删除一条语义记忆；scope 指定删哪一层。 */
-  forget(idPrefix: string, scope: Scope): boolean {
+  async forget(idPrefix: string, scope: Scope): Promise<boolean> {
     return (scope === 'user' ? this.user : this.project).forget(idPrefix);
   }
 
   /** 列出两层回收站条目，标注作用域（最新删除的在前）。 */
-  listTrash(): Array<{ scope: Scope; item: TrashItem }> {
+  async listTrash(): Promise<Array<{ scope: Scope; item: TrashItem }>> {
+    const [p, u] = await Promise.all([this.project.listTrash(), this.user.listTrash()]);
     return [
-      ...this.project.listTrash().map((item) => ({ scope: 'project' as Scope, item })),
-      ...this.user.listTrash().map((item) => ({ scope: 'user' as Scope, item })),
+      ...p.map((item) => ({ scope: 'project' as Scope, item })),
+      ...u.map((item) => ({ scope: 'user' as Scope, item })),
     ];
   }
 
   /** 从指定作用域的回收站恢复一条。 */
-  restore(trashId: string, scope: Scope): boolean {
+  async restore(trashId: string, scope: Scope): Promise<boolean> {
     return (scope === 'user' ? this.user : this.project).restore(trashId);
   }
 
   /** 永久清空回收站；不传 scope 时两层都清。 */
-  purgeTrash(scope?: Scope): void {
-    if (!scope || scope === 'user') this.user.purgeTrash();
-    if (!scope || scope === 'project') this.project.purgeTrash();
+  async purgeTrash(scope?: Scope): Promise<void> {
+    if (!scope || scope === 'user') await this.user.purgeTrash();
+    if (!scope || scope === 'project') await this.project.purgeTrash();
   }
 
   /** 合并两层语义预取（各取 top-K 再合并截断，项目级优先）。 */
@@ -126,7 +128,7 @@ export class MemoryManager implements MemoryService {
    * 仅作兜底召回，按 K 取 top 即可）。
    */
   async compose(base: string, query: string, k = 5): Promise<string> {
-    const facts = this.loadFacts();
+    const facts = await this.loadFacts();
     if (!query) return composeSystemPrompt(base, facts.user, facts.project, []);
     const scored = await this.queryScored(query, k);
     const VECTOR_MIN_SCORE = 0.3;
@@ -169,6 +171,8 @@ export class MemoryManager implements MemoryService {
     );
   }
 
-  /** 资源释放钩子（M8 异步 I/O 前为空操作）。 */
-  onDispose(): void {}
+  /** 资源释放钩子（M8 异步 I/O：冲刷两层写链，确保落盘）。 */
+  async onDispose(): Promise<void> {
+    await Promise.all([this.user.onDispose(), this.project.onDispose()]);
+  }
 }

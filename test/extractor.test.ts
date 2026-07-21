@@ -86,12 +86,12 @@ test('M4 factScopeUser=true: fact 进 user 层, semantic 仍进 project 层', as
     const n = await extractUserMemories(client, makeHistory(), orch);
     assert.strictEqual(n, 2, '应沉淀 1 fact + 1 semantic');
     // fact → user
-    assert.match(orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, 'fact 应写进 user 层');
-    assert.doesNotMatch(orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, 'fact 不应写进 project 层');
+    assert.match(await orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, 'fact 应写进 user 层');
+    assert.doesNotMatch(await orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, 'fact 不应写进 project 层');
     // semantic → project（user 层无语义记忆）
-    assert.strictEqual(orch.user.list().length, 0, 'user 层不应有 semantic 条目');
+    assert.strictEqual((await orch.user.list()).length, 0, 'user 层不应有 semantic 条目');
     assert.ok(
-      orch.project.list().some((e) => e.content.includes('正在准备前端实习')),
+      (await orch.project.list()).some((e) => e.content.includes('正在准备前端实习')),
       'semantic 应写进 project 层',
     );
   });
@@ -103,12 +103,12 @@ test('M4 factScopeUser=false (默认): fact 进 project 层, 与旧路径逐字�
     const n = await extractUserMemories(client, makeHistory(), orch);
     assert.strictEqual(n, 2, '应沉淀 1 fact + 1 semantic');
     // 默认：fact → project
-    assert.match(orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, '默认 fact 应写进 project 层');
-    assert.doesNotMatch(orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, '默认 fact 不应写进 user 层');
-    assert.strictEqual(orch.user.list().length, 0, 'user 层应为空（默认不写用户级）');
+    assert.match(await orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, '默认 fact 应写进 project 层');
+    assert.doesNotMatch(await orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, '默认 fact 不应写进 user 层');
+    assert.strictEqual((await orch.user.list()).length, 0, 'user 层应为空（默认不写用户级）');
     // semantic → project
     assert.ok(
-      orch.project.list().some((e) => e.content.includes('正在准备前端实习')),
+      (await orch.project.list()).some((e) => e.content.includes('正在准备前端实习')),
       'semantic 应写进 project 层',
     );
   });
@@ -119,7 +119,7 @@ test('M4 flag 显式关: factScopeUser=false 仍走 project（覆盖 env 默认�
     const client = makeClient();
     const n = await extractUserMemories(client, makeHistory(), orch);
     assert.strictEqual(n, 2);
-    assert.match(orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, '显式关 flag 时 fact 进 project');
-    assert.doesNotMatch(orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, '显式关 flag 时 user 层无 fact');
+    assert.match(await orch.project.loadFacts(), /偏好使用 pnpm 包管理器/, '显式关 flag 时 fact 进 project');
+    assert.doesNotMatch(await orch.user.loadFacts(), /偏好使用 pnpm 包管理器/, '显式关 flag 时 user 层无 fact');
   });
 });

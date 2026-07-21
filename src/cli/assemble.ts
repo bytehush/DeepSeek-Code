@@ -83,6 +83,9 @@ export async function assembleAppProps(
   const embedder = createEmbedder(memoryConfig.embedderMirror ? 'remote' : 'local', {
     mirror: memoryConfig.embedderMirror,
   });
+  // M8: 启动预热——提前加载嵌入模型，使首条记忆检索不卡顿；fire-and-forget，
+  // 失败（离线/无 key）优雅降级，不阻塞 assemble。compose 的首次 embed 复用同一加载。
+  void embedder.warmup?.().catch(() => {});
   const memory = memoryConfig.useOrchestrator
     ? new MemoryOrchestrator(cwd, embedder)
     : new MemoryManager(cwd, embedder);

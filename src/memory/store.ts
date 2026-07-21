@@ -1,4 +1,11 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  mkdirSync,
+} from 'node:fs';
+import { readFile, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MemoryEntry, TrashItem } from './types.ts';
@@ -17,12 +24,23 @@ import { retrieve, retrieveScored, keywordScore, type ScoredMemory } from './ret
  * - 记忆只服务非代码语义，绝不进入 grep/search 工具链（避免污染代码检索）。
  * - 子 Agent 不加载本库（隔离，保持 delegate 现状）。
  * - 所有写操作落盘；嵌入失败不影响事实记忆与关键词降级检索。
+ *
+ * ── M8 异步 I/O ──
+ * 全部读/写方法均为 async。内部 I/O 由 `this._async` 决定走 `fs/promises`（异步、不阻塞事件循环）
+ * 还是同步 `fs`（回退路径，输出逐字节一致，作安全锚点）。异步模式下所有「读-改-写」变更操作经
+ * 实例级写串行链 `_chain` 排队，杜绝并发 async 写交错导致丢失更新 / 半截文件。纯读命中内存缓存，
+ * 不进写链，保证读取不阻塞写入。
  */
 const FACTS_FILE = 'MEMORY.md';
 const INDEX_FILE = 'memories.json';
 const TRASH_FILE = 'trash.json';
 /** 回收站保留时长（ms）：30 天后超期项在下次读取时自动清理。 */
 const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export interface FileMemoryBackendOpts {
+  /** 异步 I/O 开关（M8）。true=fs/promises 不阻塞事件循环；false=同步 fs 回退（输出逐字节一致）。 */
+  async?: boolean;
+}
 
 /**
  * 单作用域记忆库。baseDir 由调用方决定：
@@ -33,6 +51,8 @@ const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export class FileMemoryBackend implements MemoryBackend {
   private dir: string;
   private embedder: EmbedderBackend;
+  /** M8 异步 I/O 开关；false = 同步回退（逐字节一致）。 */
+  private _async: boolean;
 
   /** ✅ 性能：readIndex 内存缓存，避免每次操作都从磁盘全量重读+解析 JSON */
   private _indexCache: MemoryEntry[] | null = null;
@@ -41,147 +61,225 @@ export class FileMemoryBackend implements MemoryBackend {
   private _factsCache: string | null = null;
   private _factsDirty = true;
 
-  constructor(baseDir: string, embedder: EmbedderBackend) {
+  /** M8 写串行链：所有读-改-写变更操作入队，保证异步模式下不交错损坏。 */
+  private _chain: Promise<void> = Promise.resolve();
+  /**
+   * 重入标记：当前是否正处于某个已入链操作的执行体中。
+   * 用于打破「操作体内又调用 enqueue」（如 forget→pushTrash、restore→addFact）引发的死锁：
+   * 处于操作体内时，被调用的内部写直接就地执行（本就已被外层操作串行化），不再挂新链节。
+   */
+  private _inOp = false;
+
+  constructor(baseDir: string, embedder: EmbedderBackend, opts?: FileMemoryBackendOpts) {
     this.dir = baseDir;
     this.embedder = embedder;
+    this._async = opts?.async ?? false;
   }
 
-  private ensure(): void {
+  /** 确保目录存在（同步 mkdir，幂等，两种模式通用）。 */
+  private ensureDir(): void {
     if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
   }
 
-  /** 原子写：先写临时文件再 rename，避免崩溃/并发导致 MEMORY.md / memories.json 半截损坏 */
-  private atomicWrite(p: string, data: string): void {
-    this.ensure();
+  /**
+   * 异步模式下把变更操作入写链串行执行；同步模式直接执行（同步 fs 天然不交错）。
+   *
+   * 重入处理（关键）：若当前已处于某个入链操作的执行体中（_inOp=true），则被调用的写操作
+   * 直接就地执行、不再挂新链节。否则会出现循环依赖死锁——
+   *   父操作 opA 体内 await 子操作 opB 的 enqueue 结果；
+   *   而 opB 的 prev 被设为 runA.then(...)（链尾需等 opA 整体完成）；
+   *   opA 又必须等 opB 完成才算完成 ⇒ 互相等待 ⇒ 事件循环排空 ⇒ 进程退出 ⇒ 测试被 cancelledByParent。
+   * 重入时就地执行可彻底解除该循环：opB 在 opA 的执行体内同步顺序跑完，opA 继续。
+   */
+  private enqueue<T>(op: () => Promise<T>): Promise<T> {
+    if (!this._async) return op();
+    if (this._inOp) return op();
+    const prev = this._chain;
+    const run = (async () => {
+      await prev;
+      this._inOp = true;
+      try {
+        return await op();
+      } finally {
+        this._inOp = false;
+      }
+    })();
+    // 链尾 = run 的状态（run 即调用方 await 的对象，无额外悬挂 tail）
+    this._chain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  /** 读文本文件：异步模式用 fs/promises，同步模式用 readFileSync；不存在/失败返回 null。 */
+  private async readText(p: string): Promise<string | null> {
+    if (this._async) {
+      try {
+        return await readFile(p, 'utf8');
+      } catch {
+        return null;
+      }
+    }
+    return existsSync(p) ? readFileSync(p, 'utf8') : null;
+  }
+
+  /** 原子写：临时文件 + rename；异步/同步模式分别用对应 API，输出逐字节一致。 */
+  private async writeText(p: string, data: string): Promise<void> {
+    this.ensureDir();
     const tmp = `${p}.tmp`;
-    writeFileSync(tmp, data, 'utf8');
-    renameSync(tmp, p);
+    if (this._async) {
+      await writeFile(tmp, data, 'utf8');
+      await rename(tmp, p);
+    } else {
+      writeFileSync(tmp, data, 'utf8');
+      renameSync(tmp, p);
+    }
   }
 
   /** 读取常驻事实全文；文件不存在返回空串。使用缓存避免重复 I/O。 */
-  loadFacts(): string {
+  async loadFacts(): Promise<string> {
     if (!this._factsDirty && this._factsCache !== null) return this._factsCache;
-    const p = join(this.dir, FACTS_FILE);
-    if (!existsSync(p)) {
-      this._factsCache = '';
-      this._factsDirty = false;
-      return '';
-    }
-    this._factsCache = readFileSync(p, 'utf8').trim();
+    const raw = await this.readText(join(this.dir, FACTS_FILE));
+    const text = raw ? raw.trim() : '';
+    this._factsCache = text;
     this._factsDirty = false;
-    return this._factsCache;
+    return text;
   }
 
   /** 追加一条常驻事实到 MEMORY.md。 */
-  addFact(text: string): void {
-    this.ensure();
-    const p = join(this.dir, FACTS_FILE);
-    const existing = this.loadFacts();
-    const line = `- ${text.trim()}\n`;
-    const sep = existing && !existing.endsWith('\n') ? '\n' : '';
-    this.atomicWrite(p, existing + sep + line);
-    // ✅ 写完后更新缓存，而非标记脏（避免下次重读整个文件）
-    this._factsCache = existing + sep + line;
-    this._factsDirty = false;
+  async addFact(text: string): Promise<void> {
+    return this.enqueue(async () => {
+      const existing = await this.loadFacts();
+      const line = `- ${text.trim()}\n`;
+      const sep = existing && !existing.endsWith('\n') ? '\n' : '';
+      const next = existing + sep + line;
+      await this.writeText(join(this.dir, FACTS_FILE), next);
+      // ✅ 写完后更新缓存，而非标记脏（避免下次重读整个文件）
+      this._factsCache = next;
+      this._factsDirty = false;
+    });
   }
 
-  private readIndex(): MemoryEntry[] {
-    // ✅ 缓存：脏标记为 false 且缓存非 null 时直接返回内存副本
-    if (!this._indexDirty && this._indexCache !== null) return this._indexCache;
-    const p = join(this.dir, INDEX_FILE);
-    if (!existsSync(p)) {
-      this._indexCache = [];
-      this._indexDirty = false;
+  private async readIndexFile(): Promise<MemoryEntry[]> {
+    const raw = await this.readText(join(this.dir, INDEX_FILE));
+    if (!raw) return [];
+    try {
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? (arr as MemoryEntry[]) : [];
+    } catch {
       return [];
     }
-    try {
-      const raw = readFileSync(p, 'utf8');
-      const arr = JSON.parse(raw);
-      this._indexCache = Array.isArray(arr) ? (arr as MemoryEntry[]) : [];
-    } catch {
-      this._indexCache = [];
-    }
+  }
+
+  /** 读取索引（带内存缓存，避免每次全量重读解析）。 */
+  private async readIndex(): Promise<MemoryEntry[]> {
+    if (!this._indexDirty && this._indexCache !== null) return this._indexCache;
+    const entries = await this.readIndexFile();
+    this._indexCache = entries;
     this._indexDirty = false;
     return this._indexCache;
   }
 
-  private writeIndex(entries: MemoryEntry[]): void {
-    this.ensure();
+  private async writeIndex(entries: MemoryEntry[]): Promise<void> {
     this._indexCache = entries;
     this._indexDirty = false;
     // ✅ 紧凑 JSON（去掉 null, 2），减少序列化开销和文件尺寸
-    this.atomicWrite(join(this.dir, INDEX_FILE), JSON.stringify(entries));
+    await this.writeText(join(this.dir, INDEX_FILE), JSON.stringify(entries));
   }
 
-  /** 标记索引缓存脏，下次 readIndex 时重新从磁盘读取 */
+  /** 标记索引缓存脏，下次 readIndex 时重新从磁盘读取。 */
   private invalidateIndex(): void {
     this._indexDirty = true;
   }
 
   /** 新增一条语义记忆（写入时即嵌入并缓存向量）。 */
   async addEntry(content: string, tags?: string[]): Promise<MemoryEntry> {
-    const embedding = await this.embedder.embed(content);
-    const entry: MemoryEntry = {
+    return this.enqueue(() => this.doAddEntries([content], tags ? [tags] : [undefined]).then((es) => es[0]));
+  }
+
+  /**
+   * 批量新增语义记忆（M8 批量嵌入复用）：并发嵌入 N 条，读一次索引、单次写盘落盘全部。
+   * 比循环调用 addEntry 少 N-1 次磁盘写，长对话多记忆沉淀时延迟显著下降。
+   */
+  async addEntries(contents: string[], tagsList?: Array<string[] | undefined>): Promise<MemoryEntry[]> {
+    return this.enqueue(() => this.doAddEntries(contents, tagsList));
+  }
+
+  private async doAddEntries(
+    contents: string[],
+    tagsList?: Array<string[] | undefined>,
+  ): Promise<MemoryEntry[]> {
+    const embeddings = await Promise.all(contents.map((c) => this.embedder.embed(c)));
+    const now = Date.now();
+    const entries: MemoryEntry[] = contents.map((c, i) => ({
       id: randomUUID(),
-      content: content.trim(),
-      tags,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      embedding: embedding ?? undefined,
-    };
-    const all = this.readIndex();
-    all.push(entry);
-    this.writeIndex(all);
-    return entry;
+      content: c.trim(),
+      tags: tagsList?.[i],
+      createdAt: now,
+      updatedAt: now,
+      embedding: embeddings[i] ?? undefined,
+    }));
+    const all = await this.readIndex();
+    all.push(...entries);
+    await this.writeIndex(all);
+    return entries;
   }
 
   /** 列出全部语义记忆。 */
-  list(): MemoryEntry[] {
+  async list(): Promise<MemoryEntry[]> {
     return this.readIndex();
   }
 
   /** 清空全部语义记忆（保留 MEMORY.md 常驻事实）；被清空的条目进回收站可恢复。 */
-  clear(): void {
-    const all = this.readIndex();
-    if (all.length > 0) {
-      this.pushTrash(all.map((entry) => this.entryTrash(entry)));
-    }
-    this.writeIndex([]);
+  async clear(): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.readIndex();
+      if (all.length > 0) await this.pushTrash(all.map((entry) => this.entryTrash(entry)));
+      await this.writeIndex([]);
+    });
   }
 
   /** 按 id 前缀删除一条语义记忆（list 展示的是前 8 位，用户粘贴前缀即可）；删除进回收站可恢复。 */
-  forget(idPrefix: string): boolean {
-    const all = this.readIndex();
-    const removed = all.filter((e) => e.id.startsWith(idPrefix));
-    if (removed.length === 0) return false;
-    const next = all.filter((e) => !e.id.startsWith(idPrefix));
-    this.pushTrash(removed.map((entry) => this.entryTrash(entry)));
-    this.writeIndex(next);
-    return true;
+  async forget(idPrefix: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const all = await this.readIndex();
+      const removed = all.filter((e) => e.id.startsWith(idPrefix));
+      if (removed.length === 0) return false;
+      const next = all.filter((e) => !e.id.startsWith(idPrefix));
+      await this.pushTrash(removed.map((entry) => this.entryTrash(entry)));
+      await this.writeIndex(next);
+      return true;
+    });
   }
 
   /** 按内容删除 MEMORY.md 中的一条常驻事实（精确匹配去 `- ` 前缀后的文本）；删除进回收站可恢复。 */
-  forgetFact(content: string): boolean {
-    const p = join(this.dir, FACTS_FILE);
-    if (!existsSync(p)) return false;
-    const lines = readFileSync(p, 'utf8').split('\n');
-    const target = content.trim();
-    const idx = lines.findIndex((l) => l.replace(/^- /, '').trim() === target);
-    if (idx === -1) return false;
-    lines.splice(idx, 1);
-    writeFileSync(p, lines.join('\n'), 'utf8');
-    this.pushTrash([{ trashId: randomUUID(), kind: 'fact', deletedAt: Date.now(), fact: target }]);
-    return true;
+  async forgetFact(content: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const p = join(this.dir, FACTS_FILE);
+      const raw = await this.readText(p);
+      if (!raw) return false;
+      const lines = raw.split('\n');
+      const target = content.trim();
+      const idx = lines.findIndex((l) => l.replace(/^- /, '').trim() === target);
+      if (idx === -1) return false;
+      lines.splice(idx, 1);
+      await this.writeText(p, lines.join('\n'));
+      await this.pushTrash([{ trashId: randomUUID(), kind: 'fact', deletedAt: Date.now(), fact: target }]);
+      return true;
+    });
   }
 
   /** 更新一条语义记忆的内容（保留 id/createdAt，刷新 updatedAt）；供陈旧性治理合并使用。 */
-  updateEntry(id: string, content: string): boolean {
-    const all = this.readIndex();
-    const idx = all.findIndex((e) => e.id === id);
-    if (idx === -1) return false;
-    all[idx] = { ...all[idx], content: content.trim(), updatedAt: Date.now() };
-    this.writeIndex(all);
-    return true;
+  async updateEntry(id: string, content: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const all = await this.readIndex();
+      const idx = all.findIndex((e) => e.id === id);
+      if (idx === -1) return false;
+      all[idx] = { ...all[idx], content: content.trim(), updatedAt: Date.now() };
+      await this.writeIndex(all);
+      return true;
+    });
   }
 
   // ── 回收站（软删除 / 恢复） ──
@@ -191,63 +289,66 @@ export class FileMemoryBackend implements MemoryBackend {
     return { trashId: randomUUID(), kind: 'entry', deletedAt: Date.now(), entry };
   }
 
-  private readTrash(): TrashItem[] {
-    const p = join(this.dir, TRASH_FILE);
-    if (!existsSync(p)) return [];
+  private async readTrash(): Promise<TrashItem[]> {
+    const raw = await this.readText(join(this.dir, TRASH_FILE));
+    if (!raw) return [];
     try {
-      const arr = JSON.parse(readFileSync(p, 'utf8'));
+      const arr = JSON.parse(raw);
       if (!Array.isArray(arr)) return [];
       // 读取时顺手清理超期回收项（30 天）
       const now = Date.now();
       const alive = (arr as TrashItem[]).filter((t) => now - (t.deletedAt ?? 0) < TRASH_TTL_MS);
-      if (alive.length !== arr.length) this.writeTrash(alive);
+      if (alive.length !== arr.length) await this.writeTrash(alive);
       return alive;
     } catch {
       return [];
     }
   }
 
-  private writeTrash(items: TrashItem[]): void {
-    this.ensure();
-    this.atomicWrite(join(this.dir, TRASH_FILE), JSON.stringify(items, null, 2));
+  private async writeTrash(items: TrashItem[]): Promise<void> {
+    await this.writeText(join(this.dir, TRASH_FILE), JSON.stringify(items, null, 2));
   }
 
   /** 追加回收项（最新的排前面）。 */
-  private pushTrash(items: TrashItem[]): void {
+  private async pushTrash(items: TrashItem[]): Promise<void> {
     if (items.length === 0) return;
-    const cur = this.readTrash();
-    this.writeTrash([...items, ...cur]);
+    return this.enqueue(async () => {
+      const cur = await this.readTrash();
+      await this.writeTrash([...items, ...cur]);
+    });
   }
 
   /** 列出回收站全部条目（已自动过滤超期项）。 */
-  listTrash(): TrashItem[] {
+  async listTrash(): Promise<TrashItem[]> {
     return this.readTrash();
   }
 
   /** 从回收站恢复一条（entry 写回 memories.json，fact 追加回 MEMORY.md）。 */
-  restore(trashId: string): boolean {
-    const cur = this.readTrash();
-    const item = cur.find((t) => t.trashId === trashId);
-    if (!item) return false;
-    if (item.kind === 'entry' && item.entry) {
-      const all = this.readIndex();
-      // 避免重复恢复：同 id 已存在则跳过写入
-      if (!all.some((e) => e.id === item.entry!.id)) {
-        all.push({ ...item.entry, updatedAt: Date.now() });
-        this.writeIndex(all);
+  async restore(trashId: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const cur = await this.readTrash();
+      const item = cur.find((t) => t.trashId === trashId);
+      if (!item) return false;
+      if (item.kind === 'entry' && item.entry) {
+        const all = await this.readIndex();
+        // 避免重复恢复：同 id 已存在则跳过写入
+        if (!all.some((e) => e.id === item.entry!.id)) {
+          all.push({ ...item.entry, updatedAt: Date.now() });
+          await this.writeIndex(all);
+        }
+      } else if (item.kind === 'fact' && item.fact) {
+        await this.addFact(item.fact);
+      } else {
+        return false;
       }
-    } else if (item.kind === 'fact' && item.fact) {
-      this.addFact(item.fact);
-    } else {
-      return false;
-    }
-    this.writeTrash(cur.filter((t) => t.trashId !== trashId));
-    return true;
+      await this.writeTrash(cur.filter((t) => t.trashId !== trashId));
+      return true;
+    });
   }
 
   /** 永久清空回收站。 */
-  purgeTrash(): void {
-    this.writeTrash([]);
+  async purgeTrash(): Promise<void> {
+    await this.writeTrash([]);
   }
 
   private metaPath(): string {
@@ -255,11 +356,11 @@ export class FileMemoryBackend implements MemoryBackend {
   }
 
   /** 读取作用域元数据（当前用于陈旧性治理的 lastReviseAt 时间戳）。 */
-  getMeta(): { lastReviseAt?: number } {
+  async getMeta(): Promise<{ lastReviseAt?: number }> {
+    const raw = await this.readText(this.metaPath());
+    if (!raw) return {};
     try {
-      const p = this.metaPath();
-      if (!existsSync(p)) return {};
-      const obj = JSON.parse(readFileSync(p, 'utf8'));
+      const obj = JSON.parse(raw);
       return obj && typeof obj === 'object' ? obj : {};
     } catch {
       return {};
@@ -267,22 +368,23 @@ export class FileMemoryBackend implements MemoryBackend {
   }
 
   /** 合并写入作用域元数据。 */
-  setMeta(patch: { lastReviseAt?: number }): void {
-    this.ensure();
-    const cur = this.getMeta();
-    this.atomicWrite(this.metaPath(), JSON.stringify({ ...cur, ...patch }, null, 2));
+  async setMeta(patch: { lastReviseAt?: number }): Promise<void> {
+    return this.enqueue(async () => {
+      const cur = await this.getMeta();
+      await this.writeText(this.metaPath(), JSON.stringify({ ...cur, ...patch }, null, 2));
+    });
   }
 
   /** 启动语义预取：用 query 检索 top-K 相关记忆（无向量时自动关键词降级）。 */
   async retrieve(query: string, k = 5): Promise<MemoryEntry[]> {
     const qEmbed = await this.embedder.embed(query);
-    return retrieve(qEmbed, query, this.readIndex(), k);
+    return retrieve(qEmbed, query, await this.readIndex(), k);
   }
 
   /** 带分数的召回（去重用，需要分数阈值判断是否重复）。 */
   async queryScored(query: string, k = 5): Promise<ScoredMemory[]> {
     const qEmbed = await this.embedder.embed(query);
-    return retrieveScored(qEmbed, query, this.readIndex(), k);
+    return retrieveScored(qEmbed, query, await this.readIndex(), k);
   }
 
   /**
@@ -295,7 +397,7 @@ export class FileMemoryBackend implements MemoryBackend {
     const top = (await this.queryScored(content, 1))[0];
     if (top && top.score >= (top.mode === 'vector' ? 0.82 : 0.6)) return true;
     // 常驻事实逐行比较（避免整坨 MEMORY.md 越攒越稀释相似度）
-    const facts = this.loadFacts();
+    const facts = await this.loadFacts();
     if (facts) {
       const lines = facts
         .split('\n')
@@ -306,6 +408,14 @@ export class FileMemoryBackend implements MemoryBackend {
       }
     }
     return false;
+  }
+
+  /**
+   * 资源释放（M8 异步 I/O）：冲刷写链，确保全部排队的写操作落盘后再返回。
+   * 同步模式写本是同步完成，_chain 为空链，await 立即结束。
+   */
+  async onDispose(): Promise<void> {
+    await this._chain;
   }
 }
 
