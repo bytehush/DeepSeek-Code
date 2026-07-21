@@ -25,6 +25,7 @@ import { detectMemoryIntent } from '../memory/intent.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
 import { MEMORY_RECALL_MARKER } from '../memory/pipeline.ts';
 import type { ReviseResult } from '../memory/revise.ts';
+import { scheduleIdleRevise } from '../memory/revise.ts';
 import { msgOf } from '../utils/logger.ts';
 import { handleMemory, handleSkills, applyMemoryIntent } from './commands.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
@@ -172,10 +173,14 @@ function recentContextOf(history: AppProps['history']): string {
 /**
  * 会话结束自动整理记忆（陈旧性治理，带节流 + 幂等守卫）。
  * 守卫已上移到 MemoryService 实例级；无 key / 失败安全降级为 null。
+ * M10 idleRevise：flag 开→让出事件循环、治理在空闲时跑，不挤占会话收尾（默认关=逐字节一致）。
  */
 export async function runRevision(props: AppProps): Promise<ReviseResult | null> {
   if (!props.cfg.apiKey) return null;
   const transcript = recentContextOf(props.history);
+  if (loadMemoryConfig().idleRevise) {
+    return scheduleIdleRevise(props.client, props.memoryStore, { recentContext: transcript });
+  }
   return props.memoryStore.revise(props.client, { recentContext: transcript, force: false });
 }
 

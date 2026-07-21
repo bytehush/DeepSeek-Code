@@ -265,3 +265,34 @@ export async function reviseMemories(
   }
   return applyProposal(store, proposal);
 }
+
+/**
+ * M10 idleRevise 构建块：让出事件循环后在「空闲」时跑陈旧性治理（propose+apply），
+ * 不挤占当前调用方的执行流（如会话结束前的收尾）。
+ *
+ * scheduler 可注入（默认 setImmediate）：
+ * - 测试用同步/可控 scheduler 验证「调用即返回、不被治理阻塞」；
+ * - 生产用 setImmediate 让出当前 tick，治理在后续事件循环空闲时执行。
+ *
+ * 返回治理结果（与 store.revise 同契约），便于调用方 await 后展示摘要。
+ * 失败安全降级为 null（与 revise 的 .catch(() => null) 一致）。
+ */
+export type IdleScheduler = (fn: () => void) => void;
+
+const defaultScheduler: IdleScheduler = (fn) => setImmediate(fn);
+
+export async function scheduleIdleRevise(
+  client: DeepSeekClient,
+  store: MemoryService,
+  opts: { recentContext?: string; scheduler?: IdleScheduler } = {},
+): Promise<ReviseResult | null> {
+  const scheduler = opts.scheduler ?? defaultScheduler;
+  return new Promise<ReviseResult | null>((resolve) => {
+    scheduler(() => {
+      store
+        .revise(client, { recentContext: opts.recentContext, force: false })
+        .then(resolve)
+        .catch(() => resolve(null));
+    });
+  });
+}
