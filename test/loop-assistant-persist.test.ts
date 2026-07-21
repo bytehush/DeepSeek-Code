@@ -70,8 +70,8 @@ describe('loop 最终答复落盘（修复 agent 输出丢失）', () => {
     ]);
     try {
       assert.ok(replayed, 'replayAll 应返回非空消息');
-      const userMsg = replayed!.find((m) => m.role === 'user');
-      const asstMsg = replayed!.find(
+      const userMsg = replayed!.messages.find((m) => m.role === 'user');
+      const asstMsg = replayed!.messages.find(
         (m) => m.role === 'assistant' && !(m as { tool_calls?: unknown[] }).tool_calls?.length,
       );
       assert.ok(userMsg, '应包含 user 消息');
@@ -92,7 +92,7 @@ describe('loop 最终答复落盘（修复 agent 输出丢失）', () => {
     ]);
     try {
       assert.ok(replayed, 'replayAll 应返回非空消息');
-      const asstMsg = replayed!.find(
+      const asstMsg = replayed!.messages.find(
         (m) => m.role === 'assistant' && !(m as { tool_calls?: unknown[] }).tool_calls?.length,
       );
       assert.ok(asstMsg, '中断时的部分答复也应落盘（修复前此处缺失）');

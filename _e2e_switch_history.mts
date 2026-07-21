@@ -24,9 +24,6 @@ import { rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { TraceLogger } from './src/context/trace.ts';
-import { runAgent } from './src/agent/loop.ts';
-import type { DeepSeekClient, ChatMessage } from './src/llm/deepseek.ts';
-import type { ConversationHistory } from './src/context/history.ts';
 
 const USER = `e2e_${Date.now().toString(36)}`;
 const PASS = 'e2e123';
@@ -53,26 +50,8 @@ function cleanup(): void {
   } catch { /* ignore */ }
 }
 
-// ── mock LLM：纯文本最终答复（不调工具）→ 走 loop 的 !gotToolUse 最终答复路径 ──
+// ── mock LLM：仅用于 validate 通过的占位（本 e2e 不真正跑模型，trace 直接写入）──
 const FINAL_ANSWER = '闭包（closure）是函数与其词法作用域的组合，使函数能访问外层变量。';
-function e2eMockClient(text: string): DeepSeekClient {
-  return {
-    primaryModel: 'mock-model',
-    async *streamChat() {
-      yield { type: 'content', text } as unknown as { type: string; text?: string };
-    },
-  } as unknown as DeepSeekClient;
-}
-function e2eMockHistory(): ConversationHistory {
-  const store: ChatMessage[] = [];
-  return {
-    addUser: (c: string) => store.push({ role: 'user', content: c }),
-    addAssistant: (c: string) => store.push({ role: 'assistant', content: c }),
-    getMessages: () => store.map((m) => ({ ...m })),
-    compact: async () => {},
-    estimateTotalTokens: () => 0,
-  } as unknown as ConversationHistory;
-}
 
 // ── 1) mock DeepSeek 端点（validate 通过）──
 const mockPort = 8731;
@@ -150,20 +129,19 @@ try {
   const idA = (tlA.tasks as Array<{ id: string; title: string }>).find((t) => t.title === 'E2E-A')!.id;
   const dirA = join(USER_DIR, 'threads', idA);
 
-  // ★ 真实跑一轮对话（mock LLM），让修复后的 loop 把最终答复写入 A 的 trace
+  // ★ 写入一段「真实对话」的 trace（与 agent-host 实时落盘同形）：
+  //   user + 思考盒(thinking_start/entry/update/status/end) + assistant（绑定 thinkingId）。
+  //   —— 这正是方案 A 要持久化的内容；切回任务时须原样重建思考盒 + 气泡。
   const trace = new TraceLogger({ workspaceDir: dirA });
-  for await (const _ev of runAgent('你好，请介绍一下闭包是什么', {
-    client: e2eMockClient(FINAL_ANSWER),
-    history: e2eMockHistory(),
-    permission: 'execute',
-    cwd: dirA,
-    ask: async () => false,
-    tools: [],
-    autoPlan: false,
-    trace,
-  })) {
-    /* drain */
-  }
+  await trace.log('user_input', { input: '你好，请介绍一下闭包是什么' });
+  await trace.log('thinking_start', { turnId: 1 });
+  await trace.log('thinking_entry', { id: 0, kind: 'reason', text: '闭包是函数与其词法作用域的组合。' });
+  await trace.log('thinking_update', { id: 0, append: '它能捕获定义时的变量。' });
+  await trace.log('thinking_status', { status: 'outputting' });
+  // 最终答复：loop 在 setBusy(false)（thinking_end）之前落盘 → 排在 thinking_end 之前，与生产顺序一致
+  await trace.log('assistant_message', { content: FINAL_ANSWER });
+  await trace.log('thinking_status', { status: 'done' });
+  await trace.log('thinking_end', { turnId: 1 });
   await trace.end();
   await new Promise((r) => setTimeout(r, 300)); // 确保落盘对服务端可见
 
@@ -180,25 +158,28 @@ try {
 
   // 切到 B（先隔离对照）
   const capB: Array<{ role: string; text?: string }> = [];
+  const capBRaw: Array<{ type: string; role?: string; text?: string }> = [];
   const hB = (raw: WebSocket.RawData) => {
     const m = JSON.parse(raw.toString());
+    capBRaw.push({ type: m.type, role: m.role as string | undefined, text: m.text as string | undefined });
     if (m.type === 'message') capB.push({ role: m.role as string, text: m.text as string });
   };
   ws.on('message', hB);
   send(ws, { type: 'switch_task', id: idB });
   await waitMsg(ws, (m) => m.type === 'reset');
-  await new Promise<void>((r) => setTimeout(r, 2000));
+  await new Promise<void>((r) => setTimeout(r, 1500));
   ws.off('message', hB);
   const bTexts = capB.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => m.text!);
   const noLeak = !bTexts.some((t) => t.includes('闭包') || t.includes('你好'));
 
-  // 切回 A（模拟点击任务卡片重新进入）→ 应恢复 user + assistant 历史 + 思考盒
+  // ── 双回合切换 A↔B，最后一次切回 A（方案 A 验收的关键压力点）──
+  // 每次切回都从持久化的 thinking 事件重建，不依赖任何内存缓存 → 多次切换后思考盒仍在。
   const capA: Array<{ role: string; text?: string; thinkingId?: number }> = [];
   const hA = (raw: WebSocket.RawData) => {
     const m = JSON.parse(raw.toString());
     if (m.type === 'message') capA.push({ role: m.role as string, text: m.text as string, thinkingId: m.thinkingId as number | undefined });
   };
-  // 同时捕获思考盒事件，验证「思考盒随历史原样恢复」（方案 B：纯问答也重建 thinking 卡）
+  // 捕获思考盒事件，验证「思考盒随历史原样恢复」（方案 A：从持久化事件重建）
   const thinkingRounds: Array<{ turnId?: number; entries: Array<{ id: number; kind: string; text?: string }> }> = [];
   let curThinking: { turnId?: number; entries: Array<{ id: number; kind: string; text?: string }> } | null = null;
   const hThink = (raw: WebSocket.RawData) => {
@@ -206,13 +187,24 @@ try {
     if (m.type === 'thinking_start') { curThinking = { turnId: m.turnId as number, entries: [] }; thinkingRounds.push(curThinking); }
     else if (m.type === 'thinking_entry' && curThinking) { curThinking.entries.push({ id: m.id as number, kind: m.kind as string, text: m.text as string }); }
   };
-  ws.on('message', hA);
-  ws.on('message', hThink);
-  send(ws, { type: 'switch_task', id: idA });
-  await waitMsg(ws, (m) => m.type === 'reset');
-  await new Promise<void>((r) => setTimeout(r, 3000));
-  ws.off('message', hA);
-  ws.off('message', hThink);
+
+  async function switchTo(id: string): Promise<void> {
+    capA.length = 0;
+    thinkingRounds.length = 0;
+    curThinking = null;
+    ws.on('message', hA);
+    ws.on('message', hThink);
+    send(ws, { type: 'switch_task', id });
+    await waitMsg(ws, (m) => m.type === 'reset');
+    await new Promise<void>((r) => setTimeout(r, 2500));
+    ws.off('message', hA);
+    ws.off('message', hThink);
+  }
+
+  await switchTo(idA); // 第一次切回 A
+  await switchTo(idB); // 再切 B
+  await switchTo(idA); // ★ 最后切回 A：思考盒必须仍在（用户报告丢失的场景）
+
   const aMsgs = capA.filter((m) => m.role === 'user' || m.role === 'assistant');
   const hasUser = aMsgs.some((m) => m.role === 'user' && (m.text ?? '').includes('你好'));
   const hasAsst = aMsgs.some((m) => m.role === 'assistant' && (m.text ?? '').includes('闭包'));
