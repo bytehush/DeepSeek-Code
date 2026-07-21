@@ -22,11 +22,19 @@ import { join } from 'node:path';
  *                        false = 同步 fs 回退，输出逐字节一致，作安全锚点）
  * - `vectorIndex`       M9 向量化检索（默认 false = 线性扫描现状；true = 预计算归一化矩阵
  *                        + 版本门控缓存 + query 向量缓存，召回结果与 cosine 等价、延迟更低）
+ * - `bgTrashSweep`      M10 回收站后台清理（默认 false = 读时清理现状；true = setInterval
+ *                        后台周期 sweep trash.json 超期项，读路径不再内联重写）
+ * - `idleRevise`        M10 空闲治理调度（默认 false = 会话结束同步 revise 现状；
+ *                        true = 让出事件循环延后跑 proposeRevise，不挤占对话）
+ * - `crossProcLock`     M10 跨进程 advisory lock（默认 false = 无锁现状；true = GUI+CLI 同写
+ *                        一 scope 时加文件锁包裹读-改-写临界区，防相互覆盖）
  *
  * 默认全 false（除 memoryInterfaces / asyncBackend），保证每个行为变更阶段在 flag 关闭时
  * 与旧路径逐字节一致，可作安全回退锚点。asyncBackend 默认 true 是因为它只改变 I/O 实现、
  * 不改变可观察行为，M8 的全部收益（不阻塞事件循环 / 批量嵌入 / 预热）都来自异步路径。
  * vectorIndex 默认 false 因它改变召回实现路径（虽结果等价），先以 flag 关作安全锚点。
+ * M10 三 flag（bgTrashSweep / idleRevise / crossProcLock）默认全 false：皆为「边缘场景优化」，
+ * 关=现状逐字节一致，开=各自独立行为变更，可逐个翻、互不影响。
  */
 export interface MemoryConfig {
   memoryInterfaces: boolean;
@@ -37,6 +45,9 @@ export interface MemoryConfig {
   embedderMirror: boolean;
   asyncBackend: boolean;
   vectorIndex: boolean;
+  bgTrashSweep: boolean;
+  idleRevise: boolean;
+  crossProcLock: boolean;
 }
 
 const DEFAULTS: MemoryConfig = {
@@ -48,6 +59,9 @@ const DEFAULTS: MemoryConfig = {
   embedderMirror: false,
   asyncBackend: true,
   vectorIndex: false,
+  bgTrashSweep: false,
+  idleRevise: false,
+  crossProcLock: false,
 };
 
 const ENV_KEY = 'DSA_MEMORY_FLAGS';
