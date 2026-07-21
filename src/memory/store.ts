@@ -38,12 +38,16 @@ const INDEX_FILE = 'memories.json';
 const TRASH_FILE = 'trash.json';
 /** 回收站保留时长（ms）：30 天后超期项在下次读取时自动清理。 */
 const TRASH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** 后台回收站 sweep 默认周期（ms）：6 小时。仅 bgTrashSweep 开时启用。 */
+const BG_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface FileMemoryBackendOpts {
   /** 异步 I/O 开关（M8）。true=fs/promises 不阻塞事件循环；false=同步 fs 回退（输出逐字节一致）。 */
   async?: boolean;
   /** 向量化检索开关（M9）。true=预计算归一化矩阵向量化余弦 + 版本缓存；false=线性扫描现状（默认）。 */
   vectorIndex?: boolean;
+  /** 后台回收站清理开关（M10）。true=setInterval 后台周期 sweep trash.json 超期项，读路径不再内联重写；false=读时清理现状（默认）。 */
+  bgTrashSweep?: boolean;
 }
 
 /**
@@ -65,6 +69,10 @@ export class FileMemoryBackend implements MemoryBackend {
   private retriever: Retriever;
   /** M9 query 向量缓存（仅 vectorIndex 开时启用）：同 query 字符串复用嵌入，省重复 embed。 */
   private _queryVecCache = new Map<string, number[] | null>();
+  /** M10 后台回收站清理开关（bgTrashSweep）。true=后台周期 sweep；false=读时清理（默认）。 */
+  private _bgSweep: boolean;
+  /** M10 后台 sweep 定时器句柄（bgSweep 开时存在；unref 以免阻止进程退出）。 */
+  private _sweepTimer: ReturnType<typeof setInterval> | undefined;
 
   /** ✅ 性能：readIndex 内存缓存，避免每次操作都从磁盘全量重读+解析 JSON */
   private _indexCache: MemoryEntry[] | null = null;
@@ -87,9 +95,12 @@ export class FileMemoryBackend implements MemoryBackend {
     this.embedder = embedder;
     this._async = opts?.async ?? false;
     this._vectorIndex = opts?.vectorIndex ?? false;
+    this._bgSweep = opts?.bgTrashSweep ?? false;
     this.retriever = this._vectorIndex
       ? new VectorIndexRetriever(new DefaultRetriever(), { versionProvider: () => this._version })
       : new DefaultRetriever();
+    // M10 bgTrashSweep：开→启动后台周期 sweep（unref，不阻止进程退出）；关→不启动（读时清理现状）。
+    if (this._bgSweep) this.startBackgroundSweep();
   }
 
   /** 确保目录存在（同步 mkdir，幂等，两种模式通用）。 */
@@ -315,13 +326,56 @@ export class FileMemoryBackend implements MemoryBackend {
     try {
       const arr = JSON.parse(raw);
       if (!Array.isArray(arr)) return [];
-      // 读取时顺手清理超期回收项（30 天）
+      // 读取时过滤超期回收项（30 天）；仅 bgTrashSweep 关时顺手重写磁盘（现状）。
+      // 开 bgTrashSweep 时内联重写交给后台 sweep，读路径只过滤返回、不再写盘（减少读时 I/O）。
       const now = Date.now();
       const alive = (arr as TrashItem[]).filter((t) => now - (t.deletedAt ?? 0) < TRASH_TTL_MS);
-      if (alive.length !== arr.length) await this.writeTrash(alive);
+      if (!this._bgSweep && alive.length !== arr.length) await this.writeTrash(alive);
       return alive;
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * M10 后台回收站清理：入写链串行执行「读原始 trash.json → 过滤超期 → 仅变化时写回」，
+   * 与 pushTrash/restore 等 trash 写入串行，避免进程内交错。返回本次清理掉的条数。
+   * 背景定时器与手动调用共用此方法。
+   */
+  async sweepTrash(): Promise<number> {
+    return this.enqueue(async () => {
+      const raw = await this.readText(join(this.dir, TRASH_FILE));
+      if (!raw) return 0;
+      let arr: TrashItem[];
+      try {
+        arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return 0;
+      } catch {
+        return 0;
+      }
+      const now = Date.now();
+      const alive = arr.filter((t) => now - (t.deletedAt ?? 0) < TRASH_TTL_MS);
+      const removed = arr.length - alive.length;
+      if (removed > 0) await this.writeTrash(alive);
+      return removed;
+    });
+  }
+
+  /** 启动后台回收站 sweep（bgTrashSweep 语义）。intervalMs 可注入（测试用短周期）。定时器 unref 不阻止进程退出。 */
+  startBackgroundSweep(intervalMs: number = BG_SWEEP_INTERVAL_MS): void {
+    if (this._sweepTimer) clearInterval(this._sweepTimer);
+    this._sweepTimer = setInterval(() => {
+      this.sweepTrash().catch(() => {});
+    }, intervalMs);
+    // 后台任务不应阻止进程自然退出
+    this._sweepTimer.unref?.();
+  }
+
+  /** 停止后台回收站 sweep（资源释放时调用）。 */
+  stopBackgroundSweep(): void {
+    if (this._sweepTimer) {
+      clearInterval(this._sweepTimer);
+      this._sweepTimer = undefined;
     }
   }
 
@@ -445,9 +499,10 @@ export class FileMemoryBackend implements MemoryBackend {
 
   /**
    * 资源释放（M8 异步 I/O）：冲刷写链，确保全部排队的写操作落盘后再返回。
-   * 同步模式写本是同步完成，_chain 为空链，await 立即结束。
+   * 同步模式写本是同步完成，_chain 为空链，await 立即结束。M10：释放前先停后台 sweep 定时器。
    */
   async onDispose(): Promise<void> {
+    this.stopBackgroundSweep();
     await this._chain;
   }
 
