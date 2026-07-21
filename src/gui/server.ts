@@ -39,7 +39,9 @@ import { TaskStore } from './thread-store.ts';
 import { DeepSeekClient, type ChatMessage } from '../llm/deepseek.ts';
 import { TraceLogger } from '../context/trace.ts';
 import { MemoryStore } from '../memory/store.ts';
+import type { MemoryBackend } from '../memory/backend.ts';
 import { Embedder } from '../memory/embedder.ts';
+import { loadMemoryConfig } from '../memory/config.ts';
 import { SkillManager } from '../skills/loader.ts';
 import { BrowserTelemetryHub } from './telemetry-hub.ts';
 import type { BrowserTelemetryEvent } from './telemetry-types.ts';
@@ -484,24 +486,38 @@ wss.on('connection', (ws, req) => {
    * 与 API Key 解耦——记忆管理登录即可用，不依赖内核是否装配。
    * 用离线模式 Embedder（mode='off'）避免触碰模型下载，仅做文件读删。
    */
-  function makeStores(): { user: MemoryStore; project: MemoryStore | null } {
-    const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
-    const user = new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
-    let project: MemoryStore | null = null;
-    if (taskStore && activeTaskId) {
-      project = new MemoryStore(
-        join(taskStore.dir(activeTaskId), '.dsa', 'memory'),
-        new Embedder({ mode: 'off' }),
-      );
+  /**
+   * 解析某作用域的「真实记忆后端」（M6 · 修复 L3 GUI 脱节实例）。
+   * - sharedGuiBackend=true 且内核已装配：复用 agent-host 的同一 MemoryService 实例的
+   *   user/project 后端，使 GUI 记忆 UI 与 agent 共享同一实例（写入即时互通、带真实嵌入）。
+   * - 否则（默认）：构建离线模式 Embedder 的独立 MemoryStore，与旧路径逐字节一致。
+   * - project 作用域仅当 taskDir 与当前活跃任务目录一致（或省略=当前活跃）时才复用实例，
+   *   避免把非活跃任务的记忆错配到活跃任务后端。
+   */
+  function backendAt(scope: 'user' | 'project', taskDir?: string): MemoryBackend | null {
+    const cfg = loadMemoryConfig();
+    if (cfg.sharedGuiBackend && host?.props.memoryStore) {
+      if (scope === 'user') return host.props.memoryStore.user;
+      const activeDir = taskStore && activeTaskId ? taskStore.dir(activeTaskId) : undefined;
+      if (taskDir === undefined || taskDir === activeDir) return host.props.memoryStore.project;
     }
-    return { user, project };
+    // 回退：离线模式独立实例（旧行为，逐字节一致）
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+    if (scope === 'user') {
+      return new MemoryStore(join(home, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
+    }
+    if (!taskDir) return null;
+    return new MemoryStore(join(taskDir, '.dsa', 'memory'), new Embedder({ mode: 'off' }));
   }
 
-  /** 按作用域返回对应 MemoryStore；未知作用域 / 任务级无活动任务返回 null。 */
-  function pickStore(scope: string): MemoryStore | null {
-    const { user, project } = makeStores();
-    if (scope === 'user') return user;
-    if (scope === 'project') return project;
+  function makeStores(): { user: MemoryBackend; project: MemoryBackend | null } {
+    return { user: backendAt('user')!, project: backendAt('project') };
+  }
+
+  /** 按作用域返回对应 MemoryBackend；未知作用域 / 任务级无活动任务返回 null。 */
+  function pickStore(scope: string): MemoryBackend | null {
+    if (scope === 'user') return backendAt('user');
+    if (scope === 'project') return backendAt('project');
     return null;
   }
 
@@ -516,7 +532,7 @@ wss.on('connection', (ws, req) => {
   }
 
   /** 构造导出包：读 MEMORY.md 原文 + memories.json 语义记忆（不含回收站，回收站为临时态不导出）。 */
-  function buildExportBundle(store: MemoryStore, scope: 'user' | 'project'): MemoryExportBundle {
+  function buildExportBundle(store: MemoryBackend, scope: 'user' | 'project'): MemoryExportBundle {
     return {
       kind: 'dsa-memory-export',
       version: 1,
@@ -529,7 +545,7 @@ wss.on('connection', (ws, req) => {
 
   /** 应用导入包：把事实逐行、语义记忆逐条写入目标作用域；已存在（isDuplicate）的跳过，非破坏性。 */
   async function applyImportBundle(
-    store: MemoryStore,
+    store: MemoryBackend,
     bundle: MemoryExportBundle,
   ): Promise<{ factsAdded: number; entriesAdded: number; skipped: number }> {
     let factsAdded = 0;
