@@ -473,9 +473,21 @@ export function App() {
           setView('login');
           setLoadingBoot(false);
           break;
-        case 'message':
-          setMessages((m) => [...m, { id: msg.id, role: msg.role, text: msg.text, thinkingId: msg.thinkingId }]);
+        case 'message': {
+          const newMsg: UiMessage = { id: msg.id, role: msg.role, text: msg.text, thinkingId: msg.thinkingId };
+          setMessages((m) => [...m, newMsg]);
+          // 同步缓存：回放/实时新增消息都累加到缓存，避免 thinking_end 用陈旧空 messages 覆盖，
+          // 否则二次切回任务时 messages 缓存为空 → switchTask 走清空分支 → 历史与思考盒丢失。
+          const tid = activeTaskIdRef.current;
+          if (tid) {
+            const snap = messagesCacheRef.current.get(tid);
+            messagesCacheRef.current.set(tid, {
+              messages: [...(snap ? snap.messages : []), newMsg],
+              thinkings: snap ? snap.thinkings : [],
+            });
+          }
           break;
+        }
         case 'thinking_start':
           setOutputting(false);
           // 默认折叠：思考过程收进独立盒子，用户可点击展开查看（不在消息气泡中显示）
