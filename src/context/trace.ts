@@ -32,7 +32,13 @@ export type TraceEventType =
   | 'rollback'          // 用户 /rollback：撤销最近 N 次文件变更
   | 'resume'           // 用户 /resume：从最近 trace 恢复会话历史续跑
   | 'browser_watch'    // 浏览器观察回灌开关（/watch 命令）
-  | 'session_end';       // 会话正常结束
+  | 'session_end'       // 会话正常结束
+  // ── 思考盒（思考过程）持久化：与前端显示完全同形，切回任务/重登录原样重建 ──
+  | 'thinking_start'
+  | 'thinking_entry'
+  | 'thinking_update'
+  | 'thinking_status'
+  | 'thinking_end';
 
 export interface TraceEvent {
   /** ISO 8601 时间戳 */
@@ -42,6 +48,35 @@ export interface TraceEvent {
   /** 事件载荷（类型相关） */
   payload: Record<string, unknown>;
 }
+
+/** 思考盒里一条「观察」条目（与前端 ThinkingEntry 同形） */
+export interface ReplayedThinkingEntry {
+  id: number;
+  /** reason=推理文字；tool=工具调用；tool_result=工具返回结果；error=本轮错误 */
+  kind: 'reason' | 'tool' | 'tool_result' | 'error';
+  /** tool 条目的工具名 */
+  title?: string;
+  text: string;
+}
+
+/** 思考盒状态（与前端 ThinkingStatus 同形） */
+export type ReplayedThinkingStatus = 'thinking' | 'outputting' | 'done' | 'interrupted';
+
+/** 一个思考轮次（一次 agent 工作回合的完整思考过程） */
+export interface ReplayedThinkingTurn {
+  turnId: number;
+  status: ReplayedThinkingStatus;
+  entries: ReplayedThinkingEntry[];
+}
+
+/** 回放结果：消息 + 思考轮次（思考盒随消息同形恢复） */
+export interface ReplayedConversation {
+  messages: ReplayedMessage[];
+  thinking: ReplayedThinkingTurn[];
+}
+
+/** 回放用消息：ChatMessage 扩展 thinkingId 绑定（关联对应思考轮次） */
+export type ReplayedMessage = ChatMessage & { thinkingId?: number };
 
 /**
  * JSONL Trace 日志系统（P2-1）。
@@ -208,7 +243,8 @@ export class TraceLogger {
     const traceDir = join(workspaceDir, '.dsa', 'traces');
     try {
       const content = await readFile(join(traceDir, `${sessionId}.jsonl`), 'utf8');
-      return TraceLogger.parseReplay(content);
+      const r = TraceLogger.parseReplay(content);
+      return r ? r.messages : null;
     } catch {
       return null;
     }
@@ -226,7 +262,8 @@ export class TraceLogger {
       const jsonlFiles = files.filter((f) => f.endsWith('.jsonl')).sort().reverse();
       if (jsonlFiles.length === 0) return null;
       const content = await readFile(join(traceDir, jsonlFiles[0]), 'utf8');
-      return TraceLogger.parseReplay(content);
+      const r = TraceLogger.parseReplay(content);
+      return r ? r.messages : null;
     } catch {
       return null;
     }
@@ -238,7 +275,7 @@ export class TraceLogger {
    * 避免切换/重启后早期会话被新开空文件孤立而丢失历史。
    * 仅 Web 的「切任务 / 登录恢复」入口使用；CLI 仍走 `replay`，不受影响。
    */
-  static async replayAll(workspaceDir?: string): Promise<ChatMessage[] | null> {
+  static async replayAll(workspaceDir?: string): Promise<ReplayedConversation | null> {
     const traceDir = join(workspaceDir ?? process.cwd(), '.dsa', 'traces');
     let files: string[];
     try {
@@ -248,18 +285,24 @@ export class TraceLogger {
     }
     const jsonlFiles = files.filter((f) => f.endsWith('.jsonl')).sort(); // 升序 = 时间序
     if (jsonlFiles.length === 0) return null;
-    const all: ChatMessage[] = [];
+    const allMessages: ReplayedMessage[] = [];
+    const allThinking: ReplayedThinkingTurn[] = [];
     for (const f of jsonlFiles) {
       try {
         const content = await readFile(join(traceDir, f), 'utf8');
         const part = TraceLogger.parseReplay(content);
-        if (part) all.push(...part);
+        if (part) {
+          allMessages.push(...part.messages);
+          allThinking.push(...part.thinking);
+        }
       } catch {
         // 单个文件读取失败（如被 TraceLogger 刷盘锁临时占用）跳过，不拖累整体聚合
         continue;
       }
     }
-    return all.length > 0 ? all : null;
+    return allMessages.length > 0 || allThinking.length > 0
+      ? { messages: allMessages, thinking: allThinking }
+      : null;
   }
 
   /**
@@ -305,10 +348,15 @@ export class TraceLogger {
     return { messages, filesWritten: [...new Set(filesWritten)], lastGoal };
   }
 
-  private static parseReplay(content: string): ChatMessage[] | null {
+  private static parseReplay(content: string): ReplayedConversation | null {
     const lines = content.split('\n').filter((l) => l.trim().length > 0);
-    const messages: ChatMessage[] = [];
+    const messages: ReplayedMessage[] = [];
+    const thinking: ReplayedThinkingTurn[] = [];
     let pendingToolCalls: Array<{ id: string; name: string }> = [];
+    /** 当前进行中的思考轮次（thinking_start → thinking_end 之间非空） */
+    let activeTurn: ReplayedThinkingTurn | null = null;
+    /** 最近一次开轮的 id（即便已结束也保留），用于「序列化顺序无关」的兜底绑定 */
+    let lastThinkingTurnId: number | null = null;
 
     for (const line of lines) {
       let ev: TraceEvent;
@@ -317,30 +365,78 @@ export class TraceLogger {
       } catch {
         continue;
       }
-      if (ev.type === 'user_input') {
-        messages.push({ role: 'user', content: String(ev.payload.input ?? '') });
-      } else if (ev.type === 'assistant_message') {
-        const content = String(ev.payload.content ?? '');
-        const raw = ev.payload.toolCalls;
-        let tool_calls: ToolCall[] | undefined;
-        if (Array.isArray(raw) && raw.length > 0) {
-          tool_calls = (raw as Array<{ id: string; name: string; arguments: unknown }>).map((t) => ({
-            id: String(t.id),
-            type: 'function',
-            function: { name: String(t.name), arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments ?? {}) },
-          }));
-          pendingToolCalls = (raw as Array<{ id: string; name: string }>).map((t) => ({ id: String(t.id), name: String(t.name) }));
+      switch (ev.type) {
+        case 'user_input':
+          messages.push({ role: 'user', content: String(ev.payload.input ?? '') });
+          break;
+        case 'assistant_message': {
+          const content = String(ev.payload.content ?? '');
+          const raw = ev.payload.toolCalls;
+          let tool_calls: ToolCall[] | undefined;
+          if (Array.isArray(raw) && raw.length > 0) {
+            tool_calls = (raw as Array<{ id: string; name: string; arguments: unknown }>).map((t) => ({
+              id: String(t.id),
+              type: 'function',
+              function: { name: String(t.name), arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments ?? {}) },
+            }));
+            pendingToolCalls = (raw as Array<{ id: string; name: string }>).map((t) => ({ id: String(t.id), name: String(t.name) }));
+          }
+          // 关键：无工具调用时绝不发送空数组 tool_calls（DeepSeek API 报 400）
+          const msg: ReplayedMessage = tool_calls ? { role: 'assistant', content, tool_calls } : { role: 'assistant', content };
+          // 绑定思考轮次：仅最终答复（无工具调用）归属思考轮——工具轮不单独成泡，
+          // 其推理文字已作为 reason 条目落入思考盒（由 thinking_entry 持久化）。
+          // 优先绑定「仍在进行中」的轮（activeTurn）；若思考轮已结束（thinking_end 先落盘）
+          // 则回退到最近一次开轮的 id（lastThinkingTurnId），使重放与序列化顺序无关、更稳健。
+          if (!tool_calls) msg.thinkingId = activeTurn ? activeTurn.turnId : (lastThinkingTurnId ?? undefined);
+          messages.push(msg);
+          break;
         }
-        // 关键：无工具调用时绝不发送空数组 tool_calls（DeepSeek API 报 400）
-        messages.push(tool_calls ? { role: 'assistant', content, tool_calls } : { role: 'assistant', content });
-      } else if (ev.type === 'tool_result') {
-        const toolCallId = String(ev.payload.toolCallId ?? pendingToolCalls[0]?.id ?? 'unknown');
-        const name = String(ev.payload.name ?? pendingToolCalls.shift()?.name ?? 'tool');
-        const content = String(ev.payload.output ?? ev.payload.reason ?? '');
-        messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+        case 'tool_result': {
+          const toolCallId = String(ev.payload.toolCallId ?? pendingToolCalls[0]?.id ?? 'unknown');
+          const name = String(ev.payload.name ?? pendingToolCalls.shift()?.name ?? 'tool');
+          const content = String(ev.payload.output ?? ev.payload.reason ?? '');
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+          break;
+        }
+        // ── 思考盒持久化回放 ──
+        case 'thinking_start': {
+          const turnId = Number(ev.payload.turnId);
+          activeTurn = { turnId, status: 'thinking', entries: [] };
+          lastThinkingTurnId = turnId;
+          thinking.push(activeTurn);
+          break;
+        }
+        case 'thinking_entry': {
+          if (activeTurn) {
+            activeTurn.entries.push({
+              id: Number(ev.payload.id),
+              kind: (ev.payload.kind as ReplayedThinkingEntry['kind']) ?? 'reason',
+              title: ev.payload.title !== undefined ? String(ev.payload.title) : undefined,
+              text: String(ev.payload.text ?? ''),
+            });
+          }
+          break;
+        }
+        case 'thinking_update': {
+          if (activeTurn) {
+            const e = activeTurn.entries.find((x) => x.id === Number(ev.payload.id));
+            if (e) e.text += String(ev.payload.append ?? '');
+          }
+          break;
+        }
+        case 'thinking_status': {
+          if (activeTurn) activeTurn.status = (ev.payload.status as ReplayedThinkingTurn['status']) ?? activeTurn.status;
+          break;
+        }
+        case 'thinking_end': {
+          activeTurn = null;
+          break;
+        }
+        default:
+          break;
       }
     }
-    return messages.length > 0 ? messages : null;
+    return messages.length > 0 || thinking.length > 0 ? { messages, thinking } : null;
   }
 
   private async ensureDir(): Promise<void> {
