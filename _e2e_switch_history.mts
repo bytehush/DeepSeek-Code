@@ -175,6 +175,8 @@ try {
   // ── 双回合切换 A↔B，最后一次切回 A（方案 A 验收的关键压力点）──
   // 每次切回都从持久化的 thinking 事件重建，不依赖任何内存缓存 → 多次切换后思考盒仍在。
   const capA: Array<{ role: string; text?: string; thinkingId?: number }> = [];
+  // 捕获 reset 载荷：断点①修复后，思考盒随 reset 原子恢复（emitThinking=false，不再重发 thinking 事件）。
+  const capResets: Array<Record<string, unknown>> = [];
   const hA = (raw: WebSocket.RawData) => {
     const m = JSON.parse(raw.toString());
     if (m.type === 'message') capA.push({ role: m.role as string, text: m.text as string, thinkingId: m.thinkingId as number | undefined });
@@ -187,18 +189,25 @@ try {
     if (m.type === 'thinking_start') { curThinking = { turnId: m.turnId as number, entries: [] }; thinkingRounds.push(curThinking); }
     else if (m.type === 'thinking_entry' && curThinking) { curThinking.entries.push({ id: m.id as number, kind: m.kind as string, text: m.text as string }); }
   };
+  const hReset = (raw: WebSocket.RawData) => {
+    const m = JSON.parse(raw.toString());
+    if (m.type === 'reset') capResets.push(m);
+  };
 
   async function switchTo(id: string): Promise<void> {
     capA.length = 0;
     thinkingRounds.length = 0;
+    capResets.length = 0;
     curThinking = null;
     ws.on('message', hA);
     ws.on('message', hThink);
+    ws.on('message', hReset);
     send(ws, { type: 'switch_task', id });
     await waitMsg(ws, (m) => m.type === 'reset');
     await new Promise<void>((r) => setTimeout(r, 2500));
     ws.off('message', hA);
     ws.off('message', hThink);
+    ws.off('message', hReset);
   }
 
   await switchTo(idA); // 第一次切回 A
@@ -210,13 +219,22 @@ try {
   const hasAsst = aMsgs.some((m) => m.role === 'assistant' && (m.text ?? '').includes('闭包'));
   const historyRecovered = hasUser && hasAsst;
 
-  // 思考盒恢复断言：存在 reason 条目(文本=agent 最终答复) 且 assistant 气泡已绑定 thinkingId
-  const reasonEntry = thinkingRounds.flatMap((r) => r.entries).find((e) => e.kind === 'reason' && (e.text ?? '').includes('闭包'));
+  // 思考盒恢复断言（断点①修复后）：reset 载荷携带 thinkings（含 reason 条目=agent 最终答复），
+  // 且 assistant 气泡已绑定 thinkingId。不再依赖 thinking 事件重发。
+  const resetCarriesThinking = capResets.some(
+    (r) =>
+      Array.isArray(r.thinkings) &&
+      (r.thinkings as Array<Record<string, unknown>>).some(
+        (t) =>
+          Array.isArray(t.entries) &&
+          (t.entries as Array<Record<string, unknown>>).some((e) => String(e.text ?? '').includes('闭包')),
+      ),
+  );
   const asstBound = aMsgs.some((m) => m.role === 'assistant' && m.thinkingId !== undefined);
-  const hasThinkingBox = !!reasonEntry && asstBound;
+  const hasThinkingBox = resetCarriesThinking && asstBound;
 
   console.log('A 恢复消息:', aMsgs.map((m) => `[${m.role}] ${m.text}` + (m.thinkingId !== undefined ? ` (thinkingId=${m.thinkingId})` : '')));
-  console.log('A 思考盒 reason 条目数:', thinkingRounds.flatMap((r) => r.entries).filter((e) => e.kind === 'reason').length);
+  console.log('A reset 携带 thinking 轮数:', capResets.reduce((n, r) => n + (Array.isArray(r.thinkings) ? (r.thinkings as unknown[]).length : 0), 0));
   console.log('B 显示(应无 A 历史):', bTexts);
   console.log(`\n=== E2E: historyRecovery=${historyRecovered} hasThinkingBox=${hasThinkingBox} isolation=${noLeak} ===`);
   exitCode = historyRecovered && hasThinkingBox && noLeak ? 0 : 1;
