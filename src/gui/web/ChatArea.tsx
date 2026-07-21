@@ -18,6 +18,7 @@ import remarkBreaks from 'remark-breaks';
 import { ChevronRight, ChevronDown, MessageSquare } from 'lucide-react';
 import type { UiMessage } from '../../app/types.ts';
 import type { ThinkingTurn, ThinkingEntry } from './App.tsx';
+import { computeOrphans } from './thinkingLayout.ts';
 import { useTypewriter } from './useTypewriter.ts';
 import './ChatArea.css';
 
@@ -398,13 +399,11 @@ function ChatAreaInner({ messages, busy, outputting, thinkings, onToggleThinking
     return (chars[0] ?? '') + (chars[1] ?? '');
   })();
 
-  // 已被答案气泡匹配的思考轮次 id（避免活跃轮同时以「独立卡」和「气泡上方卡」重复渲染）
-  const matchedTurnIds = new Set(
-    messages.filter((m) => m.role === 'assistant' && typeof m.thinkingId === 'number').map((m) => m.thinkingId as number),
-  );
-  // 活跃且尚未匹配到答案气泡的思考轮次（思考/输出中阶段，答案气泡尚未创建）
-  const activeUnmatched = thinkings.length > 0 ? thinkings[thinkings.length - 1] : undefined;
-  const showActiveCard = busy && activeUnmatched && activeUnmatched.status !== 'done' && !matchedTurnIds.has(activeUnmatched.turnId);
+  // 把思考轮拆成「已挂靠答案气泡」与「孤儿轮（无配套答案气泡）」两类。
+  // 孤儿轮 = 思考已 done/interrupted 但 loop 未产出答案气泡，或实时思考中气泡尚未创建。
+  // 历史恢复时须把孤儿轮也渲染，否则「思考内容」会凭空消失（孤儿思考轮缺口）。
+  // 判定逻辑抽到 thinkingLayout.computeOrphans（纯函数，由单测锁住）。
+  const { live: liveTurn, history: historyOrphans } = computeOrphans(thinkings, messages, busy);
 
   // 分段渲染（性能优化 #3）：历史很长时只渲染最近一段（tail），避免一次性把成百上千
   // 条消息的 DOM 全塞进页面（长对话生成时不卡顿）。其余历史折叠为一个可点击提示，
@@ -459,17 +458,27 @@ function ChatAreaInner({ messages, busy, outputting, thinkings, onToggleThinking
           // system / tool / error：居中轻量提示条
           return <NoteRow key={m.id} message={m} />;
         })}
-        {/* 活跃思考轮次尚未匹配到答案气泡时，作为独立卡片渲染在底部（答案气泡出现后自动转为气泡上方卡）。
-            包在 .row.assistant 里 → 左侧带智能体头像 + 名字，与最终答案气泡视觉上连贯。 */}
-        {showActiveCard && activeUnmatched && (
+        {/* 实时活跃思考轮（答案气泡尚未创建）→ 底部独立卡，思考中/输出中态 */}
+        {liveTurn && (
           <div className="row assistant">
             <img className="avatar assistant" src="/agent-avatar.png" alt="" aria-hidden />
             <div className="msg-col">
               <div className="msg-name">DeepSeek 助手</div>
-              <ThinkingCard turn={activeUnmatched} onToggle={onToggleThinking} />
+              <ThinkingCard turn={liveTurn} onToggle={onToggleThinking} />
             </div>
           </div>
         )}
+        {/* 孤儿/历史思考轮（已结束或中断但无配套答案气泡）→ 同样独立卡渲染在底部，
+            确保「思考内容在任何生命周期都完整保留」，杜绝孤儿思考轮丢失（done / interrupted 两类）。 */}
+        {historyOrphans.map((t) => (
+          <div className="row assistant" key={`orphan-${t.turnId}`}>
+            <img className="avatar assistant" src="/agent-avatar.png" alt="" aria-hidden />
+            <div className="msg-col">
+              <div className="msg-name">DeepSeek 助手</div>
+              <ThinkingCard turn={t} onToggle={onToggleThinking} />
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
