@@ -21,6 +21,7 @@ import CommandPalette, { PaletteCommand } from './CommandPalette.tsx';
 import { SkillSheet, type SkillMetaItem, type SkillFilter } from './SkillSheet.tsx';
 import { AgentPrompt } from './AgentPrompt.tsx';
 import { initBrowserTelemetry } from './telemetry.ts';
+import { ScrollFollowController } from './scrollFollow.ts';
 import type { BrowserTelemetryEvent } from '../telemetry-types.ts';
 
 interface ConnState {
@@ -390,9 +391,10 @@ export function App() {
     setThinkings((t) => t.map((x) => (x.turnId === turnId ? { ...x, collapsed: !x.collapsed } : x)));
   }, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // 用户是否「贴着底部」：贴底时新内容自动跟随滚动；用户上滑看历史时不打扰。
-  const pinnedRef = useRef<boolean>(true);
-  const followRef = useRef<boolean>(true); // 流式自动跟随开关：用户手动滚动即关，回到底部再开
+  // 流式「是否自动贴底跟随」的纯决策逻辑（无 DOM 依赖，单测见 test/scrollFollow.test.ts）。
+  // 仅在「新一轮流式开始」按是否贴底初始化；流式中途依赖变化不重设，避免覆盖用户已接管的状态。
+  const controllerRef = useRef<ScrollFollowController | null>(null);
+  if (!controllerRef.current) controllerRef.current = new ScrollFollowController(20);
   const dragIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingImportScope, setPendingImportScope] = useState<'user' | 'project' | null>(null);
@@ -790,22 +792,21 @@ export function App() {
     return () => ws.close();
   }, []);
 
-  // 监听滚动：用户主动滚动（wheel/touch/pointer）立即停跟随+置离底；scroll 仅刷新
-  // 贴底标志（不重启 follow，避免内容扩张把用户拉回底部）。follow 只在新一轮流式
-  // 启动时根据当时是否贴底重置——这样用户一旦主动滚开，整个流式期间都不会被强拉。
+  // 监听滚动：把「是否跟随」交给 ScrollFollowController 决策。
+  //  - scroll 事件按方向判定：scrollTop 减小 = 用户上滑接管（拖原生滚动条滑块/键盘也能捕获，
+  //    因为滑块拖拽不派发 wheel/pointerdown）；回到贴底恢复跟随。
+  //  - wheel/pointerdown/touchmove 作为即时意图补充：用户一碰就立即停跟随。
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const BOTTOM_THRESHOLD = 20; // 距底 <20px 才算贴底（更严格，避免扩张自动判定贴底）
-    const onUserIntent = () => {
-      followRef.current = false;
-      pinnedRef.current = false; // 立即置离底，RAF 立刻停滚
-    };
+    const controller = controllerRef.current!;
+    const onUserIntent = () => controller.onUserIntent();
     const onScroll = () => {
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD;
-      pinnedRef.current = atBottom;
-      // 注意：不在这里把 followRef 拨回 true——否则内容扩张把用户「推」回底部时
-      // 会立刻重启自动滚动，让用户无法保持向上查看历史。
+      controller.onScroll({
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      });
     };
     el.addEventListener('wheel', onUserIntent, { passive: true });
     el.addEventListener('touchmove', onUserIntent, { passive: true });
@@ -819,24 +820,34 @@ export function App() {
     };
   }, []);
 
-  // 消息新增 → 若贴底则滚到底（新用户/助手消息、系统提示等离散事件）。
+  // 消息新增 → 若应跟随则滚到底（新用户/助手消息、系统提示等离散事件）。
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && pinnedRef.current && followRef.current) el.scrollTop = el.scrollHeight;
+    if (el && controllerRef.current!.shouldFollow()) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   // 流式期间（思考/输出中）用 rAF 持续贴底：逐字揭示靠打字机内部 setState 增长 DOM 高度，
   // 不改 messages，故上面的 [messages] effect 不会触发 → 必须逐帧跟随，否则新内容长到视口下方看不见。
-  // 仅在用户贴底时跟随；上滑阅读历史时静默。非流式立即停循环，零常驻开销。
+  // 仅当「新一轮流式开始」（非活跃→活跃跳变）才按是否贴底初始化 follow；流式中途依赖
+  // [state.busy, outputting] 抖动触发本 effect 重跑时不再重设 follow，避免覆盖用户已接管的状态
+  // （原 bug：重跑时 followRef=pinnedRef 把用户刚上滑接管的状态重新打开 → 弹回底部）。
   useEffect(() => {
-    if (!state.busy && !outputting) return;
-    // 新一轮流式开始：仅当用户已在底部时才自动跟随（不在看历史时强拉）
-    followRef.current = pinnedRef.current;
+    const controller = controllerRef.current!;
+    const el0 = scrollRef.current;
+    const active = state.busy || outputting;
+    if (el0) {
+      controller.notifyActive(active, {
+        scrollTop: el0.scrollTop,
+        scrollHeight: el0.scrollHeight,
+        clientHeight: el0.clientHeight,
+      });
+    }
+    if (!active) return;
     let raf = 0;
     const tick = () => {
       const el = scrollRef.current;
-      // 用户已主动接管（followRef=false）或脱离底部 → 立即停止，交还滚动控制权
-      if (el && followRef.current && pinnedRef.current) el.scrollTop = el.scrollHeight;
+      // 用户已主动接管或脱离底部 → 立即停滚，交还滚动控制权
+      if (el && controller.shouldFollow()) el.scrollTop = el.scrollHeight;
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
