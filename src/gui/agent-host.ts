@@ -14,6 +14,7 @@ import { runChatTurn, type ChatContext } from '../app/chat.ts';
 import { proposeRevise, applyProposal, type ReviseProposal, type ReviseResult } from '../memory/revise.ts';
 import { BrowserTelemetryHub } from './telemetry-hub.ts';
 import type { BrowserTelemetryEvent } from './telemetry-types.ts';
+import type { TraceEventType } from '../context/trace.ts';
 
 export interface StatePayload {
   busy: boolean;
@@ -104,6 +105,12 @@ export class AgentHost extends EventEmitter {
   private emitUpdate(id: number, text: string): void {
     this.emit('update', { id, text });
   }
+  /** 思考盒事件同步落盘：与前端显示完全同形，切回任务/重登录原样重建（方案 A）。
+   *  思考事件与消息共用同一 TraceLogger 实例（props.traceLogger，即 runAgent 的 trace），
+   *  故写进同一 jsonl、交错顺序正确。traceLogger 缺失时安全跳过。 */
+  private traceThink(type: TraceEventType, payload: Record<string, unknown>): void {
+    this.props.traceLogger?.log(type, payload);
+  }
   private emitState(): void {
     const s: StatePayload = {
       busy: this.busy,
@@ -130,6 +137,7 @@ export class AgentHost extends EventEmitter {
     this.curTurnId += 1;
     this.thinkingTurnActive = true;
     this.emit('thinking_start', { turnId: this.curTurnId });
+    this.traceThink('thinking_start', { turnId: this.curTurnId });
   }
   /** 结束当前思考轮次（busy=false 时调用） */
   private endThinkingTurn(): void {
@@ -137,8 +145,11 @@ export class AgentHost extends EventEmitter {
     this.thinkingTurnActive = false;
     this.curThinkId = null;
     // 用户中断时把状态标为 interrupted，让前端思考卡显示「生成中断」
-    this.emit('thinking_status', { status: (this.lastTurnInterrupted ? 'interrupted' : 'done') as ThinkingStatus });
+    const finalStatus = (this.lastTurnInterrupted ? 'interrupted' : 'done') as ThinkingStatus;
+    this.emit('thinking_status', { status: finalStatus });
+    this.traceThink('thinking_status', { status: finalStatus });
     this.emit('thinking_end', { turnId: this.curTurnId });
+    this.traceThink('thinking_end', { turnId: this.curTurnId });
   }
   /** 新建一条思考条目并设为「当前追加目标」 */
   private newThinkEntry(kind: ThinkingEntry['kind'], title: string | undefined, text: string): number {
@@ -146,6 +157,7 @@ export class AgentHost extends EventEmitter {
     this.thinking.push({ id, kind, title, text, status: 'streaming' });
     this.curThinkId = id;
     this.emit('thinking_entry', { id, kind, title, text });
+    this.traceThink('thinking_entry', { id, kind, title, text });
     return id;
   }
   /** 向「当前追加目标」追加文字。若没有追加目标、或追加目标不是 reason 条目，
@@ -156,6 +168,7 @@ export class AgentHost extends EventEmitter {
     if (cur && cur.kind === 'reason') {
       cur.text += text;
       this.emit('thinking_update', { id: cur.id, append: text });
+      this.traceThink('thinking_update', { id: cur.id, append: text });
       return;
     }
     // 没有追加目标、或追加目标不是 reason → 新开一条 reason 条目
@@ -219,6 +232,7 @@ export class AgentHost extends EventEmitter {
       this.inFinal = true;
       this.closeCurThink();
       this.emit('thinking_status', { status: 'outputting' as ThinkingStatus });
+      this.traceThink('thinking_status', { status: 'outputting' as ThinkingStatus });
     } else if (phase === 'progress') {
       // 本轮过程叙述结束，回到思考态
       this.inFinal = false;
@@ -271,6 +285,7 @@ export class AgentHost extends EventEmitter {
       content: '',
     });
     this.emit('thinking_status', { status: 'thinking' as ThinkingStatus });
+    this.traceThink('thinking_status', { status: 'thinking' as ThinkingStatus });
     this.emitState(); // 每次工具调用都更新迭代计数
   };
   appendTool = (out: string): void => {
@@ -280,6 +295,7 @@ export class AgentHost extends EventEmitter {
       if (e) {
         e.text += (e.text ? '\n' : '') + out;
         this.emit('thinking_update', { id: e.id, append: `\n${out}` });
+        this.traceThink('thinking_update', { id: e.id, append: `\n${out}` });
       }
       this.emit('artifact_update', { id: this.curThinkId, append: out });
     }
@@ -301,6 +317,7 @@ export class AgentHost extends EventEmitter {
       // 进入一轮新的 agent 工作：开启思考轮次
       this.startThinkingTurn();
       this.emit('thinking_status', { status: 'thinking' as ThinkingStatus });
+      this.traceThink('thinking_status', { status: 'thinking' as ThinkingStatus });
     } else if (!b && this.busy) {
       this.endThinkingTurn();
     }
