@@ -37,7 +37,7 @@ import {
 } from './accounts.ts';
 import { TaskStore } from './thread-store.ts';
 import { DeepSeekClient, type ChatMessage } from '../llm/deepseek.ts';
-import { TraceLogger, type ReplayedConversation, type ReplayedMessage } from '../context/trace.ts';
+import { TraceLogger, type ReplayedConversation, type ReplayedMessage, type ReplayedThinkingTurn } from '../context/trace.ts';
 import { createMemoryBackend } from '../memory/backend.ts';
 import type { MemoryBackend } from '../memory/backend.ts';
 import { Embedder } from '../memory/embedder.ts';
@@ -423,8 +423,9 @@ wss.on('connection', (ws, req) => {
    * - 目标任务有历史 → 随后 host.setMessages() 会再发一次 reset 覆盖为历史；
    * - 目标任务为空 / 未配 Key → 保持清空后再追加欢迎语或提示，不残留旧任务消息。
    */
-  function pushReset(): void {
-    fwd('reset', { messages: [] });
+  function pushReset(thinkings: ReplayedThinkingTurn[] = []): void {
+    // 原子携带思考轮次：前端 reset 一次性恢复 messages+thinkings，不再依赖后续 thinking 事件重发。
+    fwd('reset', { messages: [], thinkings: thinkings as unknown as Record<string, unknown>[] });
   }
 
   /**
@@ -453,7 +454,10 @@ wss.on('connection', (ws, req) => {
     host?.abort();
     host = null;
     await sendTaskList();
-    pushReset(); // 先清空对话区，若目标任务有历史再由 setMessages 覆盖为其历史
+    // 先解析历史（含思考轮次），让 reset 原子携带 thinkings —— 切回任务时思考盒由 reset 一次性恢复，
+    // 不再依赖「清空后再等 thinking 事件重发」的脆弱链路（断点①修复）。
+    const replayed = await TraceLogger.replayAll(taskStore.dir(id));
+    pushReset(replayed?.thinking ?? []);
     const creds = await loadUserCredentials(username);
     if (!creds) {
       pushSystem(`已切换到「${meta.title}」。你尚未配置 DeepSeek API Key，点击顶栏 ⚙ API 配置后即可继续对话。`);
@@ -472,11 +476,11 @@ wss.on('connection', (ws, req) => {
     host = makeHost(props);
     if (activeToken && host.telemetryHub) telemetryHubs.set(activeToken, host.telemetryHub);
     wireHost(host);
-    const replayed = await TraceLogger.replayAll(taskStore.dir(id));
     if (replayed && replayed.messages.length > 0) {
       props.history.loadMessages(replayed.messages as never);
       props.client.resetUsage();
-      replayToUi(replayed, fwd, host);
+      // thinkings 已随 reset 原子恢复；此处只发消息事件（emitThinking=false），避免重复重建思考盒。
+      replayToUi(replayed, fwd, host, false);
       host.push('system', `已切换到「${meta.title}」，共 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息`);
     } else {
       host.welcome();
@@ -1518,6 +1522,7 @@ function replayToUi(
   replayed: ReplayedConversation,
   fwd: (type: string, payload: Record<string, unknown>) => void,
   host: AgentHost | null,
+  emitThinking = true,
 ): void {
   const msgs = replayed.messages;
   let msgId = 0;
@@ -1531,7 +1536,7 @@ function replayToUi(
   if (replayed.thinking.length === 0) {
     // ── 旧数据（无持久化思考盒）：走原重建逻辑，保证历史 trace 仍可回放 ──
     legacyReplay(msgs, fwd, pushMsg);
-  } else {
+  } else if (emitThinking) {
     // ── 方案 A：从持久化的思考事件原样重建（与实时显示完全同形）──
     // 每个最终答复（assistant_message 无 tool_calls）已绑定 thinkingId，
     // 发射其思考轮次后再发射气泡，顺序与实时一致（盒在上、泡在下）。
@@ -1561,6 +1566,21 @@ function replayToUi(
         pushMsg('assistant', typeof m.content === 'string' ? m.content : '', tid);
       }
       // tool 角色：跳过（其完整输出已作为 tool_result 条目并入思考盒）
+    }
+  } else {
+    // ── thinkings 已随 reset 原子恢复：只发消息事件并保留 thinkingId 关联，避免重复重建思考盒 ──
+    for (const m of msgs) {
+      if (m.role === 'system') continue;
+      if (m.role === 'user') {
+        pushMsg('user', typeof m.content === 'string' ? m.content : '');
+        continue;
+      }
+      if (m.role === 'assistant') {
+        const hasTool = m.tool_calls && m.tool_calls.length > 0;
+        if (hasTool) continue; // 工具轮不单独成泡，其过程已并入思考盒
+        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', m.thinkingId);
+      }
+      // tool 角色：跳过
     }
   }
 
