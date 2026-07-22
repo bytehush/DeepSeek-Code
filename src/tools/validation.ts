@@ -129,3 +129,53 @@ function repair(s: string): string {
   if (opens > closes) t += '}'.repeat(opens - closes);
   return t;
 }
+
+// ─────────────────────────────────────────────────────────────
+// 以下 fuzzyMatchBlock 由 S1.2 从 index.ts 并入（文本鲁棒匹配，供 edit_file）。
+
+/**
+ * 在文件内容中定位 old_string 的起始字符索引，比 buf.indexOf 更鲁棒。
+ * 依次尝试：1) 精确匹配；2) 统一换行符(\r\n→\n)后匹配；
+ * 3) 逐行忽略首尾空白匹配（覆盖缩进/行尾空白差异）。
+ * 返回 -1 表示均失败。edit_file 用它替代 indexOf，减少因细微空白差异导致的失败。
+ */
+export function fuzzyMatchBlock(buf: string, oldS: string): number {
+  const exact = buf.indexOf(oldS);
+  if (exact !== -1) return exact;
+
+  const normOld = oldS.replace(/\r\n/g, '\n');
+  const e2 = buf.indexOf(normOld);
+  if (e2 !== -1) return e2;
+
+  const oldLines = normOld.split('\n');
+  const bufLines = buf.split('\n');
+  // 全空白块无意义，跳过逐行匹配避免误命中
+  if (oldLines.every((l) => l.trim() === '')) return -1;
+
+  if (oldLines.length === 1) {
+    const target = oldLines[0];
+    for (let i = 0; i < bufLines.length; i++) {
+      if (bufLines[i] === target || bufLines[i].trim() === target.trim()) {
+        let idx = 0;
+        for (let k = 0; k < i; k++) idx += bufLines[k].length + 1;
+        return idx;
+      }
+    }
+    return -1;
+  }
+  for (let i = 0; i + oldLines.length <= bufLines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < oldLines.length; j++) {
+      if (bufLines[i + j].trim() !== oldLines[j].trim()) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      let idx = 0;
+      for (let k = 0; k < i; k++) idx += bufLines[k].length + 1;
+      return idx;
+    }
+  }
+  return -1;
+}
