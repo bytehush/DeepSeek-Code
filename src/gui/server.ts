@@ -27,7 +27,7 @@ import {
   saveUserCredentials,
   userDataDir,
   type Credentials,
-} from '../cli/auth.ts';
+} from '../auth/credentials.ts';
 import {
   register as registerAccount,
   verify as verifyAccount,
