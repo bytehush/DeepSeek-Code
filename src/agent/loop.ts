@@ -1,7 +1,7 @@
 import { DeepSeekClient, ChatMessage, ToolCall, StreamErrorCategory } from '../llm/deepseek.ts';
 import { errMsg } from '../llm/deepseek.ts';
 import { ToolDef, ToolResult, createTools } from '../tools/index.ts';
-import { isDestructive } from '../permission/index.ts';
+import { isDestructive, decide } from '../permission/index.ts';
 import { runTaskFidelity } from '../tools/verify-task.ts';
 import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger, type TraceEventType } from '../context/trace.ts';
@@ -783,41 +783,28 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
         // 权限闸门 + 文件写前 diff 审批（P0-②）
         // 设计：文件写类工具（def.preview 存在）在执行前必须展示 diff 并由用户确认，
         // 与权限确认合并为单次询问，避免重复弹窗。explore 模式直接拦截（文件工具均 mid/high）。
+        // 政策决策已提拔至 src/permission（decide），此处仅据裁决执行「询问/拒绝/放行」。
         const destructive = tc.name === 'run_command' && isDestructive(String((tc.arguments as Record<string, unknown>).command ?? ''));
         const effectiveRisk = destructive ? 'high' : def.risk;
         const isFileWrite = !!def.preview;
-        let granted = true;
+        const verdict = decide({ mode: opts.permission, effectiveRisk, isFileWrite, destructive, toolName: tc.name });
 
-        if (opts.permission === 'explore') {
-          if (effectiveRisk !== 'low') {
-            granted = false;
-            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'explore', risk: effectiveRisk, granted: false });
-            yield { type: 'permission', toolName: tc.name, granted: false };
-          }
-        } else if (opts.permission === 'ask') {
-          if (isFileWrite) {
+        let granted = true;
+        if (verdict.action === 'deny') {
+          granted = false;
+          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: opts.permission, risk: effectiveRisk, granted: false });
+          yield { type: 'permission', toolName: tc.name, granted: false };
+        } else if (verdict.action === 'require_confirm') {
+          if (verdict.channel === 'file_review') {
             const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
             granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
-            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', fileReview: true, granted });
-            yield { type: 'permission', toolName: tc.name, granted };
-          } else if (effectiveRisk === 'high') {
-            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk));
-            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'ask', risk: effectiveRisk, granted });
-            yield { type: 'permission', toolName: tc.name, granted };
+          } else {
+            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk, destructive));
           }
-        } else if (opts.permission === 'execute') {
-          if (destructive) {
-            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk, true));
-            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute+destructive', granted });
-            yield { type: 'permission', toolName: tc.name, granted };
-          } else if (isFileWrite) {
-            // 即便 execute 模式，文件写也需 diff 确认（安全底线：写盘不可逆）
-            const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
-            granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
-            if (trace) await trace.log('permission_decision', { tool: tc.name, mode: 'execute', fileReview: true, granted });
-            yield { type: 'permission', toolName: tc.name, granted };
-          }
+          if (trace) await trace.log('permission_decision', { tool: tc.name, mode: opts.permission, fileReview: verdict.channel === 'file_review', risk: effectiveRisk, granted });
+          yield { type: 'permission', toolName: tc.name, granted };
         }
+        // verdict.action === 'allow'：granted 保持 true，不弹窗、不发事件（与原内联行为一致）
 
         if (!granted) {
           const denyMsg = `用户拒绝执行 ${tc.name}（权限模式: ${opts.permission}）`;

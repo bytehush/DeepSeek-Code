@@ -30,3 +30,7 @@ const DESTRUCTIVE_PATTERNS = [
 export function isDestructive(command: string): boolean {
   return DESTRUCTIVE_PATTERNS.some((re) => re.test(command));
 }
+
+// 权限闸门决策（纯政策权威），S4.3 自 loop.ts 内联闸门提拔而来。
+export { decide } from './permission-system.ts';
+export type { PermissionVerdict, DecideInput } from './permission-system.ts';
