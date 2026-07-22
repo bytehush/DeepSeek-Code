@@ -69,25 +69,9 @@ function safeEnv(): Record<string, string | undefined> {
   return out;
 }
 
-// 破坏性命令静态检测（安全底线：即使 execute 模式也升级为 high 并确认）
-const DESTRUCTIVE_PATTERNS = [
-  /rm\s+-rf\s+\//,
-  /rm\s+-rf\s+~\//,
-  /mkfs/,
-  /dd\s+if=/,
-  /git\s+push\s+--force/,
-  /git\s+push\s+-f\s/,
-  /drop\s+table/i,
-  /drop\s+database/i,
-  /shutdown/,
-  /reboot/,
-  />\s*\/dev\/sd/,
-  /taskkill\s+\/f\s+\/im/, // 强杀全进程（可能误杀 Agent 自身）
-];
-
-export function isDestructive(command: string): boolean {
-  return DESTRUCTIVE_PATTERNS.some((re) => re.test(command));
-}
+// 破坏性命令判定已提拔至 src/permission（单一事实源），此处仅再导出以保持引用兼容。
+import { isDestructive } from '../permission/index.ts';
+export { isDestructive };
 
 /**
  * 在文件内容中定位 old_string 的起始字符索引，比 buf.indexOf 更鲁棒。

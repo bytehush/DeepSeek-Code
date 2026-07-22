@@ -1,6 +1,7 @@
 import { DeepSeekClient, ChatMessage, ToolCall, StreamErrorCategory } from '../llm/deepseek.ts';
 import { errMsg } from '../llm/deepseek.ts';
-import { ToolDef, ToolResult, isDestructive, createTools } from '../tools/index.ts';
+import { ToolDef, ToolResult, createTools } from '../tools/index.ts';
+import { isDestructive } from '../permission/index.ts';
 import { runTaskFidelity } from '../tools/verify-task.ts';
 import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger, type TraceEventType } from '../context/trace.ts';
@@ -9,7 +10,9 @@ import { type OutputStyle, styleInstruction } from './output-style.ts';
 import { regexExtractJSON } from '../tools/structured-parse.ts';
 import { z } from 'zod';
 
-export type PermissionMode = 'explore' | 'ask' | 'execute';
+// 权限模式枚举已提拔至 src/permission（单一事实源），此处再导出以保持引用兼容。
+import type { PermissionMode } from '../permission/index.ts';
+export type { PermissionMode };
 
 export interface AgentEvent {
   type: 'assistant_text' | 'assistant_phase' | 'assistant_promote' | 'tool_call' | 'tool_result' | 'tool_stream' | 'permission' | 'error' | 'done' | 'system';
