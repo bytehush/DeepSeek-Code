@@ -12,6 +12,12 @@ import { z } from 'zod';
 
 // 权限模式枚举已提拔至 src/permission（单一事实源），此处再导出以保持引用兼容。
 import type { PermissionMode } from '../permission/index.ts';
+
+// ReviewCommons 审查共同体（S5.4）：Format Validator + Reflection 审查 + 编排者。
+import { ReviewOrchestrator } from '../review/orchestrator.ts';
+import { FormatValidator } from '../review/format-validator.ts';
+import { ReflectionReviewer, createProReflectionAssessor } from '../review/reflection.ts';
+import { MAX_REFLECTION_ROUNDS } from '../review/types.ts';
 export type { PermissionMode };
 
 export interface AgentEvent {
@@ -405,7 +411,7 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
   };
   let totalToolRounds = 0; // 全会话累计「调了工具」的轮数，供 C2 主停止完成校验
   let everMutated = false; // 全会话是否曾改变世界状态，供 C2 主停止完成校验
-  let didElevate = false; // 双模型 Elevate 闸：本轮是否已触发过 Pro 审核（防死循环）
+  let didElevate = false; // 双模型 Elevate 闸：保留声明（语义保真审计已并入 ReviewCommons 网关，此标记停用）
   let selfReviewed = false; // P1.1 Flash 自检：本轮是否已完成自我审查（防重复）
   let replanAttempted = false; // P2.5 中继重新规划：是否已尝试过 replan（防无限循环）
   // P1 防循环新增（Claude Code 对比分析）
@@ -417,6 +423,13 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
   const TODO_NAG_AFTER = 3; // 连续 N 轮不更新 Todo → 提醒
   const perToolFailures = new Map<string, number>(); // P1: 每个工具的累计失败次数（Reflection 升级用）
   let step = 1; // ReAct 可观测：当前推理-行动步数（每进入新一轮 +1）
+
+  // ReviewCommons 审查共同体（S5.4）：实例仅建一次（每轮 agent 运行），跨 Flash 修订轮次
+  // 持久 ReflectionState，供递进审查比对深度。verdict 不修改 content，仅产出 guidance 回灌。
+  const reviewOrchestrator = new ReviewOrchestrator({
+    format: new FormatValidator(), // 通用格式 sanity（无 schema 时仅非空/未截断校验；复用 zod 能力）
+    reflection: new ReflectionReviewer(createProReflectionAssessor(opts.client, opts.signal)),
+  });
 
   while (iterations < effectiveMax) {
     // 用户主动中断：立即结束，不再开启新一轮
@@ -629,48 +642,43 @@ export async function* runAgent(userInput: string, opts: RunOptions): AsyncGener
       logger.debug('[agent loop] self-review injected (moderate task, no Elevate)');
       continue;
     }
-    if (canElevate && everMutated) {
-      // Level 1: 写操作 — 全检
-      didElevate = true;
-      // P2 任务级语义保真闸门（内核侧、基于真实落盘记录）：
-      // 在最终答复前，用 Pro 审计「整轮工作」是否真的达成用户意图——
-      // 漏子需求 / 半成品 / 声称已验证实际未跑。审计依据是内核从 history
-      // 抽出的真实工具结果，而非 Flash 自述（延续 P0「不轻信 ok 声明」哲学）。
-      try {
-        const fidelityNote = await runTaskFidelity(opts.client, opts.history, { signal: opts.signal });
-        if (fidelityNote) {
-          opts.history.addUser(
-            '[系统自动] 任务级交付审计已完成，结果如下。在输出最终答复前，请先处理其中的 must_fix（必须修复项）；若 pass=false，不要声称任务已完成。\n\n' +
-            fidelityNote,
-          );
-          if (trace) await trace.log('task_fidelity', { triggered: true });
+    if (willElevate) {
+      // 任务级语义保真审计（内核侧基于真实落盘记录，独立于答复质量审查；仅写操作触发）
+      if (everMutated) {
+        try {
+          const fidelityNote = await runTaskFidelity(opts.client, opts.history, { signal: opts.signal });
+          if (fidelityNote) {
+            opts.history.addUser(
+              '[系统自动] 任务级交付审计已完成，结果如下。在输出最终答复前，请先处理其中的 must_fix（必须修复项）；若 pass=false，不要声称任务已完成。\n\n' +
+                fidelityNote,
+            );
+            if (trace) await trace.log('task_fidelity', { triggered: true });
+          }
+        } catch (e: unknown) {
+          logger.warn('[agent loop] task fidelity check failed: ' + errMsg(e));
         }
-      } catch (e: unknown) {
-        logger.warn('[agent loop] task fidelity check failed: ' + errMsg(e));
       }
-      const elevatePrompt =
-        '[系统自动] 在输出最终答复给用户前，先调用 verify_answer 工具审核你的答复是否准确、完整、一致。\n' +
-        '你需要提供两个参数：\n' +
-        '  - answer：你准备发给用户的答复全文\n' +
-        '  - context_summary：本轮你做了哪些操作、各工具的关键结果（帮助审核员判断你是否遗漏或歪曲了事实）\n' +
-        '审核通过后，根据审核结果修正答复再发送给用户。';
-      opts.history.addUser(elevatePrompt);
-      if (trace) await trace.log('elevate', { level: 1, reason: 'full_gate', totalToolRounds, everMutated });
-      logger.debug('[agent loop] Elevate L1 — full gate (verify-task + verify-answer)');
-      continue;
-    } else if (canElevate && totalToolRounds >= 3) {
-      // Level 2: 多轮读操作 — 轻检（仅 verify-answer）
-      didElevate = true;
-      const lightPrompt =
-        '[系统自动] 本轮进行了多轮信息检索和分析（未修改文件）。在输出最终答复前，请先调用 verify_answer 工具审核你的答复是否准确、一致、无事实错误。\n' +
-        '你需要提供两个参数：\n' +
-        '  - answer：你准备发给用户的答复全文\n' +
-        '  - context_summary：本轮你检索了哪些信息、各工具的关键结果（帮助审核员判断你是否遗漏或歪曲了事实）\n' +
-        '审核通过后，根据审核结果修正答复再发送。';
-      opts.history.addUser(lightPrompt);
-      if (trace) await trace.log('elevate', { level: 2, reason: 'read_heavy_light_gate', totalToolRounds });
-      logger.debug('[agent loop] Elevate L2 — light gate (verify-answer only)');
-      continue;
+      // ReviewCommons 审查共同体（替 Elevate inline，S5.4）：对 Flash 本轮最终答复做 Format -> Reflection 审查。
+      // 未放行则 guidance 回灌、下一轮深化；达标或达递进上限则落入最终答复逻辑。
+      const verdict = await reviewOrchestrator.review(accContent);
+      if (trace) await trace.log('review_commons', { released: verdict.released, round: reviewOrchestrator.round, hasGuidance: !!verdict.guidance });
+      if (!verdict.released) {
+        if (reviewOrchestrator.round < MAX_REFLECTION_ROUNDS) {
+          opts.history.addUser(
+            '[系统自动·审查共同体] 你的答复未通过审查：\n' +
+              verdict.guidance +
+              '\n请根据以上指引修订后，重新输出最终答复。',
+          );
+          continue;
+        }
+        // 达递进深度上限仍不达标 -> 保守放行并告警（避免无限空转）
+        opts.history.addUser(
+          '[系统自动·审查共同体] 已达递进深度上限（' +
+            MAX_REFLECTION_ROUNDS +
+            ' 轮）仍不达标，放行当前答复供你定夺：\n' +
+            (verdict.guidance ?? ''),
+        );
+      }
     }
 
     // P2-⑨ 任务级 progress/final 标记：本轮若还要调用工具 → 过程叙述；否则 → 最终答复。

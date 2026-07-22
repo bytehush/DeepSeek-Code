@@ -22,6 +22,7 @@ export type TraceEventType =
   | 'cancelled'          // 用户主动中断当前请求
   | 'elevate'            // 双模型 Elevate 闸——最终答复前自动触发 Pro 审核
   | 'task_fidelity'      // 双模型 P2 任务级保真审计——整轮工作 vs 用户意图
+  | 'review_commons'     // ReviewCommons 审查共同体——最终答复前 Format→Reflection 审查结论
   | 'cycle_rescue'       // 序列循环检测——首次命中注入自救指令
   | 'plan_generated'     // Plan&Act——计划生成完成
   | 'plan_decision'      // Plan&Act——用户确认/拒绝计划
