@@ -15,8 +15,9 @@
  *     （涉及对话 API 的 tool 消息顺序，错则 400），必须留在 loop.ts。
  *   - ask 只是「把话问出去、把回答拿回来」的机械动作；问不问、问什么由权限系统决定。
  *
- * 注意：本模块当前未被 loop.ts 接线（loop 重写属 P3 循环解耦）；
- * 此处先作为独立、可单测的纯调度层交付，由 P3 的 runCore 中间件接管。
+ * 注意：本模块现已由 src/agent/core.ts::runCore 的 dispatch 内循环接线为
+ * 工具执行的唯一入口（S2.1 接线，见 commit）。core 仍负责事件/yield/history/异常，
+ * 编排者严守「被指挥」铁律：不写 history、不 yield、只消费 Gatekeeper / PermissionSystem 的判定。
  */
 
 import type { PermissionMode } from '../permission/index.ts';
@@ -55,7 +56,16 @@ export interface OrchestratorDeps {
   cwd: string;
   signal?: AbortSignal;
   onToolProgress?: (text: string) => void;
+  /**
+   * 权限观测回调：编排者在「问用户」或「直接拒绝」时调用（granted=false 表示拒绝/拦截）。
+   * 编排者自身不 yield / 不写 history——由调用方（core.ts）借此回调把权限事件转交 UI。
+   */
+  onPermission?: (toolName: string, granted: boolean) => void;
   trace?: { log: (type: string, data: unknown) => Promise<void> | void };
+}
+
+function riskBadge(risk: Risk): string {
+  return risk === 'high' ? '[高危]' : risk === 'mid' ? '[中危]' : '[低危]';
 }
 
 // —— 消息适配：工具输出截断（与 loop.ts::clampToolOutput 同预算，留 P3 统一）—— //
@@ -71,17 +81,21 @@ function clampToolOutput(output: string): string {
   return `${head}\n…[工具结果过长，已省略中段 ${cut} 字符 — 如需完整内容请缩小范围重试]…\n${tail}`;
 }
 
-/** 文件写前 diff 审批提示（与 loop.ts 同语义；P3 接线时统一为共享 helper） */
+/** 文件写前 diff 审批提示（统一为编排者单一事实源，P3 接线后 loop 不再自带副本） */
 function buildFileReviewPrompt(
   toolName: string,
   args: Record<string, unknown>,
   diff: string,
   risk: Risk,
 ): string {
+  let detail = '';
+  if (toolName === 'delete_file' || toolName === 'edit_file' || toolName === 'create_file') {
+    detail = `\n  路径: ${String(args.path ?? '')}`;
+  }
   return (
-    `[系统自动] 工具 ${toolName} 即将修改文件（风险 ${risk}）。请确认以下变更预览是否无误：\n\n` +
-    diff +
-    `\n\n变更参数摘要：${JSON.stringify(args)}\n若同意请确认，否则拒绝。`
+    `🔍 写前审批 ${toolName} ${riskBadge(risk)}：即将修改文件${detail}\n` +
+    (diff ? `${diff}\n` : '') +
+    `  是否允许此文件变更？(yes/no) `
   );
 }
 
@@ -135,23 +149,25 @@ export class ToolOrchestrator {
     });
 
     if (verdict.action === 'deny') {
+      this.deps.onPermission?.(def.name, false);
       return { ok: false, denied: true, output: verdict.reason, needSelfHeal: false };
     }
     if (verdict.action === 'require_confirm') {
       let approved: boolean;
       if (verdict.channel === 'risk_prompt') {
-        approved = await this.deps.ask(`即将执行高风险操作 ${def.name}，是否继续？`);
+        approved = await this.deps.ask(`${riskBadge(verdict.risk)} 即将执行高风险操作 ${def.name}，是否继续？`);
       } else {
         // file_review：编排者负责生成 diff 预览（它持有 def + args + cwd），但「要不要问」由权限系统决定
         const diff = def.preview
           ? await def.preview(args, {
               cwd: this.deps.cwd,
               signal: this.deps.signal,
-              onProgress: this.deps.onToolProgress,
+              onProgress: req.ctx.onProgress,
             })
           : '';
         approved = await this.deps.ask(buildFileReviewPrompt(def.name, args, diff, verdict.risk));
       }
+      this.deps.onPermission?.(def.name, approved);
       if (!approved) {
         return { ok: false, denied: true, output: `用户拒绝执行 ${def.name}`, needSelfHeal: false };
       }

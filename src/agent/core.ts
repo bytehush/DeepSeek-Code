@@ -13,13 +13,14 @@
  */
 import { DeepSeekClient, ChatMessage, ToolCall } from '../llm/deepseek.ts';
 import { errMsg } from '../llm/deepseek.ts';
-import { ToolDef, ToolResult, createTools } from '../tools/index.ts';
-import { isDestructive, decide } from '../permission/index.ts';
+import { ToolDef, createTools } from '../tools/index.ts';
 import { ConversationHistory } from '../context/history.ts';
 import { TraceLogger, type TraceEventType } from '../context/trace.ts';
 import { logger } from '../utils/logger.ts';
 import { type OutputStyle, styleInstruction } from './output-style.ts';
 import { regexExtractJSON } from '../tools/structured-parse.ts';
+import { ToolOrchestrator, type ToolCallResult } from '../tools/orchestrator.ts';
+import { DefaultGatekeeper } from '../tools/gatekeeper.ts';
 import { z } from 'zod';
 import { ReviewOrchestrator } from '../review/orchestrator.ts';
 import { FormatValidator } from '../review/format-validator.ts';
@@ -73,61 +74,10 @@ function extractTarget(tc: { name: string; arguments: Record<string, unknown> })
   }
 }
 
-/** 格式化权限确认提示，提升可读性与风险感知 */
-function formatPermissionPrompt(
-  toolName: string,
-  args: unknown,
-  risk: 'low' | 'mid' | 'high',
-  forceConfirm = false,
-): string {
-  const riskBadge = risk === 'high' ? '[高危]' : risk === 'mid' ? '[中危]' : '[低危]';
-  const header = forceConfirm
-    ? `⚠️ 检测到破坏性命令，即便在 execute 模式也需确认 ${riskBadge}`
-    : `🔐 工具 ${toolName} 需要确认执行 ${riskBadge}`;
-  let detail = '';
-  if (toolName === 'run_command') {
-    const cmd = String((args as Record<string, unknown>)?.command ?? '');
-    detail = `\n  命令: ${cmd.length > 120 ? cmd.slice(0, 120) + '…' : cmd}`;
-  } else if (toolName === 'delete_file') {
-    detail = `\n  路径: ${String((args as Record<string, unknown>)?.path ?? '')}`;
-  } else {
-    detail = `\n  参数: ${JSON.stringify(args).slice(0, 200)}`;
-  }
-  return `${header}${detail}\n  是否允许？(yes/no) `;
-}
-
-/** 格式化写前 diff 审批提示 */
-function buildFileReviewPrompt(
-  toolName: string,
-  args: unknown,
-  diff: string,
-  risk: 'low' | 'mid' | 'high',
-): string {
-  const riskBadge = risk === 'high' ? '[高危]' : risk === 'mid' ? '[中危]' : '[低危]';
-  let detail = '';
-  if (toolName === 'delete_file') {
-    detail = `\n  路径: ${String((args as Record<string, unknown>)?.path ?? '')}`;
-  } else if (toolName === 'edit_file') {
-    detail = `\n  路径: ${String((args as Record<string, unknown>)?.path ?? '')}`;
-  } else if (toolName === 'create_file') {
-    detail = `\n  路径: ${String((args as Record<string, unknown>)?.path ?? '')}`;
-  }
-  return `🔍 写前审批 ${toolName} ${riskBadge}${detail}\n${diff}\n  是否允许此文件变更？(yes/no) `;
-}
-
-/** 统一工具结果预算：单个工具结果回灌上下文前的最大字符数。 */
-const TOOL_RESULT_BUDGET = 12_000;
-const TOOL_RESULT_HEAD = 8_000;
-const TOOL_RESULT_TAIL = 3_000;
-
-/** 确定性截断工具结果输出：保留开头与结尾，掐掉中段并打标记。 */
-function clampToolOutput(output: string): string {
-  if (output.length <= TOOL_RESULT_BUDGET) return output;
-  const head = output.slice(0, TOOL_RESULT_HEAD);
-  const tail = output.slice(output.length - TOOL_RESULT_TAIL);
-  const cut = output.length - TOOL_RESULT_HEAD - TOOL_RESULT_TAIL;
-  return `${head}\n…[工具结果过长，已省略中段 ${cut} 字符 — 如需完整内容请缩小范围重试]…\n${tail}`;
-}
+/**
+ * 工具结果截断 / 权限提示文案 现由 src/tools/orchestrator.ts 单一持有（clampToolOutput /
+ * buildFileReviewPrompt），core 不再保留副本——工具执行收敛到唯一消息通道（ToolOrchestrator）。
+ */
 
 const toModelTools = (tools: ToolDef[]) =>
   tools.map((t) => ({
@@ -284,8 +234,20 @@ export async function* runCore(
 ): AsyncGenerator<AgentEvent> {
   const trace = opts.trace;
   const tools = opts.tools ?? createTools(opts.client);
-  const toolMap = new Map(tools.map((t) => [t.name, t]));
   opts.history.addUser(userInput);
+
+  // 工具执行统一收口到 ToolOrchestrator（消息驱动：路由→把关→授权→执行→截断）。
+  // 编排者不碰 history / yield / trace——core 仍负责事件、history 落盘、异常与业务状态。
+  const permissionEvents: Array<{ toolName: string; granted: boolean }> = [];
+  const toolOrchestrator = new ToolOrchestrator({
+    tools,
+    gatekeeper: new DefaultGatekeeper(),
+    ask: opts.ask,
+    mode: opts.permission,
+    cwd: opts.cwd,
+    signal: opts.signal,
+    onPermission: (toolName, granted) => permissionEvents.push({ toolName, granted }),
+  });
 
   if (trace) {
     await trace.log('session_start', { cwd: opts.cwd, permission: opts.permission, model: opts.client.primaryModel });
@@ -606,7 +568,7 @@ export async function* runCore(
 
     for (const tc of pendingToolCalls) {
       try {
-        // 模型主动 awaitUser：中途向用户提问
+        // 模型主动 awaitUser：中途向用户提问（伪工具，不走编排者路由）
         if (tc.name === 'awaitUser') {
           const question = String((tc.arguments as Record<string, unknown>).question ?? '').trim();
           let reply: string;
@@ -626,39 +588,31 @@ export async function* runCore(
 
         iterSigParts.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
         roundTargets.push(extractTarget(tc));
-        const def = toolMap.get(tc.name);
-        if (!def) {
-          const msg = `未知工具: ${tc.name}`;
-          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: msg }));
-          yield { type: 'tool_result', toolName: tc.name, result: msg, step: ctx.step, reactPhase: 'observation' };
-          iterToolResults.push(false);
-          continue;
+
+        // 工具调用事件（统一分发前发出）
+        await tlog('tool_call', { tool: tc.name, args: tc.arguments });
+        yield { type: 'tool_call', toolName: tc.name, args: tc.arguments, step: ctx.step, reactPhase: 'action' };
+
+        // 统一消息驱动分发：路由→把关→授权→执行→截断 全经 ToolOrchestrator 单入口
+        const outcome: ToolCallResult = await toolOrchestrator.dispatch({
+          id: tc.id,
+          name: tc.name,
+          rawArguments: tc.arguments,
+          ctx: {
+            cwd: opts.cwd,
+            signal: opts.signal,
+            onProgress: opts.onToolProgress ? (text: string) => opts.onToolProgress!(tc.name, text) : undefined,
+          },
+        });
+
+        // 排空调度期间产生的权限事件（deny / confirm 结果），转交 UI
+        for (const pe of permissionEvents.splice(0)) {
+          yield { type: 'permission', toolName: pe.toolName, granted: pe.granted };
+          await tlog('permission_decision', { tool: pe.toolName, mode: opts.permission, granted: pe.granted });
         }
 
-        // 权限闸门（政策决策已提拔至 src/permission::decide）
-        const destructive = tc.name === 'run_command' && isDestructive(String((tc.arguments as Record<string, unknown>).command ?? ''));
-        const effectiveRisk = destructive ? 'high' : def.risk;
-        const isFileWrite = !!def.preview;
-        const verdict = decide({ mode: opts.permission, effectiveRisk, isFileWrite, destructive, toolName: tc.name });
-
-        let granted = true;
-        if (verdict.action === 'deny') {
-          granted = false;
-          await tlog('permission_decision', { tool: tc.name, mode: opts.permission, risk: effectiveRisk, granted: false });
-          yield { type: 'permission', toolName: tc.name, granted: false };
-        } else if (verdict.action === 'require_confirm') {
-          if (verdict.channel === 'file_review') {
-            const diff = await def.preview!(tc.arguments as Record<string, unknown>, { cwd: opts.cwd });
-            granted = await opts.ask(buildFileReviewPrompt(tc.name, tc.arguments, diff, effectiveRisk));
-          } else {
-            granted = await opts.ask(formatPermissionPrompt(tc.name, tc.arguments, effectiveRisk, destructive));
-          }
-          await tlog('permission_decision', { tool: tc.name, mode: opts.permission, fileReview: verdict.channel === 'file_review', risk: effectiveRisk, granted });
-          yield { type: 'permission', toolName: tc.name, granted };
-        }
-
-        if (!granted) {
-          const denyMsg = `用户拒绝执行 ${tc.name}（权限模式: ${opts.permission}）`;
+        if (outcome.denied) {
+          const denyMsg = outcome.output || `用户拒绝执行 ${tc.name}（权限模式: ${opts.permission}）`;
           opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: denyMsg }));
           await tlog('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, denied: true, reason: denyMsg });
           yield { type: 'tool_result', toolName: tc.name, result: denyMsg, step: ctx.step, reactPhase: 'observation' };
@@ -666,16 +620,19 @@ export async function* runCore(
           continue;
         }
 
-        await tlog('tool_call', { tool: tc.name, args: tc.arguments });
-        yield { type: 'tool_call', toolName: tc.name, args: tc.arguments, step: ctx.step, reactPhase: 'action' };
-        const res: ToolResult = await def.execute(tc.arguments as Record<string, unknown>, {
-          cwd: opts.cwd,
-          signal: opts.signal,
-          onProgress: opts.onToolProgress ? (text: string) => opts.onToolProgress!(tc.name, text) : undefined,
-        });
+        if (outcome.needSelfHeal) {
+          // 路由/把关失败：回灌字段级错误，模型自愈
+          const healMsg = outcome.output || `[工具 ${tc.name} 参数校验失败]`;
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: healMsg }));
+          await tlog('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: false, needSelfHeal: true });
+          yield { type: 'tool_result', toolName: tc.name, result: healMsg, step: ctx.step, reactPhase: 'observation' };
+          iterToolResults.push(false);
+          continue;
+        }
 
-        const clampedOutput = clampToolOutput(res.output);
-        if (!res.ok) {
+        // 正常执行结果（outcome.output 已由编排者截断）
+        const clampedOutput = outcome.output;
+        if (!outcome.ok) {
           const failN = (ctx.perToolFailures.get(tc.name) ?? 0) + 1;
           ctx.perToolFailures.set(tc.name, failN);
           iterToolResults.push(false);
@@ -702,15 +659,15 @@ export async function* runCore(
             `错误: ${clampedOutput}\n\n${diagnostic}`;
           opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: reflectionMsg }));
           await tlog('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: false, failCount: failN, reflected: true });
-          yield { type: 'tool_result', toolName: tc.name, result: `[失败#${failN}] ${res.output.slice(0, 300)}... → Agent 将自我纠正`, step: ctx.step, reactPhase: 'observation' };
+          yield { type: 'tool_result', toolName: tc.name, result: `[失败#${failN}] ${clampedOutput.slice(0, 300)}... → Agent 将自我纠正`, step: ctx.step, reactPhase: 'observation' };
         } else {
           ctx.perToolFailures.delete(tc.name);
           opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: true, output: clampedOutput }));
           await tlog('tool_result', { tool: tc.name, toolCallId: tc.id, name: tc.name, ok: true, output: clampedOutput.slice(0, 3000) });
-          yield { type: 'tool_result', toolName: tc.name, result: res.output, step: ctx.step, reactPhase: 'observation' };
+          yield { type: 'tool_result', toolName: tc.name, result: clampedOutput, step: ctx.step, reactPhase: 'observation' };
           iterToolResults.push(true);
           if (MUTATING_TOOLS.has(tc.name)) roundMutated = true;
-          if (MUTATING_TOOLS.has(tc.name) && res.ok) {
+          if (MUTATING_TOOLS.has(tc.name) && outcome.ok) {
             successChecks.push(`[系统提示] ${tc.name} 已执行成功。请在下一轮给出推理时，用一句话确认：产出是否符合预期？（如「文件已创建，入口逻辑正确」）`);
           }
         }

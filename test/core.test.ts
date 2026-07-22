@@ -131,3 +131,71 @@ describe('safeSeam 异常降级：中间件抛错不崩内核', () => {
     assert.ok(events.includes('assistant_text'), '第 2 轮最终答复应照常产出');
   });
 });
+
+/** 空中间件链：隔离验证 runCore 的工具分发已统一收口到 ToolOrchestrator（消息驱动） */
+const noMw: MiddlewareChain = {
+  beforeLLM: [],
+  afterLLM: [],
+  afterFinal: [],
+  afterDispatch: [],
+  onRoundEnd: [],
+};
+
+describe('runCore 经 ToolOrchestrator 统一分发（消息驱动接线路验证）', () => {
+  test('ask 模式文件写被拒绝 → 编排者→onPermission 产出 permission(denied) + 拒绝结果', async () => {
+    const client = makeMockClient([
+      [{ type: 'tool_use', tools: [{ id: '1', name: 'write_file', arguments: { path: 'a.txt', content: 'x' } }] }],
+      [{ type: 'content', text: FINAL }],
+    ]);
+    const history = makeMockHistory();
+    const tools: ToolDef[] = [
+      {
+        name: 'write_file',
+        description: 'write a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } } },
+        risk: 'low',
+        preview: async () => '--- a.txt ---\n+x',
+        execute: async () => ({ ok: true, output: 'written' }),
+      },
+    ];
+    const events: Array<{ type: string; granted?: boolean; result?: string }> = [];
+    let done = false;
+    for await (const ev of runCore('写个文件', { ...baseOpts(client, history, tools), permission: 'ask', ask: async () => false }, noMw)) {
+      events.push({ type: ev.type, granted: ev.granted, result: ev.result });
+      if (ev.type === 'done') done = true;
+    }
+    assert.ok(done, '应正常结束');
+    const perm = events.find((e) => e.type === 'permission');
+    assert.ok(perm, '应经编排者→onPermission 回调产出 permission 事件');
+    assert.equal(perm!.granted, false, '拒绝应 granted:false');
+    const tr = events.find((e) => e.type === 'tool_result');
+    assert.ok(tr, '应产出 tool_result');
+    assert.ok(String(tr!.result).includes('拒绝'), '结果应说明被拒绝（execute 未被执行）');
+  });
+
+  test('execute 模式普通工具放行 → 编排者路由并执行、回灌结果', async () => {
+    const client = makeMockClient([
+      [{ type: 'tool_use', tools: [{ id: '1', name: 'read_file', arguments: { path: 'x' } }] }],
+      [{ type: 'content', text: FINAL }],
+    ]);
+    const history = makeMockHistory();
+    const tools: ToolDef[] = [
+      {
+        name: 'read_file',
+        description: 'read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        risk: 'low',
+        execute: async () => ({ ok: true, output: 'file content' }),
+      },
+    ];
+    const events: string[] = [];
+    let done = false;
+    for await (const ev of runCore('读文件', baseOpts(client, history, tools), noMw)) {
+      if (ev.type) events.push(ev.type);
+      if (ev.type === 'done') done = true;
+    }
+    assert.ok(done, '应正常结束');
+    assert.ok(events.includes('tool_call'), '编排者应产出 tool_call');
+    assert.ok(events.includes('tool_result'), '编排者应执行 read_file 并回灌 tool_result');
+  });
+});
