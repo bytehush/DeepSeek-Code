@@ -309,13 +309,29 @@ export class TraceLogger {
     if (jsonlFiles.length === 0) return null;
     const allMessages: ReplayedMessage[] = [];
     const allThinking: ReplayedThinkingTurn[] = [];
+    // 全局唯一 thinking turnId：多 session 的 trace 各自从 1 计 turnId（AgentHost.curTurnId
+    // 每次 makeHost 重置为 0；刷新重连还可能复用旧 traceLogger 文件追加），聚合后必然冲突。
+    // 前端用 turnId 做 React key 与 assistant 消息的 thinkingId 匹配，重复 turnId 会导致
+    // 思考轮错配 / 部分内容丢失（find 只命中首个同名 turnId）。故按聚合顺序重映射为全局
+    // 唯一 id，并同步重写对应 assistant 消息的 thinkingId 指向新 id，确保前端关联正确。
+    let seq = 0;
     for (const f of jsonlFiles) {
       try {
         const content = await readFile(join(traceDir, f), 'utf8');
         const part = TraceLogger.parseReplay(content);
-        if (part) {
-          allMessages.push(...part.messages);
-          allThinking.push(...part.thinking);
+        if (!part) continue;
+        const remap = new Map<number, number>();
+        for (const t of part.thinking) {
+          const newId = ++seq;
+          remap.set(t.turnId, newId);
+          allThinking.push({ ...t, turnId: newId });
+        }
+        for (const m of part.messages) {
+          if (typeof m.thinkingId === 'number' && remap.has(m.thinkingId)) {
+            allMessages.push({ ...m, thinkingId: remap.get(m.thinkingId)! });
+          } else {
+            allMessages.push(m);
+          }
         }
       } catch {
         // 单个文件读取失败（如被 TraceLogger 刷盘锁临时占用）跳过，不拖累整体聚合

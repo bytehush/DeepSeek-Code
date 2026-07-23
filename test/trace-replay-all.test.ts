@@ -152,7 +152,12 @@ test('工具轮：思考盒含 tool/tool_result 条目，最终答复绑定思�
     // messages: user + 工具轮 assistant(tool_calls) + 最终答复 = 3 条（工具轮保留给 LLM 上下文）
     assert.equal(all!.messages.length, 3);
     assert.equal((all!.messages[1] as { thinkingId?: number }).thinkingId, undefined, '工具轮 assistant 不应绑定 thinkingId');
-    assert.equal((all!.messages[2] as { thinkingId?: number }).thinkingId, 7, '最终答复绑定 thinkingId=7');
+    // 最终答复应绑定到唯一的思考轮次（turnId 经 replayAll 重映射为全局唯一，不断言具体值）
+    assert.equal(
+      (all!.messages[2] as { thinkingId?: number }).thinkingId,
+      all!.thinking[0].turnId,
+      '最终答复绑定到唯一思考轮次',
+    );
 
     assert.equal(all!.thinking.length, 1);
     const turn = all!.thinking[0];
