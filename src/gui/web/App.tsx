@@ -500,6 +500,19 @@ export function App() {
       } catch {
         return;
       }
+      // 宽松过滤（点⑤）：只丢弃「显式携带了 ≠ 当前激活任务 taskId」的在途流事件
+      // （切到 B 后 A 残留的流式事件），无 taskId 的事件（reset 重放 / 系统消息）照常通过，避免破坏切回任务的历史恢复。
+      const evTaskId = (msg as { taskId?: string }).taskId;
+      if (
+        evTaskId !== undefined &&
+        evTaskId !== activeTaskIdRef.current &&
+        (msg.type === 'message' || msg.type === 'update' ||
+          msg.type === 'thinking_start' || msg.type === 'thinking_entry' ||
+          msg.type === 'thinking_update' || msg.type === 'thinking_status' ||
+          msg.type === 'thinking_end' || msg.type === 'gen_interrupted')
+      ) {
+        return;
+      }
       switch (msg.type) {
         case 'auth_ok':
           sessionStorage.setItem(TOKEN_KEY, msg.token);
@@ -880,7 +893,9 @@ export function App() {
 
   const send = useCallback((text: string) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', text }));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', text, taskId: activeTaskIdRef.current ?? undefined }));
+    }
   }, []);
 
   const onSend = () => {
@@ -893,6 +908,7 @@ export function App() {
         JSON.stringify({
           type: 'input',
           text: t,
+          taskId: activeTaskIdRef.current ?? undefined,
           attachments: pendingAttachments.length ? pendingAttachments : undefined,
         }),
       );
