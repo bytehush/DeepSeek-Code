@@ -47,7 +47,7 @@ export interface AgentEvent {
    * - repeat_loop：连续多轮发出字节完全相同的工具调用（死循环）
    * - max_iterations：达到迭代轮数硬上限
    */
-  reason?: 'model_stop' | 'user_abort' | 'no_progress' | 'no_observable_progress' | 'repeat_loop' | 'max_iterations';
+  reason?: 'model_stop' | 'user_abort' | 'no_progress' | 'no_observable_progress' | 'repeat_loop' | 'max_iterations' | 'repeated_tool_no_progress';
 }
 
 export interface RunOptions {
@@ -78,6 +78,10 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** P6 输出风格：把风格指令按轮注入到最后一条 user 消息（本地副本，不污染 history/trace） */
   outputStyle?: OutputStyle;
+  /** B·harness：每轮工具调用数上限（默认 16）。超限本轮停止派发，注入收敛提示（通用限制，不识工具语义）。 */
+  maxToolCallsPerRound?: number;
+  /** B·harness：同工具 + 相同参数签名重复调用上限（默认 4）。超限终止本轮以避免活锁（通用计数，不识「为何空输出」）。 */
+  maxRepeatedToolCalls?: number;
 }
 
 /**

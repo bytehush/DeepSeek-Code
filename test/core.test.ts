@@ -199,3 +199,68 @@ describe('runCore 经 ToolOrchestrator 统一分发（消息驱动接线路验�
     assert.ok(events.includes('tool_result'), '编排者应执行 read_file 并回灌 tool_result');
   });
 });
+
+describe('B·harness 通用限制（不破坏解耦：不识工具语义、纯通用计数）', () => {
+  test('每轮工具调用超上限即停止派发，下一轮可正常收尾', async () => {
+    const calls = Array.from({ length: 20 }, (_, k) => ({
+      id: String(k),
+      name: 'read_file',
+      arguments: { path: `p${k}` },
+    }));
+    const client = makeMockClient([
+      [{ type: 'tool_use', tools: calls }],
+      [{ type: 'content', text: FINAL }],
+    ]);
+    const history = makeMockHistory();
+    const tools: ToolDef[] = [
+      {
+        name: 'read_file',
+        description: 'read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        risk: 'low',
+        execute: async () => ({ ok: true, output: 'ok' }),
+      },
+    ];
+    const events: Array<{ type: string; result?: string }> = [];
+    let done = false;
+    for await (const ev of runCore('批量读', { ...baseOpts(client, history, tools), maxToolCallsPerRound: 3 }, noMw)) {
+      events.push({ type: ev.type, result: ev.result });
+      if (ev.type === 'done') done = true;
+    }
+    const toolCalls = events.filter((e) => e.type === 'tool_call').length;
+    assert.equal(toolCalls, 3, '超过上限后应只派发 3 个工具调用');
+    const cap = events.find((e) => e.type === 'tool_result' && String(e.result).includes('每轮工具调用上限'));
+    assert.ok(cap, '溢出调用应收到上限提示的 tool_result');
+    assert.ok(done, '应正常结束（下一轮给出最终答复）');
+  });
+
+  test('同工具+相同参数重复超限 → 活锁熔断终止（repeated_tool_no_progress）', async () => {
+    const calls = Array.from({ length: 6 }, (_, k) => ({
+      id: String(k),
+      name: 'read_file',
+      arguments: { path: 'same' },
+    }));
+    const client = makeMockClient([
+      [{ type: 'tool_use', tools: calls }],
+      [{ type: 'content', text: FINAL }],
+    ]);
+    const history = makeMockHistory();
+    const tools: ToolDef[] = [
+      {
+        name: 'read_file',
+        description: 'read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        risk: 'low',
+        execute: async () => ({ ok: true, output: 'ok' }),
+      },
+    ];
+    const events: Array<{ type: string; reason?: string }> = [];
+    for await (const ev of runCore('重复读', { ...baseOpts(client, history, tools), maxRepeatedToolCalls: 4 }, noMw)) {
+      events.push({ type: ev.type, reason: ev.reason });
+    }
+    const toolCalls = events.filter((e) => e.type === 'tool_call').length;
+    assert.equal(toolCalls, 4, '应只执行 4 次相同调用，第 5 次被熔断');
+    const brk = events.find((e) => e.type === 'done' && e.reason === 'repeated_tool_no_progress');
+    assert.ok(brk, '应产出 done(reason=repeated_tool_no_progress) 活锁熔断');
+  });
+});

@@ -27,6 +27,8 @@ export type TraceEventType =
   | 'plan_generated'     // Plan&Act——计划生成完成
   | 'plan_decision'      // Plan&Act——用户确认/拒绝计划
   | 'auto_plan'         // P-Auto——复杂度分类器判定为复杂，自动进入规划
+  | 'tool_cap'          // B·harness——每轮工具调用数达上限，停止派发
+  | 'repeated_tool_break' // B·harness——同工具+相同参数重复超限，活锁熔断终止
   | 'self_review'        // P1.1 Flash 自检——中等规模任务输出前自检
   | 'replan_injected'     // P2.5 中继重新规划——连续失败+空转时注入 replan 指令
   | 'diminishing_output'   // P1 输出递减检测——连续 N 轮文本产出缩短

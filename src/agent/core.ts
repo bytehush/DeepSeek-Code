@@ -75,6 +75,25 @@ function extractTarget(tc: { name: string; arguments: Record<string, unknown> })
 }
 
 /**
+ * 把工具参数做「键排序」后的稳定序列化，作为「相同调用」的签名（B·harness 活锁熔断用）。
+ * 不依赖字段顺序，仅用于通用计数；不解析工具内部语义，守住解耦。
+ */
+function canonicalSig(v: unknown): string {
+  return JSON.stringify(stableSort(v));
+}
+function stableSort(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stableSort);
+  if (v && typeof v === 'object') {
+    const o: Record<string, unknown> = {};
+    for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+      o[k] = stableSort((v as Record<string, unknown>)[k]);
+    }
+    return o;
+  }
+  return v;
+}
+
+/**
  * 工具结果截断 / 权限提示文案 现由 src/tools/orchestrator.ts 单一持有（clampToolOutput /
  * buildFileReviewPrompt），core 不再保留副本——工具执行收敛到唯一消息通道（ToolOrchestrator）。
  */
@@ -566,6 +585,12 @@ export async function* runCore(
     let roundMutated = false;
     const successChecks: string[] = [];
 
+    // B·harness 通用限制（不识工具语义，守住宅耦）：
+    let toolCallCount = 0;
+    const repeated = new Map<string, number>();
+    const maxToolCallsPerRound = opts.maxToolCallsPerRound ?? 16;
+    const maxRepeatedToolCalls = opts.maxRepeatedToolCalls ?? 4;
+
     for (const tc of pendingToolCalls) {
       try {
         // 模型主动 awaitUser：中途向用户提问（伪工具，不走编排者路由）
@@ -585,6 +610,28 @@ export async function* runCore(
           roundMutated = true;
           continue;
         }
+
+        // B·harness 限制①：每轮工具调用数上限（通用，不识工具语义）
+        toolCallCount++;
+        if (toolCallCount > maxToolCallsPerRound) {
+          const capMsg = `已达到每轮工具调用上限（${maxToolCallsPerRound}），本轮停止派发。请汇总当前进展或调用 awaitUser 与用户确认。`;
+          opts.history.addToolResult(tc.id, tc.name, JSON.stringify({ ok: false, output: capMsg }));
+          await tlog('tool_cap', { tool: tc.name, limit: maxToolCallsPerRound });
+          yield { type: 'tool_result', toolName: tc.name, result: capMsg, step: ctx.step, reactPhase: 'observation' };
+          iterToolResults.push(false);
+          break;
+        }
+
+        // B·harness 限制③：活锁熔断——同 工具名 + 相同参数签名 重复 N 次即终止（通用计数，不识「为何空输出」）
+        const sig = `${tc.name}:${canonicalSig(tc.arguments)}`;
+        const repN = (repeated.get(sig) ?? 0) + 1;
+        if (repN > maxRepeatedToolCalls) {
+          const stopMsg = `工具 ${tc.name} 以相同参数连续调用 ${repN} 次无进展，已终止本轮以避免活锁。`;
+          await tlog('repeated_tool_break', { tool: tc.name, count: repN });
+          yield { type: 'done', reason: 'repeated_tool_no_progress', text: stopMsg };
+          return;
+        }
+        repeated.set(sig, repN);
 
         iterSigParts.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
         roundTargets.push(extractTarget(tc));
