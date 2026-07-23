@@ -6,8 +6,8 @@
  * 切换任务即切换 dataDir 并重新装配内核。助手可在左栏维护多个并行任务，
  * 各自带 status（进行中/已暂停/已完成）与 goal（任务目标），互不干扰。
  */
-import { mkdir, readdir, readFile, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 
 /** 任务状态：进行中 / 已暂停 / 已完成 */
 export type TaskStatus = 'active' | 'paused' | 'done';
@@ -197,38 +197,52 @@ export class TaskStore {
   }
 
   /**
-   * 删除任务。
-   * 核心：把 id 记入删除清单（.deleted.json）并**持久化**，list()/get() 立即排除 →
-   * 前端卡片必消失、上下文隔离成立；该标记跨重连/重启生效（修复「刷新后已删任务又回来」）。
-   * 删除标记一经写入即**永久保留**（直到该 id 被 create/ensureDefault 显式重建），不因物理
-   * 目录是否删除成功而变动——清单才是「已删除」的真相来源，不依赖脆弱的物理 rm。
-   * 物理目录删除为尽力而为的清理：Windows 下任务目录可能被内核 (TraceLogger/会话文件) 句柄
-   * 占用导致 rm 失败，立即重试几次 + 延迟 1.5s 再试一次（此时内核已从缓存移除、GC 大概率释放句柄）。
-   * 无论物理删除是否成功，都绝不抛出，以免阻断上层 delete_task 推送更新后的 task_list。
+   * 删除任务（级联物理删除，确保关联数据无残留）。
+   * 设计：删除标记（.deleted.json）先持久化 → 前端卡片必消失、上下文隔离成立，
+   * 且跨重连/重启生效（修复「刷新后已删任务又回来」）；随后**同步**递归删除整个任务目录
+   * （meta / traces 历史 / memory / sandbox 会话 等全部关联数据），带指数退避重试 +
+   * 存在性校验，覆盖 Windows 瞬时文件锁与内核异步 flush 竞态。失败明确报错，绝不静默孤儿。
+   * 含目录越界守卫，防 id 路径穿越误删/泄漏（呼应「避免数据泄漏」）。
    */
   async remove(id: string): Promise<void> {
     await this.ensureDeleted();
-    this.deleted.add(id);
-    await this.saveDeleted(); // 持久化删除标记（仅此处写一次，成功后不再清除）
     const target = this.dataDir(id);
-    const tryRm = async () => {
+    // 越界守卫：id 不得逃出 threads/ 基目录（防 ../ 路径穿越删除或泄漏任意目录）
+    const base = resolve(this.baseDir);
+    const resolved = resolve(target);
+    if (resolved !== base && !resolved.startsWith(base + sep)) {
+      console.error('[TaskStore.remove] 拒绝越界删除（疑似路径穿越）：', id);
+      return; // 不写标记、不删
+    }
+    this.deleted.add(id);
+    await this.saveDeleted(); // 标记先持久化：卡片消失、隔离成立
+    const tryRm = (): Promise<boolean> =>
+      rm(target, { recursive: true, force: true })
+        .then(() => true)
+        .catch(() => false);
+    const stillThere = async (): Promise<boolean> => {
       try {
-        await rm(target, { recursive: true, force: true });
+        await stat(target);
         return true;
-      } catch (e) {
-        console.error('[TaskStore.remove] 目录暂未删除（可能文件被占用）:', target, (e as Error)?.message);
+      } catch {
         return false;
       }
     };
-    // 立即重试 3 次（间隔等 GC 释放句柄）—— 仅尽力清理目录，不影响已持久化的删除标记
-    for (let i = 0; i < 3; i++) {
-      if (await tryRm()) return;
-      await new Promise((r) => setTimeout(r, 150));
+    // 主删除：同步、指数退避重试并校验真正消失（覆盖瞬时锁 / 内核异步 flush 竞态）
+    const backoff = [150, 300, 600, 1200, 2000];
+    for (const wait of backoff) {
+      if ((await tryRm()) && !(await stillThere())) return;
+      await new Promise((r) => setTimeout(r, wait));
     }
-    // 延迟再试一次：内核已从缓存移除，GC 后句柄通常已释放
-    setTimeout(() => {
-      void tryRm();
-    }, 1500);
+    // 兜底延迟重试：捕捉内核异步 flush 可能重建的零散文件（尽力而为，不阻塞调用方）
+    const tail = setTimeout(() => {
+      void tryRm().then(async () => {
+        if (await stillThere()) {
+          console.error('[TaskStore.remove] 任务目录物理删除仍失败，数据可能残留：', target);
+        }
+      });
+    }, 3000);
+    tail.unref?.(); // 不阻止进程退出
   }
 
   /** 任务的数据目录，用于 assembleAppProps */
