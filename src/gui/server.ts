@@ -402,6 +402,7 @@ wss.on('connection', (ws, req) => {
   };
 
   const hosts = new Map<string, AgentHost>(); // 每任务独立 host 实例，切任务不销毁
+  connectionHostMaps.add(hosts); // 注册到全局集合，供进程级优雅关闭时 flush
   /** 获取主机：taskId 显式指定则查路由表；否则取当前活跃主机 */
   function getHost(taskId?: string): AgentHost | undefined {
     return taskId ? hosts.get(taskId) : (activeTaskId ? hosts.get(activeTaskId) : undefined);
@@ -457,9 +458,17 @@ wss.on('connection', (ws, req) => {
     await h.props.traceLogger.flush();
   }
 
-  /** 清理所有 host（登出 / 重连时）。 */
-  function cleanupHosts(): void {
-    for (const h of hosts.values()) h.abort();
+  /** 清理所有 host（登出 / 重连 / 连接关闭时）：先 flush 在途 trace 再销毁，
+   *  防止进程退出 / 浏览器刷新时缓冲未落盘，导致重启后思考盒等渲染状态丢失。 */
+  async function cleanupHosts(): Promise<void> {
+    for (const h of hosts.values()) {
+      try {
+        await h.props.traceLogger?.flush();
+      } catch {
+        /* 忽略写入失败，不阻塞清理 */
+      }
+      h.abort();
+    }
     hosts.clear();
   }
 
@@ -884,7 +893,7 @@ wss.on('connection', (ws, req) => {
       if (msg.token) await revokeToken(String(msg.token)).catch(() => {});
       authed = false;
       username = null;
-      cleanupHosts();
+      await cleanupHosts();
       taskStore = null;
       activeTaskId = null;
       return;
@@ -909,7 +918,7 @@ wss.on('connection', (ws, req) => {
       }
       await saveUserCredentials(username, nc).catch(() => {});
       resetKernelsForUser(username);
-      cleanupHosts();
+      await cleanupHosts();
       fwd('key_ok');
       void bootWithUser(username);
       return;
@@ -1551,12 +1560,43 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => {
-    cleanupHosts();
+  ws.on('close', async () => {
+    await cleanupHosts();
+    connectionHostMaps.delete(hosts);
     if (activeToken) telemetryHubs.delete(activeToken);
     rateLimit.delete(connId);
   });
 });
+
+// ── 全局连接 host 注册表：进程级优雅关闭时遍历所有连接的 host flush 在途 trace ──
+const connectionHostMaps = new Set<Map<string, AgentHost>>();
+
+/** flush 所有连接的所有 host 的 trace 缓冲（不抛错，单个失败不拖累整体） */
+async function flushAllTraces(): Promise<void> {
+  for (const hm of connectionHostMaps) {
+    for (const h of hm.values()) {
+      try {
+        await h.props.traceLogger?.flush();
+      } catch {
+        /* 忽略写入失败 */
+      }
+    }
+  }
+}
+
+let shuttingDown = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[web] 收到 ${signal}，正在刷新所有 trace 缓冲后退出...`);
+  await flushAllTraces();
+  server.close(() => process.exit(0));
+  // 兜底：若 server.close 回调未触发，2s 后强制退出
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[web] DeepSeek Agent 网页版已启动 → http://localhost:${PORT} （三栏式 / 账户密码登录 / 每账号独立）`);

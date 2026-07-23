@@ -453,6 +453,9 @@ export class TraceLogger {
           break;
         }
         case 'thinking_end': {
+          // 思考轮结束：把当前轮状态置为 done，否则重放时停留 thinking，
+          // 服务器重启后思考卡会显示成「进行中」而非已完成 —— 渲染状态未完整恢复。
+          if (activeTurn) activeTurn.status = 'done';
           activeTurn = null;
           break;
         }
