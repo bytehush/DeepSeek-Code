@@ -826,6 +826,17 @@ export function App() {
     };
   }, []);
 
+  // 切换线程（activeTaskId 变化 → ChatArea 以真实 threadId 为 key 重挂载）后，
+  // 重置 ScrollFollowController 跟随状态并立即贴底：controller 实例在 App 层持久化，
+  // 不随 ChatArea 重挂载而重建，上一个线程里用户上滑接管的 follow=false 会残留，
+  // 导致历史对话加载后不自动滚到底（「历史对话不显示」的隐藏根因）。
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (controller) controller.reset();
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeTaskId]);
+
   // 消息新增 → 若应跟随则滚到底（新用户/助手消息、系统提示等离散事件）。
   useEffect(() => {
     const el = scrollRef.current;

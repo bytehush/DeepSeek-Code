@@ -106,3 +106,18 @@ test('新一轮流式：用户已回到底部 → 重新自动跟随', () => {
   c.notifyActive(true, m(700, 1200, 500)); // 距底 0 → 贴底
   assert.equal(c.shouldFollow(), true, '新一轮且贴底 → 恢复跟随');
 });
+
+test('M4-回归：reset 清除上一线程「上滑接管」残留，新线程默认贴底跟随', () => {
+  const c = new ScrollFollowController(20);
+  c.notifyActive(true, m(500, 1000, 500)); // 开始，贴底
+  c.onScroll(m(100, 1200, 500)); // 用户上滑接管
+  assert.equal(c.shouldFollow(), false, '上滑后不跟随');
+  assert.equal(c.isActive(), true);
+  // 切到新线程：ChatArea 以新 key 重挂载，App 层 controller.reset() 被调用
+  c.reset();
+  assert.equal(c.shouldFollow(), true, 'reset 后默认贴底跟随 → 历史对话加载滚到底');
+  assert.equal(c.isActive(), false, 'reset 退出流式活跃态，等待新一轮 notifyActive');
+  // reset 后即便距底很远（新内容未到），shouldFollow 仍为 true（由 [messages] effect 负责滚到底）
+  assert.equal(c.shouldFollow(), true);
+});
+

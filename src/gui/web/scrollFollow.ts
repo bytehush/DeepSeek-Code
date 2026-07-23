@@ -89,6 +89,21 @@ export class ScrollFollowController {
     return this.shouldFollow() && !atBottom;
   }
 
+  /**
+   * 切换线程 / 重新挂载对话区时调用：把跟随状态恢复到「默认贴底跟随」。
+   *
+   * 背景：ScrollFollowController 实例在 App 层用 useRef 持久化，不随 ChatArea 以 threadId 为
+   * key 重挂载而重建。若上一个线程里用户曾上滑接管（follow=false 残留），切到新线程后历史对话
+   * 加载时 [messages] effect 据 shouldFollow() 不会自动滚到底 → 表现为「历史对话卡在顶部 / 不显示」。
+   * reset 在每次 activeTaskId 变化时调用，确保新线程从「贴底跟随」开始。
+   */
+  reset(initialFollow = true): void {
+    this.follow = initialFollow;
+    this.pinned = initialFollow;
+    this.active = false;
+    this.lastScrollTop = 0;
+  }
+
   private isAtBottom(m: ScrollMetrics): boolean {
     return m.scrollHeight - m.scrollTop - m.clientHeight < this.threshold;
   }
