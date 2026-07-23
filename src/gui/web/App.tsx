@@ -335,8 +335,25 @@ export function App() {
   /** 当前激活任务 ID（从任务列表推导，用于缓存 key） */
   const activeTaskIdRef = useRef<string | null>(null);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  /**
+   * 统一设置当前激活线程：同步 ref（供 WS 闭包读取）与 state（供渲染/ChatArea key）。
+   * 消除 task_list / switchTask / delete 各自直接写双轨导致的不一致——
+   * 历史对话恢复时 task_list 只写 ref 不写 state，正是 ChatArea key='none' 永不重挂载的根因。
+   */
+  const applyActiveThread = (id: string | null): void => {
+    activeTaskIdRef.current = id;
+    setActiveTaskId(id);
+  };
   /** 思考盒：每轮对话的智能体思考过程（观察条目累积），与最终答案气泡分开 */
   const [thinkings, setThinkings] = useState<ThinkingTurn[]>([]);
+  /**
+   * 派生缓存：state（messages/thinkings/activeTaskId）是唯一真相源，
+   * messagesCacheRef 仅作「切换任务秒切」的本地快照（防白屏），由本 effect 在
+   * 三者变化时统一同步，消除各 handler 里手动双写缓存导致的状态分叉。
+   */
+  useEffect(() => {
+    if (activeTaskId) messagesCacheRef.current.set(activeTaskId, { messages, thinkings });
+  }, [messages, thinkings, activeTaskId]);
   /** 是否正处于「输出最终答案」阶段（答案气泡显示「输出中…」） */
   const [outputting, setOutputting] = useState(false);
   /** 润色输入框文本时按钮显示加载态 */
@@ -515,16 +532,6 @@ export function App() {
           const lid = ++localSeqRef.current;
           const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId, ts: msg.ts };
           setMessages((m) => [...m, newMsg]);
-          // 同步缓存：回放/实时新增消息都累加到缓存，避免 thinking_end 用陈旧空 messages 覆盖，
-          // 否则二次切回任务时 messages 缓存为空 → switchTask 走清空分支 → 历史与思考盒丢失。
-          const tid = activeTaskIdRef.current;
-          if (tid) {
-            const snap = messagesCacheRef.current.get(tid);
-            messagesCacheRef.current.set(tid, {
-              messages: [...(snap ? snap.messages : []), newMsg],
-              thinkings: snap ? snap.thinkings : [],
-            });
-          }
           break;
         }
         case 'thinking_start':
@@ -562,13 +569,6 @@ export function App() {
             if (idx === -1) return t;
             const next = t.slice();
             next[idx] = { ...next[idx], status: 'done' };
-            // 思考盒保留在界面上：本轮结束后不自动折叠，用户可手动展开/收起
-            const tid = activeTaskIdRef.current;
-            if (tid) {
-              const snap = messagesCacheRef.current.get(tid);
-              const curMsgs = snap ? snap.messages : [];
-              messagesCacheRef.current.set(tid, { messages: curMsgs, thinkings: next });
-            }
             return next;
           });
           break;
@@ -580,17 +580,6 @@ export function App() {
             for (let i = m.length - 1; i >= 0; i--) if (m[i].id === msg.id) { target = m[i].localId ?? -1; break; }
             return m.map((x) => ((x.localId ?? -1) === target && target !== -1) ? { ...x, interrupted: true } : x);
           });
-          {
-            const tid = activeTaskIdRef.current;
-            if (tid) {
-              const snap = messagesCacheRef.current.get(tid);
-              const curMsgs = snap ? snap.messages : [];
-              let target = -1;
-              for (let i = curMsgs.length - 1; i >= 0; i--) if (curMsgs[i].id === msg.id) { target = curMsgs[i].localId ?? -1; break; }
-              const next = curMsgs.map((x) => ((x.localId ?? -1) === target && target !== -1) ? { ...x, interrupted: true } : x);
-              messagesCacheRef.current.set(tid, { messages: next, thinkings: snap?.thinkings ?? [] });
-            }
-          }
           break;
         // 'thinking_clear' 已废弃：思考盒保留在界面上（不清除），无需移除该轮。
         case 'upload_ok':
@@ -615,10 +604,6 @@ export function App() {
           // 不再依赖后续 thinking 事件重发（断点①修复：消除「清空后等重发」的脆弱链）。
           setThinkings(normalizeThinkings(msg.thinkings));
           setOutputting(false);
-          {
-            const tid = activeTaskIdRef.current;
-            if (tid) messagesCacheRef.current.set(tid, { messages: resetMsgs, thinkings: normalizeThinkings(msg.thinkings) });
-          }
           break;
         case 'state':
           setState({ busy: msg.busy, mode: msg.mode, planMode: msg.planMode, outputStyle: msg.outputStyle, model: msg.model ?? '', currentIteration: msg.currentIteration ?? 0, maxIterations: msg.maxIterations ?? 0, browserWatch: msg.browserWatch ?? false });
@@ -662,7 +647,7 @@ export function App() {
           // 同步当前激活任务 ID 供缓存 key 使用
           {
             const active = (msg.tasks as TaskItem[]).find((t) => t.active);
-            if (active) activeTaskIdRef.current = active.id;
+            if (active) applyActiveThread(active.id);
           }
           break;
         case 'skills_list':
@@ -1180,6 +1165,7 @@ export function App() {
   const switchTask = (id: string) => {
     // 前端消息+思考过程缓存：命中则秒切（无白屏/加载延迟），否则清空等后端推送
     const cached = messagesCacheRef.current.get(id);
+    applyActiveThread(id); // 先切换 activeThread，避免下方 setMessages 触发派生 effect 用旧 id 污染旧 cache
     if (cached && cached.messages.length > 0) {
       setMessages(cached.messages);
       setThinkings(cached.thinkings);
@@ -1189,8 +1175,6 @@ export function App() {
       setThinkings([]);
     }
     clearPending(); // 切走旧任务的窗口内增量，避免串到新任务
-    activeTaskIdRef.current = id;
-    setActiveTaskId(id);
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
     // 持久化当前激活任务：刷新/重连后据此恢复「回到哪个对话」（不存思考内容本身，避免与服务端磁盘分叉）
@@ -1210,8 +1194,7 @@ export function App() {
     setDeleteDialog((d) => ({ ...d, open: false }));
     messagesCacheRef.current.delete(id);
     if (activeTaskIdRef.current === id) {
-      activeTaskIdRef.current = null;
-      setActiveTaskId(null);
+      applyActiveThread(null);
       try { localStorage.removeItem(ACTIVE_TASK_KEY); } catch { /* ignore */ }
     }
     wsSend(JSON.stringify({ type: 'delete_task', id }));
