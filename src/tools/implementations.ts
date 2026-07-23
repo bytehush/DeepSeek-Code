@@ -1,5 +1,8 @@
 import { readFile, writeFile, mkdir, rm, access, readdir } from 'node:fs/promises';
+import { writeFileSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { DeepSeekClient } from '../llm/deepseek.ts';
 import { msgOf } from '../utils/logger.ts';
@@ -11,6 +14,62 @@ import { isSourceMutating, safeEnv } from './security.ts';
 import { isDestructive } from '../permission/index.ts';
 import { resolve, walkFiles, walkAndSearch } from './file-walk.ts';
 import { fuzzyMatchBlock } from './validation.ts';
+
+/**
+ * 命令长度安全轨（B2·harness 通用限制的可配置默认值）。
+ * run_command 入参超长直接拒绝，避免恶意/失控的超长命令拖垮子进程与上下文。
+ * 注：多行内联脚本经 rewriteInlineScript 落临时文件后，真正交给 shell 的命令会变短。
+ */
+export const MAX_COMMAND_LENGTH = 100_000;
+
+export interface InlineScriptRewrite {
+  /** 真正交给 shell 执行的命令（多行内联脚本已改写为 `<解释器> "<临时文件>"`） */
+  cmd: string;
+  /** 若命中多行内联脚本改写，落盘的临时脚本路径；否则 null（调用方负责清理） */
+  tmpFile: string | null;
+}
+
+/**
+ * 多行内联脚本改写（B1 根因修复）：
+ *
+ * Windows 下 `spawn(cmd, [], { shell: true })` 实际执行 `cmd /c "<整条cmd>"`，
+ * 多行内联脚本（python -c / node -e / powershell -Command 含换行）的换行被 cmd
+ * 重新解释，解释器拿不到完整脚本 → 空 stdout（B1 死循环根因）。
+ *
+ * 本函数仅当检测到「多行内联脚本」时，把脚本体写到临时文件，改为执行
+ * `<解释器> "<临时文件>"`（python/pwsh 直接吃文件；node 单文件即入口），
+ * 彻底绕开 cmd 的换行解析。单行命令维持原样，零影响。
+ *
+ * 纯函数、可单测；循环/编排者对此无感知（解耦守住）。
+ */
+export function rewriteInlineScript(inputCmd: string): InlineScriptRewrite {
+  const trimmed = inputCmd.trim();
+  const writeTmp = (body: string, ext: string): string => {
+    const p = path.join(tmpdir(), `dsa-script-${randomUUID()}${ext}`);
+    writeFileSync(p, body, 'utf8');
+    return p;
+  };
+
+  // python / python3 / py  -c "..."（含换行）
+  let m = trimmed.match(/^(python3?|py)\s+-c\s+(['"])([\s\S]*)\2\s*$/);
+  if (m && m[3].includes('\n')) {
+    const tmp = writeTmp(m[3], '.py');
+    return { cmd: `${m[1]} "${tmp}"`, tmpFile: tmp };
+  }
+  // node / node.exe  -e | --eval "..."（含换行）
+  m = trimmed.match(/^(node|node\.exe)\s+(?:-e|--eval)\s+(['"])([\s\S]*)\2\s*$/);
+  if (m && m[3].includes('\n')) {
+    const tmp = writeTmp(m[3], '.js');
+    return { cmd: `${m[1]} "${tmp}"`, tmpFile: tmp };
+  }
+  // powershell / pwsh  -Command "..."（含换行）
+  m = trimmed.match(/^(pwsh|powershell)\s+-Command\s+(['"])([\s\S]*)\2\s*$/);
+  if (m && m[3].includes('\n')) {
+    const tmp = writeTmp(m[3], '.ps1');
+    return { cmd: `${m[1]} -File "${tmp}"`, tmpFile: tmp };
+  }
+  return { cmd: inputCmd, tmpFile: null };
+}
 
 // 工具函数实现（S1.2 从 index.ts 拆分）：核心工具逻辑。
 
@@ -312,6 +371,11 @@ export function createBaseTools(client: DeepSeekClient): ToolDef[] {
     },
       async execute(args, ctx) {
       const cmd = String(args.command);
+      if (cmd.length > MAX_COMMAND_LENGTH) {
+        return { ok: false, output: `命令过长（${cmd.length} 字符，上限 ${MAX_COMMAND_LENGTH}）。请缩小命令范围或改用脚本文件执行。` };
+      }
+      // B1 修复：多行内联脚本落临时文件执行，绕开 cmd /c 的换行截断；单行命令原样
+      const { cmd: rewrittenCmd, tmpFile } = rewriteInlineScript(cmd);
       const cwd = args.cwd ? resolve(String(args.cwd), ctx.cwd) : ctx.cwd;
       const { onProgress, signal } = ctx;
 
@@ -363,7 +427,7 @@ export function createBaseTools(client: DeepSeekClient): ToolDef[] {
 
         const startTime = Date.now();
         // 用 spawn 替代 exec，支持流式输出
-        const child = spawn(cmd, [], {
+        const child = spawn(rewrittenCmd, [], {
           cwd,
           shell: true,
           timeout: 120000,
@@ -384,6 +448,8 @@ export function createBaseTools(client: DeepSeekClient): ToolDef[] {
         const settle = (result: ToolResult) => {
           if (settled) return;
           settled = true;
+          // 多行内联脚本改写产生的临时文件：回收，避免残留
+          if (tmpFile) { try { unlinkSync(tmpFile); } catch { /* 已退出或权限受限，忽略 */ } }
           clearTimeout(killTimer);
           clearTimeout(guardTimer);
           signal?.removeEventListener('abort', abortHandler);
