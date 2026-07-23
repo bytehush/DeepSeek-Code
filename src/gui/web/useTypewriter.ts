@@ -51,8 +51,11 @@ export function useTypewriter(text: string, live: boolean, opts?: TypewriterOpts
   const reduced = usePrefersReducedMotion();
   const maxCps = opts?.maxCps ?? 6000;
 
-  const [shown, setShown] = useState<number>(() => text.length);
-  const shownRef = useRef<number>(text.length);
+  // live=true（流式新消息）→ shown 从 0 开始，rAF 逐字追赶（即使 React 18 批处理
+  // 把 message('') + update('full text') 合并到同一次渲染，shown 仍从 0 起步 → 有动画）
+  // live=false（历史/重放）→ shown = text.length，立即完整显示（不重新打字）
+  const [shown, setShown] = useState<number>(() => (live ? 0 : text.length));
+  const shownRef = useRef<number>(live ? 0 : text.length);
   const targetRef = useRef<string>(text);
   targetRef.current = text;
 
