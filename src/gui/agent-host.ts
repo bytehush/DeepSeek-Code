@@ -84,12 +84,21 @@ export class AgentHost extends EventEmitter {
   private inFinal = false;
   /** 当前最终答案气泡的 id（inFinal 时由首个 appendStreaming 惰性创建） */
   private finalBubbleId: number | null = null;
+  /** 最终答案首块延迟缓冲：汇集首个 ~90ms 的 chunk，待空气泡 paint 后再 flush，
+   *  避免「首块与空气泡被 React 批处理合并 → 末尾一次性出现」；延迟窗口后改为直写，保持流畅。 */
+  private finalBuffer: string | null = null;
+  private finalFirstPending = false;
+  private finalFlushScheduled = false;
+  /** 代际标记：每轮 startThinkingTurn 自增，防止上一轮残留的 90ms 定时器把旧文本 flush 进新气泡 */
+  private finalEpoch = 0;
   /** 本轮是否因用户中断而结束（用于结束思考轮次时发出 interrupted 状态） */
   private lastTurnInterrupted = false;
   /** 当前思考轮次 id（用于把思考盒与答案气泡关联） */
   private curTurnId = 0;
   /** 是否已有进行中的思考轮次（防止 setBusy(true) 重复开轮） */
   private thinkingTurnActive = false;
+  /** promoteThinkingToFinal 是否还在逐块 emitUpdate（阻止 endThinkingTurn 提前关闭回合） */
+  private _promoteBusy = false;
 
   /** 最近一次 proposeRevise 的方案缓存：applyRevise 复用它，保证「预览即所见」。 */
   private lastReviseProposal: ReviseProposal | null = null;
@@ -136,11 +145,20 @@ export class AgentHost extends EventEmitter {
     this.currentIteration = 0;
     this.curTurnId += 1;
     this.thinkingTurnActive = true;
+    this.finalBuffer = null;
+    this.finalFirstPending = false;
+    this.finalFlushScheduled = false;
+    this.finalEpoch += 1;
     this.emit('thinking_start', { turnId: this.curTurnId });
     this.traceThink('thinking_start', { turnId: this.curTurnId });
   }
-  /** 结束当前思考轮次（busy=false 时调用） */
+  /** 结束当前思考轮次（busy=false 时调用）。
+   *  若 promoteThinkingToFinal 还在逐块 emitUpdate，延迟 50ms 重试，直到播完为止。 */
   private endThinkingTurn(): void {
+    if (this._promoteBusy) {
+      setTimeout(() => this.endThinkingTurn(), 50);
+      return;
+    }
     if (!this.thinkingTurnActive) return;
     this.thinkingTurnActive = false;
     this.curThinkId = null;
@@ -218,8 +236,28 @@ export class AgentHost extends EventEmitter {
         const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: '', thinkingId: this.curTurnId, ts: new Date().toISOString() };
         this.messages.push(m);
         this.emit('message', m);
+        this.finalFirstPending = true; // 首个 chunk 延迟，给浏览器 paint 空气泡的窗口
       }
-      this.appendTo(this.finalBubbleId, chunk);
+      if (this.finalFirstPending) {
+        // 延迟窗口内缓冲所有 chunk（保留自然顺序），90ms 后一次性 flush；
+        // 若延迟期内又有后续块到达，随首块一起 flush，避免「首块延迟、后续块直发」造成乱序。
+        this.finalBuffer = (this.finalBuffer ?? '') + chunk;
+        if (!this.finalFlushScheduled) {
+          this.finalFlushScheduled = true;
+          const epoch = this.finalEpoch;
+          setTimeout(() => {
+            if (this.finalEpoch !== epoch) return; // 已进入新轮，丢弃残留 flush
+            if (this.finalBubbleId !== null && this.finalBuffer !== null) {
+              this.appendTo(this.finalBubbleId, this.finalBuffer);
+            }
+            this.finalBuffer = null;
+            this.finalFlushScheduled = false;
+            this.finalFirstPending = false;
+          }, 90);
+        }
+      } else {
+        this.appendTo(this.finalBubbleId, chunk);
+      }
     } else {
       // 过程叙述阶段：文字归入「思考盒」
       this.appendThinking(chunk);
@@ -250,7 +288,10 @@ export class AgentHost extends EventEmitter {
     }
   };
   /** 直接答复回合：把当前思考轮次**全部** reason 条目按原始顺序晋升为最终答案气泡，
-   *  保留完整的推理链条，不做任何压缩、精简或截断。由 loop 在 !gotToolUse 收尾时触发。 */
+   *  保留完整的推理链条，不做任何压缩、精简或截断。由 loop 在 !gotToolUse 收尾时触发。
+   *
+   *  流式呈现：将全文拆成 15 字块、逐块 30ms 间隔 emitUpdate，用 _promoteBusy 门闩
+   *  阻止 endThinkingTurn 提前关闭回合，让前端 useTypewriter 逐字揭示动画完整播放。 */
   prometeThinkingToFinal = (): void => {
     const reasonTexts: string[] = [];
     for (const e of this.thinking) {
@@ -258,6 +299,9 @@ export class AgentHost extends EventEmitter {
     }
     if (reasonTexts.length === 0) return;
     const fullText = reasonTexts.join('\n');
+    // ① 先发输出状态（前端 useTypewriter 进入 live 模式）
+    this.emit('thinking_status', { status: 'outputting' as ThinkingStatus });
+    this.traceThink('thinking_status', { status: 'outputting' as ThinkingStatus });
     // 思考盒保留（不清除、不 emit thinking_clear）
     if (this.finalBubbleId === null) this.finalBubbleId = this.msgId++;
     const existing = this.messages.find((x) => x.id === this.finalBubbleId);
@@ -265,9 +309,30 @@ export class AgentHost extends EventEmitter {
       existing.text += (existing.text ? '\n' : '') + fullText;
       this.emitUpdate(existing.id, existing.text);
     } else {
-      const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: fullText, thinkingId: this.curTurnId, ts: new Date().toISOString() };
+      // ② 创建空消息气泡（useTypewriter.shown=0，等待逐块填充）
+      const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: '', thinkingId: this.curTurnId, ts: new Date().toISOString() };
       this.messages.push(m);
       this.emit('message', m);
+      // ③ 逐块 emitUpdate：15 字/块、30ms 间隔 → useTypewriter 逐字揭示
+      const bid = this.finalBubbleId;
+      const CHUNK = 15;
+      const DELAY = 30;
+      this._promoteBusy = true;
+      let chunkIdx = 0;
+      let accumulated = '';
+      const emitNext = () => {
+        if (chunkIdx * CHUNK >= fullText.length) {
+          this._promoteBusy = false;
+          return;
+        }
+        accumulated += fullText.slice(chunkIdx * CHUNK, (chunkIdx + 1) * CHUNK);
+        this.emitUpdate(bid, accumulated);
+        chunkIdx++;
+        setTimeout(emitNext, DELAY);
+      };
+      // 首块延迟 90ms：确保浏览器先 paint 空气泡（flushSync commit 的 DOM），
+      // 再开始逐字推送——避免首块与空消息批到同一帧（与 appendStreaming 首块延迟对齐）
+      setTimeout(emitNext, 90);
     }
     this.inFinal = true;
   };
@@ -356,6 +421,11 @@ export class AgentHost extends EventEmitter {
     this.activeAbort = ac;
   };
   abort = (): void => {
+    this._promoteBusy = false; // 中止逐块 streaming，防止旧 host 的 setTimeout 链闹鬼
+    this.finalBuffer = null;
+    this.finalFirstPending = false;
+    this.finalFlushScheduled = false;
+    this.finalEpoch += 1; // 使任何残留的 90ms 定时器失效，避免旧文本 flush 进新气泡
     this.activeAbort?.abort();
   };
   requestConfirm = (prompt: string): Promise<boolean> =>
