@@ -425,9 +425,10 @@ wss.on('connection', (ws, req) => {
    * - 目标任务有历史 → 随后 host.setMessages() 会再发一次 reset 覆盖为历史；
    * - 目标任务为空 / 未配 Key → 保持清空后再追加欢迎语或提示，不残留旧任务消息。
    */
-  function pushReset(thinkings: ReplayedThinkingTurn[] = []): void {
+  function pushReset(taskId: string, thinkings: ReplayedThinkingTurn[] = []): void {
     // 原子携带思考轮次：前端 reset 一次性恢复 messages+thinkings，不再依赖后续 thinking 事件重发。
-    fwd('reset', { messages: [], thinkings: thinkings as unknown as Record<string, unknown>[] });
+    // taskId 让前端精确重置「目标任务」的存储（而非盲目清当前激活任务）。
+    fwd('reset', { messages: [], thinkings: thinkings as unknown as Record<string, unknown>[], taskId });
   }
 
   /**
@@ -476,7 +477,7 @@ wss.on('connection', (ws, req) => {
     // 先解析历史（含思考轮次），让 reset 原子携带 thinkings —— 切回任务时思考盒由 reset 一次性恢复，
     // 不再依赖「清空后再等 thinking 事件重发」的脆弱链路（断点①修复）。
     const replayed = await conversationStore!.load(id);
-    pushReset(replayed?.thinking ?? []);
+    pushReset(id, replayed?.thinking ?? []);
     const creds = await loadUserCredentials(username);
     if (!creds) {
       pushSystem(`已切换到「${meta.title}」。你尚未配置 DeepSeek API Key，点击顶栏 ⚙ API 配置后即可继续对话。`);
@@ -494,7 +495,7 @@ wss.on('connection', (ws, req) => {
     const props = await ensureKernel(username, taskStore.dir(id), creds, fileRoot(guiSettings));
     host = makeHost(props);
     if (activeToken && host.telemetryHub) telemetryHubs.set(activeToken, host.telemetryHub);
-    wireHost(host);
+    wireHost(host, id);
     if (replayed && replayed.messages.length > 0) {
       props.history.loadMessages(replayed.messages as never);
       props.client.resetUsage();
@@ -641,27 +642,30 @@ wss.on('connection', (ws, req) => {
   }
 
   /** 把 AgentHost 的内核事件桥接到本连接的 WebSocket。 */
-  function wireHost(h: AgentHost): void {
-    h.on('message', (m) => fwd('message', m as Record<string, unknown>));
-    h.on('update', (u) => fwd('update', u as Record<string, unknown>));
+  function wireHost(h: AgentHost, taskId: string): void {
+    // 每个事件都打上闭包捕获的 taskId（切换瞬间不会错），前端据此过滤在途事件，
+    // 防止「切到 B 后 A 的遗留流式事件」污染 B（修复点⑤：单连接多路复用下的串任务）。
+    const tag = (p: Record<string, unknown>) => ({ ...p, taskId });
+    h.on('message', (m) => fwd('message', tag(m as Record<string, unknown>)));
+    h.on('update', (u) => fwd('update', tag(u as Record<string, unknown>)));
     h.on('state', (s) => {
       busy = Boolean((s as Record<string, unknown>).busy);
-      fwd('state', s as Record<string, unknown>);
+      fwd('state', tag(s as Record<string, unknown>));
     });
-    h.on('confirm', (prompt: string) => fwd('confirm', { prompt }));
-    h.on('asktext', (prompt: string) => fwd('asktext', { prompt }));
-    h.on('exit', () => fwd('exit'));
-    h.on('reset', (ms: UiMessage[]) => fwd('reset', { messages: ms }));
-    h.on('keychange', () => fwd('need_key', { reason: 'change' }));
-    h.on('artifact', (a) => fwd('artifact', a as Record<string, unknown>));
-    h.on('artifact_update', (a) => fwd('artifact_update', a as Record<string, unknown>));
+    h.on('confirm', (prompt: string) => fwd('confirm', { prompt, taskId }));
+    h.on('asktext', (prompt: string) => fwd('asktext', { prompt, taskId }));
+    h.on('exit', () => fwd('exit', { taskId }));
+    h.on('reset', (ms: UiMessage[]) => fwd('reset', { messages: ms, taskId }));
+    h.on('keychange', () => fwd('need_key', { reason: 'change', taskId }));
+    h.on('artifact', (a) => fwd('artifact', tag(a as Record<string, unknown>)));
+    h.on('artifact_update', (a) => fwd('artifact_update', tag(a as Record<string, unknown>)));
     // 思考盒通道：把 agent 本轮的观察（推理/工具/结果）与状态转发给前端
-    h.on('thinking_start', (p) => fwd('thinking_start', p as Record<string, unknown>));
-    h.on('thinking_entry', (p) => fwd('thinking_entry', p as Record<string, unknown>));
-    h.on('thinking_update', (p) => fwd('thinking_update', p as Record<string, unknown>));
-    h.on('thinking_status', (p) => fwd('thinking_status', p as Record<string, unknown>));
-    h.on('gen_interrupted', (p) => fwd('gen_interrupted', p as Record<string, unknown>));
-    h.on('thinking_end', (p) => fwd('thinking_end', p as Record<string, unknown>));
+    h.on('thinking_start', (p) => fwd('thinking_start', tag(p as Record<string, unknown>)));
+    h.on('thinking_entry', (p) => fwd('thinking_entry', tag(p as Record<string, unknown>)));
+    h.on('thinking_update', (p) => fwd('thinking_update', tag(p as Record<string, unknown>)));
+    h.on('thinking_status', (p) => fwd('thinking_status', tag(p as Record<string, unknown>)));
+    h.on('gen_interrupted', (p) => fwd('gen_interrupted', tag(p as Record<string, unknown>)));
+    h.on('thinking_end', (p) => fwd('thinking_end', tag(p as Record<string, unknown>)));
   }
 
   /** 把当前 host 的技能列表（名称+描述+作用域）推给前端（用于底部上拉菜单）。
@@ -719,7 +723,7 @@ wss.on('connection', (ws, req) => {
     const replayed = await conversationStore!.load(activeId);
     if (replayed && replayed.messages.length > 0) {
       // host 可能尚未装配（无 Key 时不进内核分支），replayToUi 在 host=null 时仅走 fwd 通道，安全。
-      pushReset(replayed.thinking);
+      pushReset(activeId, replayed.thinking);
       replayToUi(replayed, fwd, null, false);
       const activeMeta = await taskStore.get(activeId);
       pushSystem(`已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter((m) => m.role !== 'system').length} 条历史消息，可继续对话`);
@@ -740,7 +744,7 @@ wss.on('connection', (ws, req) => {
     try {
       const props = await ensureKernel(u, taskStore.dir(activeId), creds, fileRoot(guiSettings));
       host = makeHost(props);
-      wireHost(host);
+      wireHost(host, activeId);
       // 内核装配后把历史灌入，使 Agent 可「接着干」（前端展示已在 ① 完成，这里只喂内核上下文）
       if (replayed && replayed.messages.length > 0) {
         props.history.loadMessages(replayed.messages as never);
@@ -905,7 +909,7 @@ wss.on('connection', (ws, req) => {
       activeTaskId = id;
       await discardHost();
       await sendTaskList();
-      pushReset(); // 新任务：先清空对话区，避免残留上一个任务的记录
+      pushReset(id); // 新任务：先清空对话区，避免残留上一个任务的记录
       // 若已配 Key 则装配内核开始对话；否则只在对话区提醒
       const creds = await loadUserCredentials(username);
       if (!creds) {
@@ -923,7 +927,7 @@ wss.on('connection', (ws, req) => {
       }
       const props = await ensureKernel(username, taskStore.dir(id), creds, fileRoot(guiSettings));
       host = makeHost(props);
-      wireHost(host);
+      wireHost(host, id);
       host.welcome();
       return;
     }
@@ -940,7 +944,7 @@ wss.on('connection', (ws, req) => {
       activeTaskId = newId;
       await discardHost();
       await sendTaskList();
-      pushReset(); // 复制出的新任务从空白上下文开始，先清空对话区
+      pushReset(newId); // 复制出的新任务从空白上下文开始，先清空对话区
       const creds = await loadUserCredentials(username);
       if (!creds) {
         pushSystem('已复制任务（独立上下文）。你尚未配置 DeepSeek API Key，配置后即可对话。');
@@ -957,7 +961,7 @@ wss.on('connection', (ws, req) => {
       }
       const props = await ensureKernel(username, taskStore.dir(newId), creds, fileRoot(guiSettings));
       host = makeHost(props);
-      wireHost(host);
+      wireHost(host, newId);
       host.welcome();
       return;
     }
@@ -1475,6 +1479,9 @@ wss.on('connection', (ws, req) => {
     }
 
     if (type === 'input') {
+      // 前端发送时携带当前激活任务 id；若显式携带了不同 taskId（跨任务误发，单 host 只服务激活任务），
+      // 忽略以免污染错误任务的对话。正常流程 msg.taskId === activeTaskId，必然通过。
+      if (typeof msg.taskId === 'string' && activeTaskId !== null && msg.taskId !== activeTaskId) return;
       const text = String(msg.text ?? '').trim();
       const attachments = Array.isArray(msg.attachments) ? (msg.attachments as Array<{ name?: string; path?: string }>) : [];
       // 首次用户消息：标题为默认时用前几个字作为任务标题；目标为空时用首条消息作为任务目标
