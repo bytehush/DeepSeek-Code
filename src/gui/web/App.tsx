@@ -425,30 +425,17 @@ export function App() {
   // 这里把同一窗口内的全部增量攒进 ref，再用一个 ~80ms 的尾沿节流统一提交一次
   // setState，把「每 chunk 一次重渲染」降到「每 ~80ms 一次」，且一次提交合并所有增量。
   // 视觉上与逐字流式无差异（打字机在更内层平滑揭示），但渲染次数降数倍。
-  const FLUSH_MS = 80;
-  const pendingMsgText = useRef<Map<number, string>>(new Map()); // msgId -> 完整 text（覆盖式）
   const pendingThinkAppend = useRef<Map<number, string>>(new Map()); // entryId -> 累计增量（追加式）
-  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rafId = useRef<number | null>(null); // 思考盒增量合批用的 rAF 句柄（render 对齐，免疫 clearTimeout）
 
+  // 思考盒增量合批：同帧内多条 thinking_update 叠加，下一个动画帧统一提交。
+  // 用 requestAnimationFrame 而非 setTimeout(80) —— 与渲染对齐，且 clearPending 的
+  // clearTimeout 无法误杀 rAF，消除「首条消息流式被异步窗口吞掉」的竞态。
+  // （答案气泡文本走同步直写，见 update handler，不再入此合批。）
   const flushPending = useCallback(() => {
-    flushTimer.current = null;
-    if (pendingMsgText.current.size > 0) {
-      const batch = pendingMsgText.current;
-      pendingMsgText.current = new Map();
-      setMessages((m) => {
-        // serverId 可能重叠：只更新「每个 serverId 在数组中最后出现」的那条，
-        // 避免把同 id 的历史消息也一起改写（首轮多次 boot 时 serverId 从 0 重复）。
-        const lastLocal = new Map<number, number>();
-        for (const x of m) if (batch.has(x.id)) lastLocal.set(x.id, x.localId ?? -1);
-        return m.map((x) => {
-          const t = batch.get(x.id);
-          if (t !== undefined && (x.localId ?? -1) === lastLocal.get(x.id)) return { ...x, text: t };
-          return x;
-        });
-      });
-    }
+    rafId.current = null;
     if (pendingThinkAppend.current.size > 0) {
-      const batch = pendingThinkAppend.current;
+      const batch = new Map(pendingThinkAppend.current);
       pendingThinkAppend.current = new Map();
       setThinkings((t) => {
         const last = t[t.length - 1];
@@ -468,18 +455,19 @@ export function App() {
   }, []);
 
   const scheduleFlush = useCallback(() => {
-    // 尾沿节流：首个增量排程定时器，窗口内后续增量不再重排，
-    // 统一在 FLUSH_MS 后提交——即「攒一批再更新一次」。
-    if (flushTimer.current) return;
-    flushTimer.current = setTimeout(flushPending, FLUSH_MS);
+    // 尾沿节流：首个增量排程 rAF，窗口内后续增量不再重排，下一帧统一提交。
+    if (rafId.current != null) return;
+    rafId.current = requestAnimationFrame(() => {
+      rafId.current = null;
+      flushPending();
+    });
   }, [flushPending]);
 
   const clearPending = useCallback(() => {
-    if (flushTimer.current) {
-      clearTimeout(flushTimer.current);
-      flushTimer.current = null;
+    if (rafId.current != null) {
+      cancelAnimationFrame(rafId.current);
+      rafId.current = null;
     }
-    pendingMsgText.current.clear();
     pendingThinkAppend.current.clear();
   }, []);
 
@@ -589,9 +577,21 @@ export function App() {
           }
           break;
         case 'update':
-          // 合批：完整 text 攒进 pendingMsgText（覆盖式），由 scheduleFlush 统一提交（见上方性能优化）
-          pendingMsgText.current.set(msg.id, msg.text);
-          scheduleFlush();
+          // 同步直写答案气泡文本：不走 80ms setTimeout 合批，消除「首条消息流式增量被
+          // 异步窗口 / clearPending 竞态吞掉、回合末才一次性出现」的根因（唯一的异步单点）。
+          // React 18 在事件回调内自动批处理，逐 token 到达也能稳定增量渲染；useTypewriter 负责逐字揭示。
+          setMessages((m) => {
+            // serverId 可能重叠：只更新「每个 serverId 在数组中最后出现」的那条，
+            // 避免把同 id 的历史消息也一起改写（首轮多次 boot 时 serverId 从 0 重复）。
+            const lastLocal = new Map<number, number>();
+            for (const x of m) if (x.id === msg.id) lastLocal.set(x.id, x.localId ?? -1);
+            return m.map((x) => {
+              if (x.id === msg.id && (x.localId ?? -1) === lastLocal.get(x.id)) {
+                return { ...x, text: msg.text };
+              }
+              return x;
+            });
+          });
           break;
         case 'reset':
           clearPending();
