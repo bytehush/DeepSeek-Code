@@ -11,7 +11,7 @@
  * 它只是 AgentHost（Node 后端）的「瘦客户端」：通过 WebSocket 收发消息，本地只做
  * 渲染与输入。所有内核逻辑都在后端。
  */
-import { useEffect, useRef, useState, useCallback, useMemo, type ChangeEvent } from 'react';
+import { useEffect, useRef, useState, useReducer, useCallback, useMemo, type ChangeEvent } from 'react';
 import remarkGfm from 'remark-gfm';
 import { Plus, Settings, LogOut, ChevronRight, ChevronLeft, MessageSquare, Share2, Bookmark, Ellipsis, Upload, Download } from 'lucide-react';
 import type { UiMessage, MsgRole } from '../../app/types.ts';
@@ -121,7 +121,7 @@ type ServerMsg =
   | { type: 'auth_error'; message: string }
   | { type: 'message'; id: number; role: MsgRole; text: string; thinkingId?: number; ts?: string }
   | { type: 'update'; id: number; text: string }
-  | { type: 'reset'; messages: UiMessage[]; thinkings?: ThinkingTurn[] }
+  | { type: 'reset'; messages: UiMessage[]; thinkings?: ThinkingTurn[]; taskId?: string }
   | { type: 'state'; busy: boolean; mode: string; planMode: boolean; outputStyle: string; model?: string; currentIteration?: number; maxIterations?: number; browserWatch?: boolean }
   | { type: 'thinking_start'; turnId: number }
   | { type: 'thinking_entry'; id: number; kind: 'reason' | 'tool' | 'tool_result'; title?: string; text: string }
@@ -235,6 +235,28 @@ const TASK_TEMPLATES = [
   { key: 'debug', label: '问题调试', title: '问题调试', goal: '' },
 ];
 
+/**
+ * 消息存储：按 taskId 全局唯一映射（Record<taskId, UiMessage[]>），单一真相源。
+ * 所有对 messages 的修改都走 messagesReducer，保证不可变更新；dev 下打印每次变更后
+ * 该任务的 messages.length，便于确认「切回任务首条 / 在途事件」是否真的在涨（点①+③）。
+ */
+type MsgAction = { type: 'apply'; taskId: string; updater: (m: UiMessage[]) => UiMessage[] };
+
+function messagesReducer(state: Record<string, UiMessage[]>, action: MsgAction): Record<string, UiMessage[]> {
+  switch (action.type) {
+    case 'apply': {
+      const next = action.updater(state[action.taskId] ?? []);
+      if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
+        // eslint-disable-next-line no-console
+        console.log('[msg]', action.taskId, 'len=', next.length);
+      }
+      return { ...state, [action.taskId]: next };
+    }
+    default:
+      return state;
+  }
+}
+
 export function App() {
   const [view, setView] = useState<'login' | 'app'>('login');
   const [connected, setConnected] = useState(false);
@@ -324,21 +346,29 @@ export function App() {
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>('main');
   const isMobile = useMobileDetect();
 
-  // 聊天
-  const [messages, setMessages] = useState<UiMessage[]>([]);
-  /** 前端消息+思考过程缓存：按任务 ID 存最近一次快照（消息数组 + 思考盒条目）。
-   *  切换任务时直接取缓存 → 秒开无加载延迟，且思考过程不丢。 */
-  const messagesCacheRef = useRef<Map<string, { messages: UiMessage[]; thinkings: ThinkingTurn[] }>>(new Map());
+  // 聊天：消息按 taskId 全局唯一映射（Record<taskId, UiMessage[]>），单一真相源。
+  const [messagesByTask, messagesDispatch] = useReducer(messagesReducer, {} as Record<string, UiMessage[]>);
+  /**
+   * setMessages 薄封装：所有对 messages 的修改都经 reducer（不可变更新 + dev 日志 length）。
+   * taskId 默认当前激活任务；WS 流式事件可显式传 msg.taskId（点①：只认这个 taskId）。
+   */
+  const setMessages = useCallback(
+    (updater: (m: UiMessage[]) => UiMessage[], taskId?: string | null) => {
+      const tid = taskId ?? activeTaskIdRef.current ?? '';
+      if (!tid) return;
+      messagesDispatch({ type: 'apply', taskId: tid, updater });
+    },
+    [messagesDispatch],
+  );
   // 前端唯一消息序号：服务端 msg.id 在多次 boot（每个 AgentHost 实例各自从 0 计数）时会重复，
   // 导致 React key 冲突（对话区空白）与 serverId 匹配错配。前端为每条进入 state 的消息分配唯一 localId。
   const localSeqRef = useRef(0);
-  /** 当前激活任务 ID（从任务列表推导，用于缓存 key） */
+  /** 当前激活任务 ID（从任务列表推导，用于路由） */
   const activeTaskIdRef = useRef<string | null>(null);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   /**
    * 统一设置当前激活线程：同步 ref（供 WS 闭包读取）与 state（供渲染/ChatArea key）。
-   * 消除 task_list / switchTask / delete 各自直接写双轨导致的不一致——
-   * 历史对话恢复时 task_list 只写 ref 不写 state，正是 ChatArea key='none' 永不重挂载的根因。
+   * 消除 task_list / switchTask / delete 各自直接写双轨导致的不一致。
    */
   const applyActiveThread = (id: string | null): void => {
     activeTaskIdRef.current = id;
@@ -346,14 +376,8 @@ export function App() {
   };
   /** 思考盒：每轮对话的智能体思考过程（观察条目累积），与最终答案气泡分开 */
   const [thinkings, setThinkings] = useState<ThinkingTurn[]>([]);
-  /**
-   * 派生缓存：state（messages/thinkings/activeTaskId）是唯一真相源，
-   * messagesCacheRef 仅作「切换任务秒切」的本地快照（防白屏），由本 effect 在
-   * 三者变化时统一同步，消除各 handler 里手动双写缓存导致的状态分叉。
-   */
-  useEffect(() => {
-    if (activeTaskId) messagesCacheRef.current.set(activeTaskId, { messages, thinkings });
-  }, [messages, thinkings, activeTaskId]);
+  /** 当前激活任务的消息（派生自全局 messagesByTask，切换任务即换 key 读取，无需缓存双写） */
+  const messages = activeTaskId ? (messagesByTask[activeTaskId] ?? []) : [];
   /** 是否正处于「输出最终答案」阶段（答案气泡显示「输出中…」） */
   const [outputting, setOutputting] = useState(false);
   /** 润色输入框文本时按钮显示加载态 */
@@ -532,7 +556,7 @@ export function App() {
         case 'message': {
           const lid = ++localSeqRef.current;
           const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId, ts: msg.ts };
-          setMessages((m) => [...m, newMsg]);
+          setMessages((m) => [...m, newMsg], evTaskId ?? activeTaskIdRef.current);
           break;
         }
         case 'thinking_start':
@@ -604,7 +628,7 @@ export function App() {
               }
               return x;
             });
-          });
+          }, evTaskId ?? activeTaskIdRef.current);
           break;
         case 'reset':
           clearPending();
@@ -612,7 +636,7 @@ export function App() {
           // 用 localId 作 React key 可避免首轮对话区空白（与 message handler 同一序号空间）。
           const incomingReset = (msg.messages || []).filter(Boolean) as UiMessage[];
           const resetMsgs = incomingReset.map((m) => ({ ...m, localId: ++localSeqRef.current }));
-          setMessages(resetMsgs);
+          setMessages(() => resetMsgs, msg.taskId ?? activeTaskIdRef.current);
           // 原子恢复思考盒：若 reset 携带 thinkings（服务端已从 trace 解析），整体恢复，
           // 不再依赖后续 thinking 事件重发（断点①修复：消除「清空后等重发」的脆弱链）。
           setThinkings(normalizeThinkings(msg.thinkings));
@@ -1129,7 +1153,7 @@ export function App() {
     setUsername(null);
     setView('login');
     clearPending();
-    setMessages([]);
+    setMessages(() => []);
     setTasks([]);
     setArtifacts([]);
     setLoginUser('');
@@ -1139,7 +1163,7 @@ export function App() {
   const createTask = () => {
     wsSend(JSON.stringify({ type: 'new_task' }));
     clearPending();
-    setMessages([]); // 立即清空对话区，避免残留上一个任务的记录（服务端随后也会发 reset）
+    setMessages(() => []); // 立即清空对话区，避免残留上一个任务的记录（服务端随后也会发 reset）
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
   };
@@ -1149,7 +1173,7 @@ export function App() {
     const tpl = TASK_TEMPLATES.find((t) => t.key === key) ?? TASK_TEMPLATES[0];
     wsSend(JSON.stringify({ type: 'new_task', title: tpl.title, goal: tpl.goal }));
     clearPending();
-    setMessages([]);
+    setMessages(() => []);
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
   };
@@ -1158,7 +1182,7 @@ export function App() {
   const duplicateTask = (id: string) => {
     wsSend(JSON.stringify({ type: 'duplicate_task', id }));
     clearPending();
-    setMessages([]);
+    setMessages(() => []);
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
   };
@@ -1190,18 +1214,11 @@ export function App() {
   };
 
   const switchTask = (id: string) => {
-    // 前端消息+思考过程缓存：命中则秒切（无白屏/加载延迟），否则清空等后端推送
-    const cached = messagesCacheRef.current.get(id);
-    applyActiveThread(id); // 先切换 activeThread，避免下方 setMessages 触发派生 effect 用旧 id 污染旧 cache
-    if (cached && cached.messages.length > 0) {
-      setMessages(cached.messages);
-      setThinkings(cached.thinkings);
-      setOutputting(false);
-    } else {
-      setMessages([]);
-      setThinkings([]);
-    }
+    // 消息按 taskId 全局存储（messagesByTask）：切换即换 key 读取，命中内存快照则秒切、
+    // 否则显示空等后端 reset+replay 重建；不再需要 messagesCacheRef 双写缓存。
+    applyActiveThread(id);
     clearPending(); // 切走旧任务的窗口内增量，避免串到新任务
+    setThinkings([]); // 清思考盒，等后端 reset 带新任务的 thinkings
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
     // 持久化当前激活任务：刷新/重连后据此恢复「回到哪个对话」（不存思考内容本身，避免与服务端磁盘分叉）
@@ -1219,7 +1236,7 @@ export function App() {
   const confirmDeleteTask = () => {
     const id = deleteDialog.id;
     setDeleteDialog((d) => ({ ...d, open: false }));
-    messagesCacheRef.current.delete(id);
+    setMessages(() => [], id); // 删除任务时清掉该任务在全局消息映射里的记录
     if (activeTaskIdRef.current === id) {
       applyActiveThread(null);
       try { localStorage.removeItem(ACTIVE_TASK_KEY); } catch { /* ignore */ }
