@@ -12,6 +12,7 @@
  * 渲染与输入。所有内核逻辑都在后端。
  */
 import { useEffect, useRef, useState, useReducer, useCallback, useMemo, type ChangeEvent } from 'react';
+import { flushSync } from 'react-dom';
 import remarkGfm from 'remark-gfm';
 import { Plus, Settings, LogOut, ChevronRight, ChevronLeft, MessageSquare, Share2, Bookmark, Ellipsis, Upload, Download } from 'lucide-react';
 import type { UiMessage, MsgRole } from '../../app/types.ts';
@@ -122,6 +123,7 @@ type ServerMsg =
   | { type: 'message'; id: number; role: MsgRole; text: string; thinkingId?: number; ts?: string }
   | { type: 'update'; id: number; text: string }
   | { type: 'reset'; messages: UiMessage[]; thinkings?: ThinkingTurn[]; taskId?: string }
+  | { type: 'task_history'; taskId: string; messages: UiMessage[]; thinkings?: ThinkingTurn[] }
   | { type: 'state'; busy: boolean; mode: string; planMode: boolean; outputStyle: string; model?: string; currentIteration?: number; maxIterations?: number; browserWatch?: boolean }
   | { type: 'thinking_start'; turnId: number }
   | { type: 'thinking_entry'; id: number; kind: 'reason' | 'tool' | 'tool_result'; title?: string; text: string }
@@ -246,6 +248,7 @@ function messagesReducer(state: Record<string, UiMessage[]>, action: MsgAction):
   switch (action.type) {
     case 'apply': {
       const next = action.updater(state[action.taskId] ?? []);
+      // dev 下打印每次变更后该任务的 messages.length，便于确认切回任务首条/在途事件是否真的在涨
       if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
         // eslint-disable-next-line no-console
         console.log('[msg]', action.taskId, 'len=', next.length);
@@ -363,6 +366,8 @@ export function App() {
   // 前端唯一消息序号：服务端 msg.id 在多次 boot（每个 AgentHost 实例各自从 0 计数）时会重复，
   // 导致 React key 冲突（对话区空白）与 serverId 匹配错配。前端为每条进入 state 的消息分配唯一 localId。
   const localSeqRef = useRef(0);
+  /** 乐观渲染：发送前暂存 user 气泡的 localId，服务器回显时替换而非追加 */
+  const pendingUserMsgLocalId = useRef<number | null>(null);
   /** 当前激活任务 ID（从任务列表推导，用于路由） */
   const activeTaskIdRef = useRef<string | null>(null);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -374,8 +379,22 @@ export function App() {
     activeTaskIdRef.current = id;
     setActiveTaskId(id);
   };
-  /** 思考盒：每轮对话的智能体思考过程（观察条目累积），与最终答案气泡分开 */
-  const [thinkings, setThinkings] = useState<ThinkingTurn[]>([]);
+  /** 思考盒：按 taskId 全局映射（各任务独立，切任务不丢失实时思考过程） */
+  const [thinkingsByTask, setThinkingsByTask] = useState<Record<string, ThinkingTurn[]>>({});
+  const setThinkings = useCallback(
+    (updater: (t: ThinkingTurn[]) => ThinkingTurn[], taskId?: string | null) => {
+      const tid = taskId ?? activeTaskIdRef.current ?? '';
+      if (!tid) return;
+      setThinkingsByTask((prev) => {
+        const current = prev[tid] ?? [];
+        const next = updater(current);
+        if (next === current) return prev;
+        return { ...prev, [tid]: next };
+      });
+    },
+    [],
+  );
+  const thinkings = thinkingsByTask[activeTaskId ?? ''] ?? [];
   /** 当前激活任务的消息（派生自全局 messagesByTask，切换任务即换 key 读取，无需缓存双写） */
   const messages = activeTaskId ? (messagesByTask[activeTaskId] ?? []) : [];
   /** 是否正处于「输出最终答案」阶段（答案气泡显示「输出中…」） */
@@ -554,15 +573,35 @@ export function App() {
           setLoadingBoot(false);
           break;
         case 'message': {
+          // 乐观渲染去重：若后端回显的是 user 消息且前端已有临时气泡，
+          // 则原地替换 id（而非追加重复气泡）
+          if (msg.role === 'user' && pendingUserMsgLocalId.current !== null) {
+            const plc = pendingUserMsgLocalId.current;
+            pendingUserMsgLocalId.current = null;
+            setMessages(
+              (m) => m.map((x) => (x.localId === plc ? { ...x, id: msg.id, role: 'user' as const, text: msg.text, ts: msg.ts } : x)),
+              evTaskId ?? activeTaskIdRef.current,
+            );
+            break;
+          }
           const lid = ++localSeqRef.current;
           const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId, ts: msg.ts };
-          setMessages((m) => [...m, newMsg], evTaskId ?? activeTaskIdRef.current);
+          // 助手空气泡（text=''）：flushSync 强制立即 commit DOM，
+          // 打破 React 18 自动批处理（防止 message+update 合并到一次渲染 → 无中间态可见）
+          if (msg.role === 'assistant' && (msg.text ?? '').length === 0) {
+            flushSync(() => {
+              setMessages((m) => [...m, newMsg], evTaskId ?? activeTaskIdRef.current);
+            });
+          } else {
+            setMessages((m) => [...m, newMsg], evTaskId ?? activeTaskIdRef.current);
+          }
           break;
         }
         case 'thinking_start':
           setOutputting(false);
-          // 默认折叠：思考过程收进独立盒子，用户可点击展开查看（不在消息气泡中显示）
-          setThinkings((t) => [...t, { turnId: msg.turnId, status: 'thinking', collapsed: true, entries: [] }]);
+          // 默认展开：用户发消息后立刻看到助手头像/名字/展开的思考卡（实时渲染思考过程）。
+          // 回合结束后由 thinking_end 自动收起，避免下一轮开始时视觉噪音。
+          setThinkings((t) => [...t, { turnId: msg.turnId, status: 'thinking', collapsed: false, entries: [] }], evTaskId);
           break;
         case 'thinking_entry':
           setThinkings((t) => {
@@ -572,12 +611,18 @@ export function App() {
               ...last,
               entries: [...last.entries, { id: msg.id, kind: msg.kind, title: msg.title, text: msg.text, status: 'streaming' }],
             });
-          });
+          }, evTaskId);
           break;
         case 'thinking_update':
-          // 合批：增量攒进 pendingThinkAppend（同窗口内多条增量叠加），由 scheduleFlush 统一提交
-          pendingThinkAppend.current.set(msg.id, (pendingThinkAppend.current.get(msg.id) ?? '') + msg.append);
-          scheduleFlush();
+          // 直接路由到目标任务（不再用 rAF 批处理，避免跨任务 thinkings 串扰）
+          setThinkings((t) => {
+            const last = t[t.length - 1];
+            if (!last) return t;
+            const entries = last.entries.map((e) =>
+              e.id === msg.id ? { ...e, text: e.text + msg.append } : e,
+            );
+            return t.slice(0, -1).concat({ ...last, entries });
+          }, evTaskId);
           break;
         case 'thinking_status':
           setOutputting(msg.status === 'outputting');
@@ -585,17 +630,19 @@ export function App() {
             const last = t[t.length - 1];
             if (!last) return t;
             return t.slice(0, -1).concat({ ...last, status: msg.status });
-          });
+          }, evTaskId);
           break;
         case 'thinking_end':
           setOutputting(false);
+          // 回合结束：把该轮标记为 done 并自动收起（用户仍可手动点开回看历史思考）。
+          // 补 evTaskId 路由：原代码漏传，多任务下会误写默认任务的 thinkings（丢思考卡）。
           setThinkings((t) => {
             const idx = t.findIndex((x) => x.turnId === msg.turnId);
             if (idx === -1) return t;
             const next = t.slice();
-            next[idx] = { ...next[idx], status: 'done' };
+            next[idx] = { ...next[idx], status: 'done', collapsed: true };
             return next;
-          });
+          }, evTaskId);
           break;
         case 'gen_interrupted':
           // 用户中断：把对应答案气泡标记为「生成中断」（保留半截内容，仅加徽章）
@@ -617,29 +664,46 @@ export function App() {
           // 同步直写答案气泡文本：不走 80ms setTimeout 合批，消除「首条消息流式增量被
           // 异步窗口 / clearPending 竞态吞掉、回合末才一次性出现」的根因（唯一的异步单点）。
           // React 18 在事件回调内自动批处理，逐 token 到达也能稳定增量渲染；useTypewriter 负责逐字揭示。
-          setMessages((m) => {
-            // serverId 可能重叠：只更新「每个 serverId 在数组中最后出现」的那条，
-            // 避免把同 id 的历史消息也一起改写（首轮多次 boot 时 serverId 从 0 重复）。
-            const lastLocal = new Map<number, number>();
-            for (const x of m) if (x.id === msg.id) lastLocal.set(x.id, x.localId ?? -1);
-            return m.map((x) => {
-              if (x.id === msg.id && (x.localId ?? -1) === lastLocal.get(x.id)) {
-                return { ...x, text: msg.text };
-              }
-              return x;
-            });
-          }, evTaskId ?? activeTaskIdRef.current);
+          {
+            const targetTask = evTaskId ?? activeTaskIdRef.current;
+            // 首块保险：若目标气泡当前 text 为空（刚由 message handler flushSync 提交为空气泡），
+            // 用 flushSync 强制本次 update 立即 commit，打破 React 18 批处理，
+            // 确保空气泡 paint 之后、首字才出现，用户看到「逐渐有内容」而非末尾一次性出现。
+            const lookupKey = targetTask ?? '';
+            const isFirstChunk = (messagesByTask[lookupKey] ?? []).some(
+              (x) => x.id === msg.id && (x.text ?? '').trim() === '',
+            );
+            const applyUpdate = () =>
+              setMessages((m) => {
+                const lastLocal = new Map<number, number>();
+                for (const x of m) if (x.id === msg.id) lastLocal.set(x.id, x.localId ?? -1);
+                return m.map((x) => {
+                  if (x.id === msg.id && (x.localId ?? -1) === lastLocal.get(x.id)) {
+                    return { ...x, text: msg.text };
+                  }
+                  return x;
+                });
+              }, targetTask);
+            if (isFirstChunk) flushSync(applyUpdate);
+            else applyUpdate();
+          }
+          break;
+        case 'task_history':
+          // 原子替换整个消息列表（替代 reset + 逐条 replay，消除竞态窗口）
+          clearPending();
+          {
+            const hMsgs = msg.messages.map((m: UiMessage) => ({ ...m, localId: ++localSeqRef.current }));
+            setMessages(() => hMsgs, msg.taskId);
+          }
+          setThinkings(() => normalizeThinkings(msg.thinkings), msg.taskId);
+          setOutputting(false);
           break;
         case 'reset':
           clearPending();
-          // 为每条进入 state 的消息分配唯一 localId：服务端 reset 携带的历史消息其 serverId 可能重叠，
-          // 用 localId 作 React key 可避免首轮对话区空白（与 message handler 同一序号空间）。
           const incomingReset = (msg.messages || []).filter(Boolean) as UiMessage[];
           const resetMsgs = incomingReset.map((m) => ({ ...m, localId: ++localSeqRef.current }));
           setMessages(() => resetMsgs, msg.taskId ?? activeTaskIdRef.current);
-          // 原子恢复思考盒：若 reset 携带 thinkings（服务端已从 trace 解析），整体恢复，
-          // 不再依赖后续 thinking 事件重发（断点①修复：消除「清空后等重发」的脆弱链）。
-          setThinkings(normalizeThinkings(msg.thinkings));
+          setThinkings(() => normalizeThinkings(msg.thinkings), msg.taskId ?? activeTaskIdRef.current);
           setOutputting(false);
           break;
         case 'state':
@@ -927,12 +991,20 @@ export function App() {
     // 有正文、或仅带附件都可发送
     if (!t && pendingAttachments.length === 0) return;
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    const tid = activeTaskIdRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN && tid) {
+      // 乐观渲染：立即在聊天区显示用户气泡（不等服务器回显）
+      const lid = ++localSeqRef.current;
+      pendingUserMsgLocalId.current = lid;
+      setMessages(
+        (m) => [...m, { id: -1, localId: lid, role: 'user', text: t, ts: new Date().toISOString() } as UiMessage],
+        tid,
+      );
       ws.send(
         JSON.stringify({
           type: 'input',
           text: t,
-          taskId: activeTaskIdRef.current ?? undefined,
+          taskId: tid,
           attachments: pendingAttachments.length ? pendingAttachments : undefined,
         }),
       );
@@ -1218,7 +1290,6 @@ export function App() {
     // 否则显示空等后端 reset+replay 重建；不再需要 messagesCacheRef 双写缓存。
     applyActiveThread(id);
     clearPending(); // 切走旧任务的窗口内增量，避免串到新任务
-    setThinkings([]); // 清思考盒，等后端 reset 带新任务的 thinkings
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
     // 持久化当前激活任务：刷新/重连后据此恢复「回到哪个对话」（不存思考内容本身，避免与服务端磁盘分叉）
