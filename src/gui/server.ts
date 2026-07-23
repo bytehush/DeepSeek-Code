@@ -401,7 +401,11 @@ wss.on('connection', (ws, req) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, ...payload }));
   };
 
-  let host: AgentHost | null = null;
+  const hosts = new Map<string, AgentHost>(); // 每任务独立 host 实例，切任务不销毁
+  /** 获取主机：taskId 显式指定则查路由表；否则取当前活跃主机 */
+  function getHost(taskId?: string): AgentHost | undefined {
+    return taskId ? hosts.get(taskId) : (activeTaskId ? hosts.get(activeTaskId) : undefined);
+  }
   let username: string | null = null;
   let activeToken: string | null = null;
   let authed = false;
@@ -425,11 +429,7 @@ wss.on('connection', (ws, req) => {
    * - 目标任务有历史 → 随后 host.setMessages() 会再发一次 reset 覆盖为历史；
    * - 目标任务为空 / 未配 Key → 保持清空后再追加欢迎语或提示，不残留旧任务消息。
    */
-  function pushReset(taskId: string, thinkings: ReplayedThinkingTurn[] = []): void {
-    // 原子携带思考轮次：前端 reset 一次性恢复 messages+thinkings，不再依赖后续 thinking 事件重发。
-    // taskId 让前端精确重置「目标任务」的存储（而非盲目清当前激活任务）。
-    fwd('reset', { messages: [], thinkings: thinkings as unknown as Record<string, unknown>[], taskId });
-  }
+
 
   /**
    * 用当前「项目目录」作为 agent 工作区构造 AgentHost（覆盖默认 process.cwd()，避免改到工具源码）。
@@ -446,21 +446,21 @@ wss.on('connection', (ws, req) => {
   }
 
   /**
-   * 收口断链①（状态↔数据 500ms 缓冲）：丢弃当前 host 前，先把它仍在缓冲里的 trace 强制落盘，
-   * 否则随后 replayAll 会从「落后最新若干事件」的磁盘重建出截断历史。
-   * - 先 abort 让 agent 循环停止继续 emit；
-   * - 第一次 flush 写出回合主体事件；abort 收尾（gen_interrupted / thinking_end 等）是异步 emit，
-   *   稍候 30ms 再 flush 一次兜底，确保切任务前磁盘与内存态一致。
+   * 强制刷新指定 host 的 trace 缓冲到磁盘（切任务前防止丢失在途事件）。
+   * 不再 abort host——每任务独立实例，切走不销毁。
    */
-  async function discardHost(): Promise<void> {
-    if (!host) return;
-    host.abort();
-    if (host.props.traceLogger) {
-      await host.props.traceLogger.flush();
-      await new Promise((r) => setTimeout(r, 30));
-      await host.props.traceLogger.flush();
-    }
-    host = null;
+  async function flushHostTrace(taskId: string): Promise<void> {
+    const h = hosts.get(taskId);
+    if (!h || !h.props.traceLogger) return;
+    await h.props.traceLogger.flush();
+    await new Promise((r) => setTimeout(r, 30));
+    await h.props.traceLogger.flush();
+  }
+
+  /** 清理所有 host（登出 / 重连时）。 */
+  function cleanupHosts(): void {
+    for (const h of hosts.values()) h.abort();
+    hosts.clear();
   }
 
   /**
@@ -472,12 +472,21 @@ wss.on('connection', (ws, req) => {
     const meta = await taskStore.get(id);
     if (!meta) return;
     activeTaskId = id;
-    await discardHost();
+    if (hosts.has(id)) await flushHostTrace(id);
     await sendTaskList();
-    // 先解析历史（含思考轮次），让 reset 原子携带 thinkings —— 切回任务时思考盒由 reset 一次性恢复，
-    // 不再依赖「清空后再等 thinking 事件重发」的脆弱链路（断点①修复）。
     const replayed = await conversationStore!.load(id);
-    pushReset(id, replayed?.thinking ?? []);
+    // 原子发送完整历史（task_history）
+    const historyMsgs: UiMessage[] = [];
+    let hid = 0;
+    for (const m of (replayed?.messages ?? [])) {
+      if (m.role === 'system') continue;
+      if (m.role !== 'user' && m.role !== 'assistant') continue;
+      const text = typeof m.content === 'string' ? m.content : '';
+      if (text || m.role === 'assistant') {
+        historyMsgs.push({ id: hid++, role: m.role as MsgRole, text, ts: m.ts, thinkingId: m.thinkingId });
+      }
+    }
+    fwd('task_history', { taskId: id, messages: historyMsgs, thinkings: replayed?.thinking ?? [] });
     const creds = await loadUserCredentials(username);
     if (!creds) {
       pushSystem(`已切换到「${meta.title}」。你尚未配置 DeepSeek API Key，点击顶栏 ⚙ API 配置后即可继续对话。`);
@@ -492,18 +501,23 @@ wss.on('connection', (ws, req) => {
       fwd('task_error', { message: '任务隔离校验失败' });
       return;
     }
+    // 已有 host → 复用（msgId 保持连续，不创建新实例）
+    if (hosts.has(id)) {
+      hosts.get(id)!.push('system', `已切换回「${meta.title}」，共 ${replayed?.messages.filter(m => m.role !== 'system').length ?? 0} 条历史消息`);
+      return;
+    }
     const props = await ensureKernel(username, taskStore.dir(id), creds, fileRoot(guiSettings));
-    host = makeHost(props);
-    if (activeToken && host.telemetryHub) telemetryHubs.set(activeToken, host.telemetryHub);
-    wireHost(host, id);
+    const newHost = makeHost(props);
+    hosts.set(id, newHost);
+    if (activeToken && newHost.telemetryHub) telemetryHubs.set(activeToken, newHost.telemetryHub);
+    wireHost(newHost, id);
     if (replayed && replayed.messages.length > 0) {
       props.history.loadMessages(replayed.messages as never);
       props.client.resetUsage();
-      // thinkings 已随 reset 原子恢复；此处只发消息事件（emitThinking=false），避免重复重建思考盒。
-      replayToUi(replayed, fwd, host, false);
-      host.push('system', `已切换到「${meta.title}」，共 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息`);
+      newHost.setMessagesSilent(replayedToUiSimple(replayed.messages));
+      newHost.push('system', `已切换到「${meta.title}」，共 ${replayed.messages.filter(m => m.role !== 'system').length} 条历史消息`);
     } else {
-      host.welcome();
+      newHost.welcome();
     }
   }
 
@@ -522,10 +536,11 @@ wss.on('connection', (ws, req) => {
    */
   function backendAt(scope: 'user' | 'project', taskDir?: string): MemoryBackend | null {
     const cfg = loadMemoryConfig();
-    if (cfg.sharedGuiBackend && host?.props.memoryStore) {
-      if (scope === 'user') return host.props.memoryStore.user;
+    const h = getHost();
+    if (cfg.sharedGuiBackend && h?.props.memoryStore) {
+      if (scope === 'user') return h.props.memoryStore.user;
       const activeDir = taskStore && activeTaskId ? taskStore.dir(activeTaskId) : undefined;
-      if (taskDir === undefined || taskDir === activeDir) return host.props.memoryStore.project;
+      if (taskDir === undefined || taskDir === activeDir) return h.props.memoryStore.project;
     }
     // 回退：离线模式独立实例（旧行为，逐字节一致）
     const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
@@ -674,8 +689,9 @@ wss.on('connection', (ws, req) => {
     let metas: Array<{ name: string; description: string; scope: 'project' | 'global' }>;
     let info: { includeGlobal: boolean; allow: string[] | null; source: 'constructor' | 'env' | 'config' | 'all' | 'off' };
     let description: string;
-    if (host) {
-      const mgr = host.props.skillManager;
+    const h = getHost();
+    if (h) {
+      const mgr = h.props.skillManager;
       metas = mgr.listMeta();
       info = mgr.getFilterInfo();
       description = mgr.filterDescription();
@@ -722,9 +738,17 @@ wss.on('connection', (ws, req) => {
     //    无 Key / Key 失效时刷新，历史记录（含思考盒）仍完整显示，仅不能真正发起对话。
     const replayed = await conversationStore!.load(activeId);
     if (replayed && replayed.messages.length > 0) {
-      // host 可能尚未装配（无 Key 时不进内核分支），replayToUi 在 host=null 时仅走 fwd 通道，安全。
-      pushReset(activeId, replayed.thinking);
-      replayToUi(replayed, fwd, null, false);
+      const hMsgs: UiMessage[] = [];
+      let hid = 0;
+      for (const m of replayed.messages) {
+        if (m.role === 'system') continue;
+        if (m.role !== 'user' && m.role !== 'assistant') continue;
+        const text = typeof m.content === 'string' ? m.content : '';
+        if (text || m.role === 'assistant') {
+          hMsgs.push({ id: hid++, role: m.role as MsgRole, text, ts: m.ts, thinkingId: m.thinkingId });
+        }
+      }
+      fwd('task_history', { taskId: activeId, messages: hMsgs, thinkings: replayed.thinking });
       const activeMeta = await taskStore.get(activeId);
       pushSystem(`已恢复「${activeMeta?.title ?? '默认任务'}」的 ${replayed.messages.filter((m) => m.role !== 'system').length} 条历史消息，可继续对话`);
     }
@@ -743,14 +767,16 @@ wss.on('connection', (ws, req) => {
 
     try {
       const props = await ensureKernel(u, taskStore.dir(activeId), creds, fileRoot(guiSettings));
-      host = makeHost(props);
-      wireHost(host, activeId);
-      // 内核装配后把历史灌入，使 Agent 可「接着干」（前端展示已在 ① 完成，这里只喂内核上下文）
+      const resumeHost = makeHost(props);
+      hosts.set(activeId, resumeHost);
+      wireHost(resumeHost, activeId);
+      // 内核装配后把历史灌入
       if (replayed && replayed.messages.length > 0) {
         props.history.loadMessages(replayed.messages as never);
         props.client.resetUsage();
+        resumeHost.setMessagesSilent(replayedToUiSimple(replayed.messages));
       } else {
-        host.welcome();
+        resumeHost.welcome();
       }
       // 内核就绪后立刻把技能清单推给前端（用于底部上拉菜单）
       void sendSkillsList();
@@ -858,7 +884,7 @@ wss.on('connection', (ws, req) => {
       if (msg.token) await revokeToken(String(msg.token)).catch(() => {});
       authed = false;
       username = null;
-      await discardHost();
+      cleanupHosts();
       taskStore = null;
       activeTaskId = null;
       return;
@@ -883,7 +909,7 @@ wss.on('connection', (ws, req) => {
       }
       await saveUserCredentials(username, nc).catch(() => {});
       resetKernelsForUser(username);
-      await discardHost();
+      cleanupHosts();
       fwd('key_ok');
       void bootWithUser(username);
       return;
@@ -907,9 +933,9 @@ wss.on('connection', (ws, req) => {
       const goal = String(msg.goal ?? '').slice(0, 200);
       const id = await taskStore.create(title, goal);
       activeTaskId = id;
-      await discardHost();
+      await flushHostTrace(id);
       await sendTaskList();
-      pushReset(id); // 新任务：先清空对话区，避免残留上一个任务的记录
+      fwd('task_history', { taskId: id, messages: [], thinkings: [] }); // 新任务：空对话区
       // 若已配 Key 则装配内核开始对话；否则只在对话区提醒
       const creds = await loadUserCredentials(username);
       if (!creds) {
@@ -926,9 +952,10 @@ wss.on('connection', (ws, req) => {
         return;
       }
       const props = await ensureKernel(username, taskStore.dir(id), creds, fileRoot(guiSettings));
-      host = makeHost(props);
-      wireHost(host, id);
-      host.welcome();
+      const ntHost = makeHost(props);
+      hosts.set(id, ntHost);
+      wireHost(ntHost, id);
+      ntHost.welcome();
       return;
     }
 
@@ -942,9 +969,9 @@ wss.on('connection', (ws, req) => {
         return;
       }
       activeTaskId = newId;
-      await discardHost();
+      await flushHostTrace(newId);
       await sendTaskList();
-      pushReset(newId); // 复制出的新任务从空白上下文开始，先清空对话区
+      fwd('task_history', { taskId: newId, messages: [], thinkings: [] }); // 复制新任务：空白上下文
       const creds = await loadUserCredentials(username);
       if (!creds) {
         pushSystem('已复制任务（独立上下文）。你尚未配置 DeepSeek API Key，配置后即可对话。');
@@ -960,9 +987,10 @@ wss.on('connection', (ws, req) => {
         return;
       }
       const props = await ensureKernel(username, taskStore.dir(newId), creds, fileRoot(guiSettings));
-      host = makeHost(props);
-      wireHost(host, newId);
-      host.welcome();
+      const dupHost = makeHost(props);
+      hosts.set(newId, dupHost);
+      wireHost(dupHost, newId);
+      dupHost.welcome();
       return;
     }
 
@@ -1236,7 +1264,7 @@ wss.on('connection', (ws, req) => {
       const taskId = String(msg.taskId ?? '');
       try {
         // sharedGuiBackend：注入 agent 同一实例的后端，使沉淀走真实嵌入；非活跃任务不复用（防错配）。
-        const svc = host?.props.memoryStore;
+        const svc = getHost(taskId)?.props.memoryStore;
         const shared = svc && loadMemoryConfig().sharedGuiBackend;
         const userBackend = shared ? svc.user : undefined;
         const projBackend =
@@ -1255,19 +1283,21 @@ wss.on('connection', (ws, req) => {
     // 整理记忆（Dreaming 式陈旧性治理）—— 两步式：先预览方案、用户确认后再应用。
     // 需要内核（含 API Key）才能调用模型。
     if (type === 'revise_preview') {
-      if (!host) {
+      const revHost = getHost();
+      if (!revHost) {
         fwd('revise_proposal', {
           proposal: { actions: [], summary: '', skipped: true, reason: '整理记忆需要 API Key，请先在设置中配置' },
         });
         return;
       }
-      const proposal = await host.proposeRevise();
+      const proposal = await revHost.proposeRevise();
       fwd('revise_proposal', { proposal });
       return;
     }
 
     if (type === 'revise_apply') {
-      if (!host) {
+      const revHost = getHost();
+      if (!revHost) {
         fwd('revise_result', {
           deleted: 0,
           merged: 0,
@@ -1277,7 +1307,7 @@ wss.on('connection', (ws, req) => {
         });
         return;
       }
-      const r = await host.applyRevise();
+      const r = await revHost.applyRevise();
       fwd('revise_result', {
         deleted: r.deleted,
         merged: r.merged,
@@ -1455,17 +1485,18 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // 其余消息需内核就绪；若只是没配 Key，不弹阻塞浮层，仅在对话区提醒。
-    if (!host || !taskStore || !activeTaskId) {
+    // 其余消息需内核就绪
+    const curHost = getHost();
+    if (!curHost || !taskStore || !activeTaskId) {
       if (type === 'input') {
         pushSystem('你还没有配置 DeepSeek API Key，无法发送消息。请先点击顶栏 ⚙ API 进行配置。');
       }
       return;
     }
 
-    // 浏览器遥测上报：结构化错误/日志/网络失败 → 入 hub（供调试循环回灌）+ 实时转发前端展示
+    // 浏览器遥测
     if (type === 'telemetry') {
-      const hub = host.telemetryHub;
+      const hub = curHost.telemetryHub;
       const evs = Array.isArray(msg.events) ? (msg.events as BrowserTelemetryEvent[]) : [];
       if (hub && evs.length) {
         const norm = evs.map((e) => ({
@@ -1479,9 +1510,13 @@ wss.on('connection', (ws, req) => {
     }
 
     if (type === 'input') {
-      // 前端发送时携带当前激活任务 id；若显式携带了不同 taskId（跨任务误发，单 host 只服务激活任务），
-      // 忽略以免污染错误任务的对话。正常流程 msg.taskId === activeTaskId，必然通过。
-      if (typeof msg.taskId === 'string' && activeTaskId !== null && msg.taskId !== activeTaskId) return;
+      // 路由到目标任务的 host（允许多任务并行处理）
+      const taskId = String(msg.taskId ?? '');
+      const targetHost = getHost(taskId);
+      if (!targetHost) {
+        pushSystem('该任务尚未初始化，请重新切换或创建任务。');
+        return;
+      }
       const text = String(msg.text ?? '').trim();
       const attachments = Array.isArray(msg.attachments) ? (msg.attachments as Array<{ name?: string; path?: string }>) : [];
       // 首次用户消息：标题为默认时用前几个字作为任务标题；目标为空时用首条消息作为任务目标
@@ -1504,21 +1539,21 @@ wss.on('connection', (ws, req) => {
         const list = valid.map((a) => `- ${a.name || basename(a.path!)}：${a.path}`).join('\n');
         fullText += `\n\n[用户附件] 用户随本条消息上传了以下文档，请在回答前先读取并理解其内容：\n${list}`;
       }
-      host.send(fullText);
-    } else if (type === 'confirm') host.resolveConfirm(Boolean(msg.yes));
-    else if (type === 'asktext') host.resolveAskText(String(msg.text ?? ''));
-    else if (type === 'abort') host.abort();
+      targetHost.send(fullText);
+    } else if (type === 'confirm') curHost.resolveConfirm(Boolean(msg.yes));
+    else if (type === 'asktext') curHost.resolveAskText(String(msg.text ?? ''));
+    else if (type === 'abort') curHost.abort();
     else if (type === 'set_limit') {
       const limit = Number(msg.limit);
       if (Number.isFinite(limit) && limit >= 0) {
-        host.setMaxIterations(limit);
+        curHost.setMaxIterations(limit);
       }
     }
   });
 
   ws.on('close', () => {
-    host?.abort();
-    if (activeToken) telemetryHubs.delete(activeToken); // 移除遥测注册，避免泄漏
+    cleanupHosts();
+    if (activeToken) telemetryHubs.delete(activeToken);
     rateLimit.delete(connId);
   });
 });
@@ -1551,135 +1586,7 @@ async function uniqueUploadPath(p: string): Promise<string> {
  */
 type FwdFn = (type: string, payload: Record<string, unknown>) => void;
 
-function replayToUi(
-  replayed: ReplayedConversation,
-  fwd: (type: string, payload: Record<string, unknown>) => void,
-  host: AgentHost | null,
-  emitThinking = true,
-): void {
-  const msgs = replayed.messages;
-  let msgId = 0;
-
-  const pushMsg = (role: MsgRole, text: string, thinkingId?: number, ts?: string) => {
-    const m: UiMessage = { id: msgId++, role, text };
-    if (thinkingId !== undefined) m.thinkingId = thinkingId;
-    if (ts) m.ts = ts;
-    fwd('message', m as unknown as Record<string, unknown>);
-  };
-
-  if (replayed.thinking.length === 0) {
-    // ── 旧数据（无持久化思考盒）：走原重建逻辑，保证历史 trace 仍可回放 ──
-    legacyReplay(msgs, fwd, pushMsg);
-  } else if (emitThinking) {
-    // ── 方案 A：从持久化的思考事件原样重建（与实时显示完全同形）──
-    // 每个最终答复（assistant_message 无 tool_calls）已绑定 thinkingId，
-    // 发射其思考轮次后再发射气泡，顺序与实时一致（盒在上、泡在下）。
-    const emittedTurns = new Set<number>();
-    for (const m of msgs) {
-      if (m.role === 'system') continue;
-      if (m.role === 'user') {
-        pushMsg('user', typeof m.content === 'string' ? m.content : '', undefined, m.ts);
-        continue;
-      }
-      if (m.role === 'assistant') {
-        const hasTool = m.tool_calls && m.tool_calls.length > 0;
-        if (hasTool) continue; // 工具轮不单独成泡，其过程已并入思考盒
-        const tid = m.thinkingId;
-        if (tid !== undefined && !emittedTurns.has(tid)) {
-          const turn = replayed.thinking.find((t) => t.turnId === tid);
-          if (turn) {
-            emittedTurns.add(tid);
-            fwd('thinking_start', { turnId: turn.turnId });
-            for (const e of turn.entries) {
-              fwd('thinking_entry', { id: e.id, kind: e.kind, title: e.title, text: e.text });
-            }
-            fwd('thinking_status', { status: turn.status });
-            fwd('thinking_end', { turnId: turn.turnId });
-          }
-        }
-        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', tid, m.ts);
-      }
-      // tool 角色：跳过（其完整输出已作为 tool_result 条目并入思考盒）
-    }
-  } else {
-    // ── thinkings 已随 reset 原子恢复：只发消息事件并保留 thinkingId 关联，避免重复重建思考盒 ──
-    for (const m of msgs) {
-      if (m.role === 'system') continue;
-      if (m.role === 'user') {
-        pushMsg('user', typeof m.content === 'string' ? m.content : '', undefined, m.ts);
-        continue;
-      }
-      if (m.role === 'assistant') {
-        const hasTool = m.tool_calls && m.tool_calls.length > 0;
-        if (hasTool) continue; // 工具轮不单独成泡，其过程已并入思考盒
-        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', m.thinkingId, m.ts);
-      }
-      // tool 角色：跳过
-    }
-  }
-
-  // 回填 host 的消息数组（供后续内核追加）
-  if (host) {
-    host.setMessagesSilent(replayedToUiSimple(msgs));
-  }
-}
-
 /** 旧数据回放（无持久化思考盒）：从 assistant_message.tool_calls + 后续 tool 消息重建思考卡。 */
-function legacyReplay(
-  msgs: ReplayedMessage[],
-  fwd: (type: string, payload: Record<string, unknown>) => void,
-  pushMsg: (role: MsgRole, text: string, thinkingId?: number) => void,
-): void {
-  let turnId = 0;
-  let i = 0;
-  while (i < msgs.length) {
-    const m = msgs[i];
-    if (m.role === 'system') { i++; continue; }
-    if (m.role === 'user') {
-      pushMsg('user', typeof m.content === 'string' ? m.content : '');
-      i++;
-      continue;
-    }
-    if (m.role === 'assistant') {
-      const hasToolCalls = m.tool_calls && m.tool_calls.length > 0;
-      const content = typeof m.content === 'string' ? m.content : '';
-      if (hasToolCalls) {
-        const curTurnId = turnId++;
-        fwd('thinking_start', { turnId: curTurnId });
-        if (content.trim()) fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
-        fwd('thinking_entry', { id: 1, kind: 'tool', title: '工具调用', text: (m.tool_calls ?? []).map((t) => t.function.name).join(', ') });
-        i++;
-        let toolId = 2;
-        while (i < msgs.length && msgs[i].role === 'tool') {
-          const tm = msgs[i];
-          const tName = tm.name ?? '工具';
-          const tContent = typeof tm.content === 'string' ? tm.content : '';
-          fwd('thinking_entry', { id: toolId++, kind: 'tool_result', title: tName, text: tContent });
-          i++;
-        }
-        fwd('thinking_end', { turnId: curTurnId });
-        if (i < msgs.length) {
-          const nx = msgs[i];
-          if (nx.role === 'assistant' && (!nx.tool_calls || nx.tool_calls.length === 0)) {
-            const raw = nx.content;
-            pushMsg('assistant', typeof raw === 'string' ? raw : '', curTurnId);
-            i++;
-          }
-        }
-      } else {
-        const curTurnId = turnId++;
-        fwd('thinking_start', { turnId: curTurnId });
-        if (content.trim()) fwd('thinking_entry', { id: 0, kind: 'reason', text: content });
-        fwd('thinking_end', { turnId: curTurnId });
-        pushMsg('assistant', content, curTurnId);
-        i++;
-      }
-    } else {
-      i++;
-    }
-  }
-}
-
 /** 简化版：只转 UiMessage[]，不重建思考卡（供 setMessagesSilent 回填用） */
 function replayedToUiSimple(messages: ReplayedMessage[]): UiMessage[] {
   const out: UiMessage[] = [];
