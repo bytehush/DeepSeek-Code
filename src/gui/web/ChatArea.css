@@ -82,6 +82,23 @@
   margin: 0 2px 3px;
   line-height: 1.2;
 }
+/* 时间线：每条消息的发生时间（ISO → HH:MM / MM-DD HH:MM）。低调、等宽数字，
+   不抢气泡视觉，仅作追溯锚点。 */
+.msg-time {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted-2, #9aa0a6);
+  font-variant-numeric: tabular-nums;
+}
+/* 系统 / 工具 / 错误提示条上方的时间线（居中提示，单独一行） */
+.note-time {
+  display: block;
+  margin: 0 0 3px;
+  font-size: 11px;
+  color: var(--muted-2, #9aa0a6);
+  font-variant-numeric: tabular-nums;
+}
 /* 系统 / 工具 / 错误消息统一走 .note-row 居中提示（见下方 .note 样式） */
 
 /* 助手消息气泡 */

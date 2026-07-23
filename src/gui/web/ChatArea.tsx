@@ -137,6 +137,28 @@ function safeImageSrc(value: string): string {
   return '';
 }
 
+/**
+ * 时间线格式化：把消息的 ISO 时间戳渲染成易读的相对时间。
+ *  - 当天 → HH:MM
+ *  - 跨天 → MM-DD HH:MM（便于在历史对话里定位「这条发生在哪天」）
+ * 非法 / 缺失时间戳返回空串（不渲染时间，向后兼容无 ts 的旧消息）。
+ */
+function formatMessageTime(iso?: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return `${hh}:${mm}`;
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hh}:${mm}`;
+}
+
 /** 代码块：渲染转义后的文本，并提供「安全复制」（只复制纯文本，绝不复制 innerHTML） */
 function CodePre({ children }: { children?: ReactNode }) {
   const preRef = useRef<HTMLPreElement>(null);
@@ -255,7 +277,10 @@ const AssistantRow = memo(function AssistantRow({
     <div className="row assistant">
       <img className="avatar assistant" src="/agent-avatar.png" alt="" aria-hidden />
       <div className="msg-col">
-        <div className="msg-name">DeepSeek 助手</div>
+        <div className="msg-name">
+          DeepSeek 助手
+          {message.ts && <time className="msg-time" dateTime={message.ts}>{formatMessageTime(message.ts)}</time>}
+        </div>
         {thinking && <ThinkingCard turn={thinking} onToggle={onToggleThinking} />}
         <div className={`bubble ${showOutputting ? 'outputting' : ''} ${message.phase === 'progress' ? 'dim' : ''} ${message.interrupted ? 'interrupted' : ''}`}>
           {message.interrupted && (
@@ -295,7 +320,10 @@ const UserRow = memo(function UserRow({ message, userName, userInitial }: { mess
   return (
     <div className="row user">
       <div className="msg-col user">
-        <div className="msg-name">{userName}</div>
+        <div className="msg-name">
+          {userName}
+          {message.ts && <time className="msg-time" dateTime={message.ts}>{formatMessageTime(message.ts)}</time>}
+        </div>
         <div className="bubble user">
           {text && <div className="bubble-text">{text}</div>}
           {attachments.length > 0 && (
@@ -331,6 +359,7 @@ const NoteRow = memo(function NoteRow({ message }: { message: UiMessage }) {
   const monoCls = message.text.includes('\n') ? ' mono' : '';
   return (
     <div className="row note-row">
+      {message.ts && <time className="msg-time note-time" dateTime={message.ts}>{formatMessageTime(message.ts)}</time>}
       <div className={`note ${noteClass}${monoCls}`}>{message.text}</div>
     </div>
   );
