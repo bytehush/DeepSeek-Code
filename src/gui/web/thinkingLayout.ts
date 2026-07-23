@@ -31,8 +31,16 @@ export function computeOrphans(thinkings: ThinkingTurn[], messages: UiMessage[],
       .map((m) => m.thinkingId as number),
   );
   const orphans = thinkings.filter((t) => !matchedTurnIds.has(t.turnId));
-  // 实时活跃卡：仅在 busy 且仍处于思考/输出中阶段时存在（答案气泡尚未创建）
-  const live = busy ? orphans.find((t) => t.status === 'thinking' || t.status === 'outputting') : undefined;
+  // 实时活跃卡：取「最新孤儿轮」，只要它仍处于 thinking/outputting 且全局 busy，就显示为
+  // live 卡——不受历史里是否有 assistant 气泡影响（历史气泡已通过 matchedTurnIds 排除，
+  // 不会与 live 卡重叠）。这正是「切换/后续任务中发消息也能看到助手头像+思考卡」的关键。
+  // 过度防御回归：早期为消除 [overlap] 把 guard 写成「messages 含 assistant 即不显示 live」，
+  // 范围过大，导致任何有历史的任务在思考阶段完全没有 live 卡。
+  const latestOrphan = orphans[orphans.length - 1];
+  const live =
+    busy && latestOrphan && (latestOrphan.status === 'thinking' || latestOrphan.status === 'outputting')
+      ? latestOrphan
+      : undefined;
   // 其余孤儿轮（已结束 / 中断 / 多轮思考里未匹配的早期轮）全部作为历史卡渲染
   const history = orphans.filter((t) => t !== live);
   return { live, history };
