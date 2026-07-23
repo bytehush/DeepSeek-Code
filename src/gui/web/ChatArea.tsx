@@ -11,7 +11,7 @@
  *
  * 通过 forwardRef 把内部 div ref 暴露给父组件，以便父组件在消息追加时自动滚到底。
  */
-import { forwardRef, type Ref, memo, useState, useRef, useEffect, type ReactNode } from 'react';
+import { forwardRef, type Ref, memo, useState, useRef, useEffect, useLayoutEffect, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -373,6 +373,14 @@ function ChatAreaInner({ messages, busy, outputting, thinkings, onToggleThinking
     const chars = Array.from(userName);
     return (chars[0] ?? '') + (chars[1] ?? '');
   })();
+
+  // 任务切换后 ChatArea 重挂载（key 变化）→ 立即滚到底部，确保新内容在视口内
+  useLayoutEffect(() => {
+    if (typeof ref !== 'function' && ref?.current) {
+      ref.current.scrollTop = ref.current.scrollHeight;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 把思考轮拆成「已挂靠答案气泡」与「孤儿轮（无配套答案气泡）」两类。
   // 孤儿轮 = 思考已 done/interrupted 但 loop 未产出答案气泡，或实时思考中气泡尚未创建。
