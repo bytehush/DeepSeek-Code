@@ -71,6 +71,37 @@ export function rewriteInlineScript(inputCmd: string): InlineScriptRewrite {
   return { cmd: inputCmd, tmpFile: null };
 }
 
+/**
+ * 定位 old_string 在文件中的所有起始字符索引（精确 + 换行归一化两种匹配）。
+ * 供 edit_file 在「非唯一」时给出匹配行号，帮助模型定位唯一上下文（B2）。
+ */
+export function findAllOccurrences(buf: string, oldS: string): number[] {
+  const res = new Set<number>();
+  // 1) 精确匹配
+  let i = buf.indexOf(oldS);
+  while (i !== -1) {
+    res.add(i);
+    i = buf.indexOf(oldS, i + oldS.length);
+  }
+  // 2) 换行归一化匹配（\r\n -> \n）
+  const normOld = oldS.replace(/\r\n/g, '\n');
+  if (normOld !== oldS) {
+    let j = buf.indexOf(normOld);
+    while (j !== -1) {
+      res.add(j);
+      j = buf.indexOf(normOld, j + normOld.length);
+    }
+  }
+  return [...res].sort((a, b) => a - b);
+}
+
+/** 把匹配字符索引集合转成 1-based 行号（B2 诊断用） */
+export function occurrenceLineNumbers(buf: string, oldS: string): number[] {
+  return findAllOccurrences(buf, oldS)
+    .map((idx) => buf.slice(0, idx).split('\n').length)
+    .sort((a, b) => a - b);
+}
+
 // 工具函数实现（S1.2 从 index.ts 拆分）：核心工具逻辑。
 
 /** 预览文本行数截断，避免超长 diff 撑爆 TUI 确认条 */
@@ -299,8 +330,22 @@ export function createBaseTools(client: DeepSeekClient): ToolDef[] {
               '\n请先用 read_file 重新读取该文件的最新内容，确认 old_string 与文件实际字节一致' +
               '（尤其缩进、换行、行尾），再调用 edit_file。',
           };
-        if (fuzzyMatchBlock(buf.slice(idx + 1), oldS) !== -1)
+        if (fuzzyMatchBlock(buf.slice(idx + 1), oldS) !== -1) {
+          // B2：拒绝「非唯一匹配」的安全行为不变，但给出匹配行号让模型可定位唯一上下文
+          const lines = occurrenceLineNumbers(buf, oldS);
+          if (lines.length >= 2) {
+            const shown = lines.slice(0, 5).join(', ');
+            const more = lines.length > 5 ? ` 等共 ${lines.length} 处` : '';
+            return {
+              ok: false,
+              output:
+                `old_string 在文件中出现 ${lines.length} 次，不唯一。` +
+                `\n匹配位置（行号，1-based）：${shown}${more}。` +
+                `\n请加入更多相邻上下文（如上下各几行）使其唯一后再调用 edit_file。`,
+            };
+          }
           return { ok: false, output: 'old_string 在文件中出现多次，请提供更多上下文使其唯一' };
+        }
         const updated = buf.slice(0, idx) + newS + buf.slice(idx + oldS.length);
         // 回滚点：落盘前记录原文（edit 还原=写回 buf），供 /rollback 撤销
         await rollbackManager.snapshot('edit', fp, buf, ctx.cwd);

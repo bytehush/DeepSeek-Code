@@ -1,7 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import { createBaseTools, rewriteInlineScript, MAX_COMMAND_LENGTH } from '../src/tools/implementations.ts';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import {
+  createBaseTools,
+  rewriteInlineScript,
+  MAX_COMMAND_LENGTH,
+  findAllOccurrences,
+  occurrenceLineNumbers,
+} from '../src/tools/implementations.ts';
 
 const findTool = (name: string) => {
   const tools = createBaseTools({} as never);
@@ -59,3 +68,40 @@ test('run_command: 普通单行命令走原样（长度护栏不误伤）', asyn
   assert.equal(r.tmpFile, null);
   assert.equal(r.cmd, 'dir');
 });
+
+test('findAllOccurrences / occurrenceLineNumbers: 定位所有重复匹配行号', () => {
+  const buf = 'foo\nbar\nfoo\nbaz\nfoo';
+  assert.deepEqual(findAllOccurrences(buf, 'foo'), [0, 8, 16]);
+  assert.deepEqual(occurrenceLineNumbers(buf, 'foo'), [1, 3, 5]);
+});
+
+test('edit_file: old_string 不唯一时返回匹配行号（可行动诊断, B2）', async () => {
+  const edit = findTool('edit_file');
+  const tmp = join(tmpdir(), `dsa-edit-${randomUUID()}.txt`);
+  await fs.writeFile(tmp, 'line1\nTARGET\nline3\nTARGET\nline5', 'utf8');
+  const res = await edit.execute(
+    { path: tmp, old_string: 'TARGET', new_string: 'X' },
+    { cwd: tmpdir(), signal: undefined },
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.output, /出现 2 次/);
+  assert.match(res.output, /行号/);
+  assert.match(res.output, /2, 4/); // 两处分别在第 2、4 行
+  await fs.unlink(tmp);
+});
+
+test('edit_file: 唯一匹配仍正常执行（不被 B2 改动误伤）', async () => {
+  const edit = findTool('edit_file');
+  const tmp = join(tmpdir(), `dsa-edit-${randomUUID()}.txt`);
+  await fs.writeFile(tmp, 'AAA\nBBB\nCCC', 'utf8');
+  const res = await edit.execute(
+    { path: tmp, old_string: 'BBB', new_string: 'B2' },
+    { cwd: tmpdir(), signal: undefined },
+  );
+  // 命中唯一匹配：进入写盘路径（verifyWrittenFile 对纯文本通过），ok 应为 true
+  assert.equal(res.ok, true);
+  const after = await fs.readFile(tmp, 'utf8');
+  assert.equal(after, 'AAA\nB2\nCCC');
+  await fs.unlink(tmp);
+});
+
