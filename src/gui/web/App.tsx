@@ -119,7 +119,7 @@ type MobilePanel = 'left' | 'main' | 'right';
 type ServerMsg =
   | { type: 'auth_ok'; token: string; username: string }
   | { type: 'auth_error'; message: string }
-  | { type: 'message'; id: number; role: MsgRole; text: string; thinkingId?: number }
+  | { type: 'message'; id: number; role: MsgRole; text: string; thinkingId?: number; ts?: string }
   | { type: 'update'; id: number; text: string }
   | { type: 'reset'; messages: UiMessage[]; thinkings?: ThinkingTurn[] }
   | { type: 'state'; busy: boolean; mode: string; planMode: boolean; outputStyle: string; model?: string; currentIteration?: number; maxIterations?: number; browserWatch?: boolean }
@@ -513,7 +513,7 @@ export function App() {
           break;
         case 'message': {
           const lid = ++localSeqRef.current;
-          const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId };
+          const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId, ts: msg.ts };
           setMessages((m) => [...m, newMsg]);
           // 同步缓存：回放/实时新增消息都累加到缓存，避免 thinking_end 用陈旧空 messages 覆盖，
           // 否则二次切回任务时 messages 缓存为空 → switchTask 走清空分支 → 历史与思考盒丢失。

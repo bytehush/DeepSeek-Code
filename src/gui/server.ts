@@ -46,6 +46,7 @@ import { SkillManager } from '../skills/loader.ts';
 import { BrowserTelemetryHub } from './telemetry-hub.ts';
 import type { BrowserTelemetryEvent } from './telemetry-types.ts';
 import type { AppProps, UiMessage, MsgRole } from '../app/types.ts';
+import { JsonlConversationStore, type ConversationStore } from './storage.ts';
 
 const PORT = Number(process.env.DSA_WEB_PORT ?? 4173);
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -405,6 +406,7 @@ wss.on('connection', (ws, req) => {
   let activeToken: string | null = null;
   let authed = false;
   let taskStore: TaskStore | null = null;
+  let conversationStore: ConversationStore | null = null;
   let activeTaskId: string | null = null;
   /** 内核是否正忙（由 host 的 state 事件同步），避免上传时与正在进行的生成交错 */
   let busy = false;
@@ -456,7 +458,7 @@ wss.on('connection', (ws, req) => {
     await sendTaskList();
     // 先解析历史（含思考轮次），让 reset 原子携带 thinkings —— 切回任务时思考盒由 reset 一次性恢复，
     // 不再依赖「清空后再等 thinking 事件重发」的脆弱链路（断点①修复）。
-    const replayed = await TraceLogger.replayAll(taskStore.dir(id));
+    const replayed = await conversationStore!.load(id);
     pushReset(replayed?.thinking ?? []);
     const creds = await loadUserCredentials(username);
     if (!creds) {
@@ -681,6 +683,7 @@ wss.on('connection', (ws, req) => {
   async function bootWithUser(u: string, threadId?: string): Promise<void> {
     // 先初始化任务存储（即使没配 Key，也应展示任务列表）
     taskStore = new TaskStore(userDataDir(u));
+    conversationStore = new JsonlConversationStore(taskStore);
     // 激活任务优先级：指定 threadId（刷新前持久化的上次激活任务）→ default → 第一个现存任务 → 兜底强制重建 default。
     // 这样刷新后能回到用户上次正在看的对话（含思考盒），而非落到空默认任务。
     // threadId 须经 taskStore.get 校验归属当前用户，避免客户端伪造他人任务 id。
@@ -696,7 +699,7 @@ wss.on('connection', (ws, req) => {
 
     // ① 历史回放（展示层，与 API Key 解耦）：无论是否配 Key，都把「消息 + 思考盒」推给前端。
     //    无 Key / Key 失效时刷新，历史记录（含思考盒）仍完整显示，仅不能真正发起对话。
-    const replayed = await TraceLogger.replayAll(taskStore.dir(activeId));
+    const replayed = await conversationStore!.load(activeId);
     if (replayed && replayed.messages.length > 0) {
       // host 可能尚未装配（无 Key 时不进内核分支），replayToUi 在 host=null 时仅走 fwd 通道，安全。
       pushReset(replayed.thinking);
@@ -1537,9 +1540,10 @@ function replayToUi(
   const msgs = replayed.messages;
   let msgId = 0;
 
-  const pushMsg = (role: MsgRole, text: string, thinkingId?: number) => {
+  const pushMsg = (role: MsgRole, text: string, thinkingId?: number, ts?: string) => {
     const m: UiMessage = { id: msgId++, role, text };
     if (thinkingId !== undefined) m.thinkingId = thinkingId;
+    if (ts) m.ts = ts;
     fwd('message', m as unknown as Record<string, unknown>);
   };
 
@@ -1554,7 +1558,7 @@ function replayToUi(
     for (const m of msgs) {
       if (m.role === 'system') continue;
       if (m.role === 'user') {
-        pushMsg('user', typeof m.content === 'string' ? m.content : '');
+        pushMsg('user', typeof m.content === 'string' ? m.content : '', undefined, m.ts);
         continue;
       }
       if (m.role === 'assistant') {
@@ -1573,7 +1577,7 @@ function replayToUi(
             fwd('thinking_end', { turnId: turn.turnId });
           }
         }
-        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', tid);
+        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', tid, m.ts);
       }
       // tool 角色：跳过（其完整输出已作为 tool_result 条目并入思考盒）
     }
@@ -1582,13 +1586,13 @@ function replayToUi(
     for (const m of msgs) {
       if (m.role === 'system') continue;
       if (m.role === 'user') {
-        pushMsg('user', typeof m.content === 'string' ? m.content : '');
+        pushMsg('user', typeof m.content === 'string' ? m.content : '', undefined, m.ts);
         continue;
       }
       if (m.role === 'assistant') {
         const hasTool = m.tool_calls && m.tool_calls.length > 0;
         if (hasTool) continue; // 工具轮不单独成泡，其过程已并入思考盒
-        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', m.thinkingId);
+        pushMsg('assistant', typeof m.content === 'string' ? m.content : '', m.thinkingId, m.ts);
       }
       // tool 角色：跳过
     }

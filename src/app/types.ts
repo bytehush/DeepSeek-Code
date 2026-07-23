@@ -28,6 +28,8 @@ export interface UiMessage {
   interrupted?: boolean;
   /** 前端唯一序号：服务端 msg.id 在多次 boot 时会从 0 重复，导致 React key 冲突与更新错配；
    *  前端为每条进入 state 的消息分配唯一 localId，作展示 key 与流式更新匹配依据。 */
+  /** 消息发生时间（ISO 字符串），由存储层从 trace 事件 timestamp 提取，用于时间线展示 */
+  ts?: string;
   localId?: number;
 }
 

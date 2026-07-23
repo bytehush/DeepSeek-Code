@@ -78,8 +78,8 @@ export interface ReplayedConversation {
   thinking: ReplayedThinkingTurn[];
 }
 
-/** 回放用消息：ChatMessage 扩展 thinkingId 绑定（关联对应思考轮次） */
-export type ReplayedMessage = ChatMessage & { thinkingId?: number };
+/** 回放用消息：ChatMessage 扩展 thinkingId 绑定（关联对应思考轮次）与时间线 ts */
+export type ReplayedMessage = ChatMessage & { thinkingId?: number; ts?: string };
 
 /**
  * JSONL Trace 日志系统（P2-1）。
@@ -370,7 +370,7 @@ export class TraceLogger {
       }
       switch (ev.type) {
         case 'user_input':
-          messages.push({ role: 'user', content: String(ev.payload.input ?? '') });
+          messages.push({ role: 'user', content: String(ev.payload.input ?? ''), ts: ev.timestamp });
           break;
         case 'assistant_message': {
           const content = String(ev.payload.content ?? '');
@@ -385,7 +385,9 @@ export class TraceLogger {
             pendingToolCalls = (raw as Array<{ id: string; name: string }>).map((t) => ({ id: String(t.id), name: String(t.name) }));
           }
           // 关键：无工具调用时绝不发送空数组 tool_calls（DeepSeek API 报 400）
-          const msg: ReplayedMessage = tool_calls ? { role: 'assistant', content, tool_calls } : { role: 'assistant', content };
+          const msg: ReplayedMessage = tool_calls
+            ? { role: 'assistant', content, tool_calls, ts: ev.timestamp }
+            : { role: 'assistant', content, ts: ev.timestamp };
           // 绑定思考轮次：仅最终答复（无工具调用）归属思考轮——工具轮不单独成泡，
           // 其推理文字已作为 reason 条目落入思考盒（由 thinking_entry 持久化）。
           // 优先绑定「仍在进行中」的轮（activeTurn）；若思考轮已结束（thinking_end 先落盘）
@@ -398,7 +400,7 @@ export class TraceLogger {
           const toolCallId = String(ev.payload.toolCallId ?? pendingToolCalls[0]?.id ?? 'unknown');
           const name = String(ev.payload.name ?? pendingToolCalls.shift()?.name ?? 'tool');
           const content = String(ev.payload.output ?? ev.payload.reason ?? '');
-          messages.push({ role: 'tool', tool_call_id: toolCallId, name, content });
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name, content, ts: ev.timestamp });
           break;
         }
         // ── 思考盒持久化回放 ──

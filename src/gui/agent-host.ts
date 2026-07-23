@@ -200,7 +200,7 @@ export class AgentHost extends EventEmitter {
     }
     const id = this.msgId++;
     this.messages.push({ id, role, text });
-    this.emit('message', { id, role, text });
+    this.emit('message', { id, role, text, ts: new Date().toISOString() });
     return id;
   };
   appendTo = (id: number, chunk: string): void => {
@@ -215,7 +215,7 @@ export class AgentHost extends EventEmitter {
       // 最终答案阶段：文字写入「答案气泡」（惰性创建并绑定当前思考轮次 id）
       if (this.finalBubbleId === null) {
         this.finalBubbleId = this.msgId++;
-        const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: '', thinkingId: this.curTurnId };
+        const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: '', thinkingId: this.curTurnId, ts: new Date().toISOString() };
         this.messages.push(m);
         this.emit('message', m);
       }
@@ -265,7 +265,7 @@ export class AgentHost extends EventEmitter {
       existing.text += (existing.text ? '\n' : '') + fullText;
       this.emitUpdate(existing.id, existing.text);
     } else {
-      const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: fullText, thinkingId: this.curTurnId };
+      const m: UiMessage = { id: this.finalBubbleId, role: 'assistant', text: fullText, thinkingId: this.curTurnId, ts: new Date().toISOString() };
       this.messages.push(m);
       this.emit('message', m);
     }
