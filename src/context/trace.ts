@@ -102,6 +102,8 @@ export class TraceLogger {
   private _buf: string[] = [];
   private _flushTimer: ReturnType<typeof setTimeout> | null = null;
   private _flushing = false;
+  /** 当前进行中的 flush Promise：并发 flush（显式调用 vs 500ms 定时器）等待同一写操作，避免竞态丢数据 */
+  private _flushPromise: Promise<void> | null = null;
   private static readonly FLUSH_INTERVAL_MS = 500;
   private static readonly FLUSH_THRESHOLD = 20; // 攒满 20 条自动刷
 
@@ -118,19 +120,36 @@ export class TraceLogger {
   }
 
   /** 刷出缓冲区中所有待写入事件到文件 */
+  /**
+   * 刷出缓冲区中所有待写入事件到文件。
+   * 强一致：循环直至缓冲清空；若已有刷盘在进行，等待其完成后再检查——
+   * 这样显式 `await flush()`（如切任务前强制落盘）不会与 500ms 定时器竞态丢数据，
+   * 调用方 await 返回后即可保证缓冲已落盘。
+   */
   async flush(): Promise<void> {
-    if (this._flushing || this._buf.length === 0) return;
-    this._flushing = true;
-    this._clearFlushTimer();
-    const lines = this._buf.join('');
-    this._buf = [];
-    try {
-      await this.ensureDir();
-      await writeFile(this.filePath, lines, { flag: 'a', mode: 0o600 });
-    } catch {
-      /* 文件写入失败不阻塞主流程 */
+    while (this._buf.length > 0) {
+      if (this._flushing) {
+        await this._flushPromise;
+        continue; // 当前刷盘结束后再看缓冲是否又有新增
+      }
+      this._flushing = true;
+      this._clearFlushTimer();
+      const lines = this._buf.join('');
+      this._buf = [];
+      const p = (async () => {
+        try {
+          await this.ensureDir();
+          await writeFile(this.filePath, lines, { flag: 'a', mode: 0o600 });
+        } catch {
+          /* 文件写入失败不阻塞主流程 */
+        } finally {
+          this._flushing = false;
+        }
+      })();
+      this._flushPromise = p;
+      await p;
     }
-    this._flushing = false;
+    this._flushPromise = null;
   }
 
   private _clearFlushTimer(): void {

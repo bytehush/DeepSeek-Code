@@ -445,6 +445,24 @@ wss.on('connection', (ws, req) => {
   }
 
   /**
+   * 收口断链①（状态↔数据 500ms 缓冲）：丢弃当前 host 前，先把它仍在缓冲里的 trace 强制落盘，
+   * 否则随后 replayAll 会从「落后最新若干事件」的磁盘重建出截断历史。
+   * - 先 abort 让 agent 循环停止继续 emit；
+   * - 第一次 flush 写出回合主体事件；abort 收尾（gen_interrupted / thinking_end 等）是异步 emit，
+   *   稍候 30ms 再 flush 一次兜底，确保切任务前磁盘与内存态一致。
+   */
+  async function discardHost(): Promise<void> {
+    if (!host) return;
+    host.abort();
+    if (host.props.traceLogger) {
+      await host.props.traceLogger.flush();
+      await new Promise((r) => setTimeout(r, 30));
+      await host.props.traceLogger.flush();
+    }
+    host = null;
+  }
+
+  /**
    * 装配并启动某任务的内核：清空对话区 → 校验 Key/隔离 → 装配内核（工作区=当前工作空间）
    * → 有历史则 replay，否则欢迎语。供 switch_task 与 set_settings（工作空间变更后即时生效）复用。
    */
@@ -453,8 +471,7 @@ wss.on('connection', (ws, req) => {
     const meta = await taskStore.get(id);
     if (!meta) return;
     activeTaskId = id;
-    host?.abort();
-    host = null;
+    await discardHost();
     await sendTaskList();
     // 先解析历史（含思考轮次），让 reset 原子携带 thinkings —— 切回任务时思考盒由 reset 一次性恢复，
     // 不再依赖「清空后再等 thinking 事件重发」的脆弱链路（断点①修复）。
@@ -837,8 +854,7 @@ wss.on('connection', (ws, req) => {
       if (msg.token) await revokeToken(String(msg.token)).catch(() => {});
       authed = false;
       username = null;
-      host?.abort();
-      host = null;
+      await discardHost();
       taskStore = null;
       activeTaskId = null;
       return;
@@ -863,8 +879,7 @@ wss.on('connection', (ws, req) => {
       }
       await saveUserCredentials(username, nc).catch(() => {});
       resetKernelsForUser(username);
-      if (host) host.abort();
-      host = null;
+      await discardHost();
       fwd('key_ok');
       void bootWithUser(username);
       return;
@@ -888,8 +903,7 @@ wss.on('connection', (ws, req) => {
       const goal = String(msg.goal ?? '').slice(0, 200);
       const id = await taskStore.create(title, goal);
       activeTaskId = id;
-      host?.abort();
-      host = null;
+      await discardHost();
       await sendTaskList();
       pushReset(); // 新任务：先清空对话区，避免残留上一个任务的记录
       // 若已配 Key 则装配内核开始对话；否则只在对话区提醒
@@ -924,8 +938,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
       activeTaskId = newId;
-      host?.abort();
-      host = null;
+      await discardHost();
       await sendTaskList();
       pushReset(); // 复制出的新任务从空白上下文开始，先清空对话区
       const creds = await loadUserCredentials(username);
