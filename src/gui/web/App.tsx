@@ -329,6 +329,9 @@ export function App() {
   /** 前端消息+思考过程缓存：按任务 ID 存最近一次快照（消息数组 + 思考盒条目）。
    *  切换任务时直接取缓存 → 秒开无加载延迟，且思考过程不丢。 */
   const messagesCacheRef = useRef<Map<string, { messages: UiMessage[]; thinkings: ThinkingTurn[] }>>(new Map());
+  // 前端唯一消息序号：服务端 msg.id 在多次 boot（每个 AgentHost 实例各自从 0 计数）时会重复，
+  // 导致 React key 冲突（对话区空白）与 serverId 匹配错配。前端为每条进入 state 的消息分配唯一 localId。
+  const localSeqRef = useRef(0);
   /** 当前激活任务 ID（从任务列表推导，用于缓存 key） */
   const activeTaskIdRef = useRef<string | null>(null);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -415,10 +418,17 @@ export function App() {
     if (pendingMsgText.current.size > 0) {
       const batch = pendingMsgText.current;
       pendingMsgText.current = new Map();
-      setMessages((m) => m.map((x) => {
-        const t = batch.get(x.id);
-        return t !== undefined ? { ...x, text: t } : x;
-      }));
+      setMessages((m) => {
+        // serverId 可能重叠：只更新「每个 serverId 在数组中最后出现」的那条，
+        // 避免把同 id 的历史消息也一起改写（首轮多次 boot 时 serverId 从 0 重复）。
+        const lastLocal = new Map<number, number>();
+        for (const x of m) if (batch.has(x.id)) lastLocal.set(x.id, x.localId ?? -1);
+        return m.map((x) => {
+          const t = batch.get(x.id);
+          if (t !== undefined && (x.localId ?? -1) === lastLocal.get(x.id)) return { ...x, text: t };
+          return x;
+        });
+      });
     }
     if (pendingThinkAppend.current.size > 0) {
       const batch = pendingThinkAppend.current;
@@ -502,7 +512,8 @@ export function App() {
           setLoadingBoot(false);
           break;
         case 'message': {
-          const newMsg: UiMessage = { id: msg.id, role: msg.role, text: msg.text, thinkingId: msg.thinkingId };
+          const lid = ++localSeqRef.current;
+          const newMsg: UiMessage = { id: msg.id, localId: lid, role: msg.role, text: msg.text, thinkingId: msg.thinkingId };
           setMessages((m) => [...m, newMsg]);
           // 同步缓存：回放/实时新增消息都累加到缓存，避免 thinking_end 用陈旧空 messages 覆盖，
           // 否则二次切回任务时 messages 缓存为空 → switchTask 走清空分支 → 历史与思考盒丢失。
@@ -563,13 +574,20 @@ export function App() {
           break;
         case 'gen_interrupted':
           // 用户中断：把对应答案气泡标记为「生成中断」（保留半截内容，仅加徽章）
-          setMessages((m) => m.map((x) => (x.id === msg.id ? { ...x, interrupted: true } : x)));
+          // serverId 可能重叠：只标记最后一条匹配的消息，避免误伤历史同 id 消息。
+          setMessages((m) => {
+            let target = -1;
+            for (let i = m.length - 1; i >= 0; i--) if (m[i].id === msg.id) { target = m[i].localId ?? -1; break; }
+            return m.map((x) => ((x.localId ?? -1) === target && target !== -1) ? { ...x, interrupted: true } : x);
+          });
           {
             const tid = activeTaskIdRef.current;
             if (tid) {
               const snap = messagesCacheRef.current.get(tid);
               const curMsgs = snap ? snap.messages : [];
-              const next = curMsgs.map((x) => (x.id === msg.id ? { ...x, interrupted: true } : x));
+              let target = -1;
+              for (let i = curMsgs.length - 1; i >= 0; i--) if (curMsgs[i].id === msg.id) { target = curMsgs[i].localId ?? -1; break; }
+              const next = curMsgs.map((x) => ((x.localId ?? -1) === target && target !== -1) ? { ...x, interrupted: true } : x);
               messagesCacheRef.current.set(tid, { messages: next, thinkings: snap?.thinkings ?? [] });
             }
           }
@@ -588,15 +606,18 @@ export function App() {
           break;
         case 'reset':
           clearPending();
-          setMessages(msg.messages ? (msg.messages.filter(Boolean) as UiMessage[]) : []);
+          // 为每条进入 state 的消息分配唯一 localId：服务端 reset 携带的历史消息其 serverId 可能重叠，
+          // 用 localId 作 React key 可避免首轮对话区空白（与 message handler 同一序号空间）。
+          const incomingReset = (msg.messages || []).filter(Boolean) as UiMessage[];
+          const resetMsgs = incomingReset.map((m) => ({ ...m, localId: ++localSeqRef.current }));
+          setMessages(resetMsgs);
           // 原子恢复思考盒：若 reset 携带 thinkings（服务端已从 trace 解析），整体恢复，
           // 不再依赖后续 thinking 事件重发（断点①修复：消除「清空后等重发」的脆弱链）。
           setThinkings(normalizeThinkings(msg.thinkings));
           setOutputting(false);
           {
-            const ms = msg.messages ? (msg.messages.filter(Boolean) as UiMessage[]) : [];
             const tid = activeTaskIdRef.current;
-            if (tid) messagesCacheRef.current.set(tid, { messages: ms, thinkings: normalizeThinkings(msg.thinkings) });
+            if (tid) messagesCacheRef.current.set(tid, { messages: resetMsgs, thinkings: normalizeThinkings(msg.thinkings) });
           }
           break;
         case 'state':

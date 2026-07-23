@@ -389,7 +389,7 @@ function ChatAreaInner({ messages, busy, outputting, thinkings, onToggleThinking
             const thinking = typeof m.thinkingId === 'number' ? thinkings.find((t) => t.turnId === m.thinkingId) : undefined;
             return (
               <AssistantRow
-                key={m.id}
+                key={m.localId ?? m.id}
                 message={m}
                 outputting={outputting}
                 busy={busy}
@@ -399,10 +399,10 @@ function ChatAreaInner({ messages, busy, outputting, thinkings, onToggleThinking
             );
           }
           if (m.role === 'user') {
-            return <UserRow key={m.id} message={m} userName={userName} userInitial={userInitial} />;
+            return <UserRow key={m.localId ?? m.id} message={m} userName={userName} userInitial={userInitial} />;
           }
           // system / tool / error：居中轻量提示条
-          return <NoteRow key={m.id} message={m} />;
+          return <NoteRow key={m.localId ?? m.id} message={m} />;
         })}
         {/* 实时活跃思考轮（答案气泡尚未创建）→ 底部独立卡，思考中/输出中态 */}
         {liveTurn && (
