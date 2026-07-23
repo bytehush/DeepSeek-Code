@@ -92,6 +92,11 @@ export function extractArguments(raw: unknown): ExtractResult {
   if (raw === null || raw === undefined) {
     return { ok: false, error: 'arguments 为 null/undefined' };
   }
+  // 已是解析后的对象/数组（兼容 ToolCallRequest.rawArguments 为 Record 的契约变体）：
+  // 直接返回，避免 String(obj) 得到 "[object Object]" 后解析失败。
+  if (typeof raw === 'object' && raw !== null) {
+    return { ok: true, value: raw };
+  }
   const text = String(raw).trim();
   if (text === '') return { ok: true, value: {} }; // 无参工具
 
@@ -112,13 +117,60 @@ export function extractArguments(raw: unknown): ExtractResult {
     }
   }
 
-  // 3. 容错修复：去尾随逗号 + 补缺失右括号
+  // 3. B3 根因修复：LLM 常在大型多行 content 里把换行/制表符直接写进 JSON 字符串
+  //    （未转义），导致 JSON.parse 失败 → 整段参数被拒（"参数校验失败"）。
+  //    在字符串字面量内把这些未转义控制字符转成合法 JSON 转义（\n \r \t 等）。
+  try {
+    return { ok: true, value: JSON.parse(escapeControlInStrings(text)) };
+  } catch {
+    /* fallthrough */
+  }
+
+  // 4. 容错修复：去尾随逗号 + 补缺失右括号，再转义控制字符
   const repaired = repair(text);
   try {
-    return { ok: true, value: JSON.parse(repaired) };
+    return { ok: true, value: JSON.parse(escapeControlInStrings(repaired)) };
   } catch (e) {
     return { ok: false, error: `无法解析 arguments: ${(e as Error).message}` };
   }
+}
+
+/**
+ * 在 JSON 字符串字面量内部，把未转义的控制字符（换行/回车/制表等）转成合法转义序列。
+ * 状态机扫描：仅在引号内、且非转义状态下转换；已转义的序列（如 \" \\n）原样保留。
+ * 这把 LLM 直接写进字符串的裸换行修正为 \n，JSON.parse 即可还原为真实换行字符。
+ */
+function escapeControlInStrings(s: string): string {
+  let out = '';
+  let inStr = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      out += ch;
+      inStr = !inStr;
+      continue;
+    }
+    if (inStr) {
+      const code = s.charCodeAt(i);
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+      if (code < 0x20) { out += '\\u' + code.toString(16).padStart(4, '0'); continue; }
+    }
+    out += ch;
+  }
+  return out;
 }
 
 function repair(s: string): string {

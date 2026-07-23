@@ -80,3 +80,27 @@ test('extractArguments: null/undefined 明确报错', () => {
   assert.equal(extractArguments(null).ok, false);
   assert.equal(extractArguments(undefined).ok, false);
 });
+
+test('extractArguments: 已是对象直接返回（兼容 Record 契约变体, B3）', () => {
+  const obj = { path: '/a', content: 'x' };
+  const r = extractArguments(obj);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value, obj);
+});
+
+test('extractArguments: 多行 content 未转义换行被容错解析（B3 根因修复）', () => {
+  // LLM 把裸换行直接写进 JSON 字符串（大型多行 content 常见），原实现 JSON.parse 失败
+  const raw = '{"content":"line1\nline2\nline3"}';
+  const r = extractArguments(raw);
+  assert.equal(r.ok, true);
+  assert.equal((r.value as { content: string }).content, 'line1\nline2\nline3');
+});
+
+test('extractArguments: 多行 + 尾随逗号组合也能修复（B3）', () => {
+  const raw = '{\n  "content": "a\nb\nc",\n  "path": "/x",\n}';
+  const r = extractArguments(raw);
+  assert.equal(r.ok, true);
+  assert.equal((r.value as { content: string }).content, 'a\nb\nc');
+  assert.equal((r.value as { path: string }).path, '/x');
+});
+
