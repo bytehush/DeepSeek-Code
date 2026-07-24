@@ -12,9 +12,19 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+import { FileLock } from '../memory/lock.ts';
 
-const ACCOUNTS_PATH = path.resolve(homedir(), '.dsa', 'accounts.json');
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+const LOCK_TIMEOUT_MS = 10_000;
+
+// 使用函数而非模块加载时一次性计算：允许测试通过修改 process.env.HOME 指向临时目录，
+// 也避免 os.homedir() 缓存导致不同调用得到不同路径时出错。
+function accountsPath(): string {
+  return path.resolve(homedir(), '.dsa', 'accounts.json');
+}
+function accountsLockPath(): string {
+  return accountsPath() + '.lock';
+}
 
 interface AccountRecord {
   salt: string;
@@ -36,7 +46,7 @@ function emptyStore(): Store {
 
 async function readStore(): Promise<Store> {
   try {
-    const txt = await readFile(ACCOUNTS_PATH, 'utf8');
+    const txt = await readFile(accountsPath(), 'utf8');
     const s = JSON.parse(txt) as Partial<Store>;
     return { users: s.users ?? {}, sessions: s.sessions ?? {} };
   } catch {
@@ -45,8 +55,32 @@ async function readStore(): Promise<Store> {
 }
 
 async function writeStore(s: Store): Promise<void> {
-  await mkdir(path.dirname(ACCOUNTS_PATH), { recursive: true });
-  await writeFile(ACCOUNTS_PATH, JSON.stringify(s, null, 2), { mode: 0o600 });
+  const p = accountsPath();
+  await mkdir(path.dirname(p), { recursive: true });
+  await writeFile(p, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+/**
+ * 在进程锁保护下执行「读 store → 改 store → 写 store」。
+ * 持锁后强制重读磁盘，避免 GUI/CLI 多进程或同一进程内并发写覆盖。
+ */
+async function withStore<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+  const p = accountsPath();
+  // 先确保目录存在：FileLock 用 `wx` 原子创建锁文件，父目录缺失会 ENOENT
+  await mkdir(path.dirname(p), { recursive: true });
+  const lock = new FileLock(accountsLockPath(), 30_000);
+  const acquired = await lock.acquire(LOCK_TIMEOUT_MS);
+  if (!acquired) {
+    throw new Error(`accounts store lock timeout (${LOCK_TIMEOUT_MS}ms)`);
+  }
+  try {
+    const store = await readStore();
+    const result = await fn(store);
+    await writeStore(store);
+    return result;
+  } finally {
+    await lock.release();
+  }
 }
 
 // ── 密码哈希（scrypt，同步即可：登录/注册低频，不阻塞关键路径）──
@@ -83,52 +117,53 @@ export async function register(username: string, password: string): Promise<Regi
   if (uErr) return { ok: false, error: uErr };
   const pErr = validatePassword(password);
   if (pErr) return { ok: false, error: pErr };
-  const store = await readStore();
-  if (store.users[username]) return { ok: false, error: '该用户名已被注册' };
-  const { salt, hash } = hashPassword(password);
-  store.users[username] = { salt, hash, createdAt: Date.now() };
-  await writeStore(store);
-  return { ok: true };
+  return withStore(async (store) => {
+    if (store.users[username]) return { ok: false, error: '该用户名已被注册' };
+    const { salt, hash } = hashPassword(password);
+    store.users[username] = { salt, hash, createdAt: Date.now() };
+    return { ok: true };
+  });
 }
 
 export async function verify(username: string, password: string): Promise<boolean> {
-  const store = await readStore();
-  const rec = store.users[username];
-  // 防时序侧信道：用户名不存在时也执行一次 scrypt，使响应时间与存在用户的校验一致，
-  // 避免攻击者通过响应耗时差异枚举有效用户名。
-  const h = rec
-    ? scryptSync(password, rec.salt, 64)
-    : scryptSync(password, randomBytes(16).toString('hex'), 64);
-  if (!rec) return false;
-  const expected = Buffer.from(rec.hash, 'hex');
-  return h.length === expected.length && timingSafeEqual(h, expected);
+  return withStore(async (store) => {
+    const rec = store.users[username];
+    // 防时序侧信道：用户名不存在时也执行一次 scrypt，使响应时间与存在用户的校验一致，
+    // 避免攻击者通过响应耗时差异枚举有效用户名。
+    const h = rec
+      ? scryptSync(password, rec.salt, 64)
+      : scryptSync(password, randomBytes(16).toString('hex'), 64);
+    if (!rec) return false;
+    const expected = Buffer.from(rec.hash, 'hex');
+    return h.length === expected.length && timingSafeEqual(h, expected);
+  });
 }
 
 // ── 会话 token ──
 export async function issueToken(username: string): Promise<string> {
   const token = randomBytes(32).toString('hex');
-  const store = await readStore();
-  store.sessions[token] = { username, createdAt: Date.now() };
-  await writeStore(store);
+  await withStore(async (store) => {
+    store.sessions[token] = { username, createdAt: Date.now() };
+  });
   return token;
 }
 
 export async function verifyToken(token: string): Promise<string | null> {
-  const store = await readStore();
-  const s = store.sessions[token];
-  if (!s) return null;
-  if (Date.now() - s.createdAt > TOKEN_TTL_MS) {
-    delete store.sessions[token];
-    await writeStore(store).catch(() => {});
-    return null;
-  }
-  return s.username;
+  return withStore(async (store) => {
+    const s = store.sessions[token];
+    if (!s) return null;
+    if (Date.now() - s.createdAt > TOKEN_TTL_MS) {
+      delete store.sessions[token];
+      return null;
+    }
+    return s.username;
+  });
 }
 
 export async function revokeToken(token: string): Promise<void> {
-  const store = await readStore();
-  if (store.sessions[token]) {
-    delete store.sessions[token];
-    await writeStore(store).catch(() => {});
-  }
+  await withStore(async (store) => {
+    if (store.sessions[token]) {
+      delete store.sessions[token];
+    }
+  });
 }
