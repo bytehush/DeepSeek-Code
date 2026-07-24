@@ -71,3 +71,43 @@ export function clearActiveTask(): void {
 }
 
 export { TOKEN_KEY, ACTIVE_TASK_KEY };
+
+/**
+ * 探测 localStorage 是否真正可写。
+ * 隐私模式 / 沙箱 iframe（无 allow-same-origin）/ 存储被禁用时，setItem 会抛错，
+ * 导致 token 永远写不进去 —— 这正是「登录成功但刷新又回登录」的最隐蔽成因。
+ */
+export function isStorageAvailable(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const probe = '__dsa_probe__';
+    localStorage.setItem(probe, '1');
+    localStorage.removeItem(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 一次性迁移（幂等）：旧版把 token 存 sessionStorage，新版统一 localStorage。
+ * 若 localStorage 无 token 但 sessionStorage 残留旧 token，则迁过去并清掉旧副本，
+ * 避免「部署新构建后看起来没修复」（旧 token 仍躺在 sessionStorage 里、localStorage 为空）。
+ * 模块加载时自动执行一次。
+ */
+export function migrateLegacyToken(): void {
+  try {
+    if (typeof localStorage === 'undefined' || typeof sessionStorage === 'undefined') return;
+    if (localStorage.getItem(TOKEN_KEY)) return; // 已有新存储，无需迁移
+    const legacy = sessionStorage.getItem(TOKEN_KEY);
+    if (legacy) {
+      localStorage.setItem(TOKEN_KEY, legacy);
+      sessionStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+// 模块加载即执行一次迁移（浏览器页面加载时触发）
+migrateLegacyToken();

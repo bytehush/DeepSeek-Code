@@ -8,6 +8,8 @@ import {
   readActiveTask,
   writeActiveTask,
   clearActiveTask,
+  isStorageAvailable,
+  migrateLegacyToken,
 } from '../src/gui/web/authStorage.ts';
 
 /** 内存版 Storage mock（实现 getItem/setItem/removeItem 最小契约） */
@@ -123,5 +125,63 @@ test('localStorage 不存在（typeof 守卫）时 readToken/readActiveTask 返�
     assert.equal(readActiveTask(), null);
   } finally {
     (globalThis as { localStorage?: unknown }).localStorage = prev;
+  }
+});
+
+test('isStorageAvailable：localStorage 可写时返回 true', () => {
+  const local = makeStorage();
+  const restore = install(local, makeStorage());
+  try {
+    assert.equal(isStorageAvailable(), true);
+  } finally {
+    restore();
+  }
+});
+
+test('isStorageAvailable：localStorage.setItem 抛错（隐私模式/禁用）时返回 false', () => {
+  const throwing = {
+    map: new Map<string, string>(),
+    getItem() {
+      return null;
+    },
+    setItem() {
+      throw new Error('SecurityError');
+    },
+    removeItem() {},
+    clear() {},
+  };
+  const restore = install(throwing, makeStorage());
+  try {
+    assert.equal(isStorageAvailable(), false, '存储不可写应判定为不可用');
+  } finally {
+    restore();
+  }
+});
+
+test('migrateLegacyToken：localStorage 空且 sessionStorage 有旧 token 时迁入并清旧副本', () => {
+  const local = makeStorage();
+  const session = makeStorage();
+  session.setItem('dsa_token', 'legacy-session-token');
+  const restore = install(local, session);
+  try {
+    migrateLegacyToken();
+    assert.equal(local.getItem('dsa_token'), 'legacy-session-token', '旧 token 应迁入 localStorage');
+    assert.equal(session.getItem('dsa_token'), null, 'sessionStorage 旧副本应清除');
+  } finally {
+    restore();
+  }
+});
+
+test('migrateLegacyToken：localStorage 已有 token 时不覆盖（幂等）', () => {
+  const local = makeStorage();
+  const session = makeStorage();
+  local.setItem('dsa_token', 'already-local');
+  session.setItem('dsa_token', 'legacy-session-token');
+  const restore = install(local, session);
+  try {
+    migrateLegacyToken();
+    assert.equal(local.getItem('dsa_token'), 'already-local', '不应覆盖已有 localStorage token');
+  } finally {
+    restore();
   }
 });

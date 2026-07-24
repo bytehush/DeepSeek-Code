@@ -25,7 +25,7 @@ import { initBrowserTelemetry } from './telemetry.ts';
 import { ScrollFollowController } from './scrollFollow.ts';
 import type { BrowserTelemetryEvent } from '../telemetry-types.ts';
 // 登录态(token)与当前激活任务的持久化统一收口到 authStorage（均存 localStorage，保证刷新/关标签重开后仍登录并回到原对话）
-import { readToken, writeToken, clearToken, readActiveTask, writeActiveTask, clearActiveTask } from './authStorage.ts';
+import { readToken, writeToken, clearToken, readActiveTask, writeActiveTask, clearActiveTask, isStorageAvailable } from './authStorage.ts';
 
 interface ConnState {
   busy: boolean;
@@ -274,6 +274,11 @@ export function App() {
   const [authErr, setAuthErr] = useState<string | null>(null);
   /** 登录成功后等待服务端启动内核 + 推送任务列表的阶段 */
   const [loadingBoot, setLoadingBoot] = useState(false);
+  // 浏览器存储是否可写：隐私模式/沙箱 iframe/禁用存储时 localStorage.setItem 会抛错，
+  // 导致 token 永远写不进 → 「登录成功但刷新又回登录」。登录页据此给出可见告警。
+  const storageOk = useMemo(() => isStorageAvailable(), []);
+  // 刷新后自动登录(resume)的诊断状态：登录页可见展示，无需开 F12 即可定位「回登录」卡在哪一步。
+  const [resumeDiag, setResumeDiag] = useState<'idle' | 'sending' | 'ok' | 'rejected' | 'no-token'>('idle');
 
   // 主题：默认读 localStorage（index.html 的防闪烁脚本已提前设好 data-theme）
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -527,10 +532,18 @@ export function App() {
     ws.onopen = () => {
       setConnected(true);
       const t = readToken();
+      // [auth] 诊断：刷新后是否带着 token 发出 resume，是判断「回登录」卡在哪一步的关键
+      console.log('[auth] ws open · storage可用=', storageOk, '· token存在=', !!t, '· 发送resume=', !!t, '· origin=', location.origin);
       if (t) {
+        setResumeDiag('sending');
         // 刷新/重连时把「上次激活的任务」带回，让服务端直接 boot 该任务（恢复含思考盒的历史）
         const threadId = readActiveTask() ?? undefined;
         ws.send(JSON.stringify({ type: 'resume', token: t, threadId }));
+      } else {
+        setResumeDiag('no-token');
+        if (!storageOk) {
+          console.warn('[auth] localStorage 不可写，token 无法持久化 → 刷新必回登录（环境/隐私模式问题）');
+        }
       }
     };
     ws.onclose = () => {
@@ -558,6 +571,8 @@ export function App() {
       }
       switch (msg.type) {
         case 'auth_ok':
+          console.log('[auth] auth_ok 收到，username=', (msg as { username?: string }).username, '· token已写入localStorage=', !!msg.token);
+          setResumeDiag('ok');
           writeToken(msg.token);
           setToken(msg.token);
           setUsername(msg.username);
@@ -568,6 +583,8 @@ export function App() {
           loadFileTree('');
           break;
         case 'auth_error':
+          console.warn('[auth] auth_error 收到：', (msg as { message?: string }).message);
+          setResumeDiag('rejected');
           setAuthErr(msg.message);
           setView('login');
           setLoadingBoot(false);
@@ -1399,6 +1416,36 @@ export function App() {
             </button>
           </div>
           {authErr && <div className="modal-error">{authErr}</div>}
+          {!storageOk && (
+            <div className="modal-error" style={{ background: '#fff3cd', color: '#856404', borderColor: '#ffe69c' }}>
+              浏览器存储(localStorage)不可用：登录态无法在刷新后保持。请关闭无痕/隐私窗口，或检查站点「存储」权限后重试。
+            </div>
+          )}
+          {/* 刷新回登录·可见诊断（无需开 F12）：显示当前访问来源/origin、存储可用性、本地登录态、resume 结果 */}
+          <div
+            className="auth-diag"
+            style={{ marginTop: 10, fontSize: 12, lineHeight: 1.6, color: '#666', background: '#f6f6f6', border: '1px solid #e3e3e3', borderRadius: 6, padding: '8px 10px', fontFamily: 'monospace' }}
+          >
+            <div>诊断 · 刷新回登录排查</div>
+            <div>来源 origin: <b>{typeof location !== 'undefined' ? location.origin : 'n/a'}</b>（localhost 与 127.0.0.1 的 localStorage 不互通）</div>
+            <div>存储可用: <b>{storageOk ? '是' : '否'}</b> · 本地登录态: <b>{readToken() ? '存在' : '缺失'}</b></div>
+            <div>
+              resume 状态:{' '}
+              <b>
+                {resumeDiag === 'idle' && '等待连接'}
+                {resumeDiag === 'sending' && '已发送，等待服务端确认'}
+                {resumeDiag === 'ok' && '成功（应自动进入）'}
+                {resumeDiag === 'no-token' && '未携带登录态→不发 resume（本地无 token）'}
+                {resumeDiag === 'rejected' && '被服务端拒绝（见上方错误）'}
+              </b>
+            </div>
+            {storageOk && !readToken() && resumeDiag === 'no-token' && (
+              <div style={{ color: '#b00', marginTop: 4 }}>
+                → 本地无登录态：请用本地址登录一次（写进 localStorage），之后刷新即可保持；
+                {' '}若曾用旧版本/其他地址登录，旧 token 不在本 origin 下。
+              </div>
+            )}
+          </div>
           <form
             className="login-form"
             onSubmit={(e) => {
