@@ -24,6 +24,8 @@ import { AgentPrompt } from './AgentPrompt.tsx';
 import { initBrowserTelemetry } from './telemetry.ts';
 import { ScrollFollowController } from './scrollFollow.ts';
 import type { BrowserTelemetryEvent } from '../telemetry-types.ts';
+// 登录态(token)与当前激活任务的持久化统一收口到 authStorage（均存 localStorage，保证刷新/关标签重开后仍登录并回到原对话）
+import { readToken, writeToken, clearToken, readActiveTask, writeActiveTask, clearActiveTask } from './authStorage.ts';
 
 interface ConnState {
   busy: boolean;
@@ -214,8 +216,7 @@ const ROLE_COLOR: Record<MsgRole, string> = {
   error: '#c0392b',
 };
 
-const TOKEN_KEY = 'dsa_token';
-const ACTIVE_TASK_KEY = 'dsa_active_task'; // 当前激活任务 id：刷新后据此恢复「回到哪个对话」，思考内容本身由服务端磁盘持久化
+// token 与 ACTIVE_TASK_KEY 的存取已统一收口到 ./authStorage.ts（见顶部 import）
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -263,7 +264,7 @@ function messagesReducer(state: Record<string, UiMessage[]>, action: MsgAction):
 export function App() {
   const [view, setView] = useState<'login' | 'app'>('login');
   const [connected, setConnected] = useState(false);
-  const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
+  const [token, setToken] = useState<string | null>(() => readToken());
   const [username, setUsername] = useState<string | null>(null);
 
   // 登录/注册
@@ -525,11 +526,10 @@ export function App() {
     );
     ws.onopen = () => {
       setConnected(true);
-      const t = sessionStorage.getItem(TOKEN_KEY);
+      const t = readToken();
       if (t) {
         // 刷新/重连时把「上次激活的任务」带回，让服务端直接 boot 该任务（恢复含思考盒的历史）
-        let threadId: string | undefined;
-        try { threadId = localStorage.getItem(ACTIVE_TASK_KEY) ?? undefined; } catch { /* ignore */ }
+        const threadId = readActiveTask() ?? undefined;
         ws.send(JSON.stringify({ type: 'resume', token: t, threadId }));
       }
     };
@@ -558,7 +558,7 @@ export function App() {
       }
       switch (msg.type) {
         case 'auth_ok':
-          sessionStorage.setItem(TOKEN_KEY, msg.token);
+          writeToken(msg.token);
           setToken(msg.token);
           setUsername(msg.username);
           setView('app');
@@ -1220,7 +1220,7 @@ export function App() {
     if (ws && ws.readyState === WebSocket.OPEN && token) {
       ws.send(JSON.stringify({ type: 'logout', token }));
     }
-    sessionStorage.removeItem(TOKEN_KEY);
+    clearToken();
     setToken(null);
     setUsername(null);
     setView('login');
@@ -1293,7 +1293,7 @@ export function App() {
     setArtifacts([]);
     if (isMobile) setMobilePanel('main');
     // 持久化当前激活任务：刷新/重连后据此恢复「回到哪个对话」（不存思考内容本身，避免与服务端磁盘分叉）
-    try { localStorage.setItem(ACTIVE_TASK_KEY, id); } catch { /* 隐私模式忽略写入失败 */ }
+    writeActiveTask(id);
     wsSend(JSON.stringify({ type: 'switch_task', id }));
   };
 
@@ -1310,7 +1310,7 @@ export function App() {
     setMessages(() => [], id); // 删除任务时清掉该任务在全局消息映射里的记录
     if (activeTaskIdRef.current === id) {
       applyActiveThread(null);
-      try { localStorage.removeItem(ACTIVE_TASK_KEY); } catch { /* ignore */ }
+      clearActiveTask();
     }
     wsSend(JSON.stringify({ type: 'delete_task', id }));
   };
