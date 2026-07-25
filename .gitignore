@@ -12,3 +12,6 @@ dist/
 
 # 运行时用户偏好配置
 .dsa/output-style.json
+
+# Vite 构建临时文件（构建过程残留，非源码）
+vite.config.ts.timestamp-*.mjs
