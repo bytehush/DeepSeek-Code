@@ -7,10 +7,11 @@
 ## 功能概览
 
 - **直连官方 API**：无中转、无代理，密钥只保存在本地。
-- **双模型策略**：主循环用 `deepseek-v4-flash` 做工具调度（快、省），复杂分析用 `deepseek-v4-pro` 做深度推理。
+- **双模型路由**：主循环用 `deepseek-v4-flash`（非思考模式，负责工具调度，快、省）；审查 / 审计 / 术语 / 项目发现 / 提交信息 / 深度生成 / 校验等复合分析统一走推理模型 `deepseek-v4-pro`（思考模式，深度推理）。
 - **全中文交互**：对话、提交信息、代码审查、依赖审计均为中文。
-- **CLI + Web 双界面**：终端里跑，或开网页用（三栏式、账户登录、多任务）。
+- **CLI + Web 双界面**：终端里跑，或开网页用（账户登录、多任务线程、实时流式渲染）。
 - **会话持久化**：对话以 JSONL 记录，可 `/resume` 恢复；Web 端按任务线程隔离。
+- **实时流式渲染（Web）**：助手回答与思考过程逐字呈现，界面实时更新；思考盒（思考过程）随 trace 落盘，刷新页面后仍可恢复，无需前端缓存。
 - **权限三模式**：`explore`（只读）/ `ask`（需确认）/ `execute`（自动执行），文件写操作默认展示 diff 再确认。
 - **Plan Mode**：先输出执行步骤，确认后再动手。
 - **成本可视**：`/cost` 查看累计 token 与费用估算。
@@ -49,10 +50,10 @@ REASONER_MODEL_ID=deepseek-v4-pro
 |------|------|
 | `DEEPSEEK_API_KEY` | 在 [platform.deepseek.com](https://platform.deepseek.com) 获取 |
 | `DEEPSEEK_BASE_URL` | API 地址，默认 `https://api.deepseek.com` |
-| `MODEL_ID` | 主循环模型（非思考模式，负责工具调度）|
-| `REASONER_MODEL_ID` | 复合工具（审查 / 审计 / 术语 / 项目发现 / 提交信息）使用的推理模型；不配置时回退到主模型 |
+| `MODEL_ID` | 主循环模型（非思考模式，负责工具调度），默认 `deepseek-v4-flash` |
+| `REASONER_MODEL_ID` | 复合工具（审查 / 审计 / 术语 / 项目发现 / 提交信息 / 深度生成 / 校验）使用的推理模型，默认 `deepseek-v4-pro`；不配置时回退到该固定模型 |
 
-> `.env` 已被 `.gitignore` 排除，不会误提交。DeepSeek V4 旧别名 `deepseek-chat` / `deepseek-reasoner` 已弃用，请使用上述 V4 模型名。
+> `.env` 已被 `.gitignore` 排除，不会误提交。DeepSeek V4 旧别名 `deepseek-chat` / `deepseek-reasoner` 目前仍可识别（过渡期兼容），但建议统一使用上述 V4 模型名。
 
 **方式 B：Web GUI（设置里填）**
 
@@ -73,10 +74,11 @@ npm start
 npm run web
 ```
 
-首次会先构建前端再启动服务，打开 **http://localhost:4173**。
+首次会先构建前端再启动服务，打开 **http://localhost:4173**（仅绑定本机 `127.0.0.1`）。
 
-- **账户**：首次用任意用户名 + 密码注册（密码用 scrypt 哈希存本机 `~/.dsa/accounts.json`，不存明文）；登录后签发 30 天有效 token，刷新可免登录。
-- **多任务**：每个账户可新建 / 切换 / 删除多个任务线程，互不干扰。
+- **账户**：首次用任意用户名 + 密码注册（密码用 scrypt 哈希存本机 `~/.dsa/accounts.json`，不存明文）；登录后签发 30 天有效 token 并存于浏览器 localStorage，刷新可免登录。
+- **实时流式渲染**：助手回答与思考过程逐字呈现，界面实时更新；思考盒（思考过程）随 trace 落盘，刷新页面后仍可恢复，无需前端缓存。
+- **多任务与隔离**：每个账户可新建 / 切换 / 删除 / 复制多个任务线程，互不干扰；每个任务独立 host 实例，事件按 `taskId` 路由，切换任务不串流。
 - **换端口**：设置环境变量 `DSA_WEB_PORT`（如 `DSA_WEB_PORT=4199 npm run web`）。
 - **数据隔离**：每个账户的数据落在 `~/.dsa/users/<用户名>/`（任务 / 历史 / 记忆 / 日志），互不可见。
 
@@ -84,27 +86,34 @@ npm run web
 
 | 命令 | 作用 |
 |------|------|
-| `/help` | 显示帮助 |
+| `/help` 或 `?` | 显示帮助面板 |
 | `/mode explore\|ask\|execute` | 切换权限模式 |
-| `/plan` | 进入规划模式（先输出步骤，确认后再执行）|
-| `/resume` | 从最近会话恢复上下文 |
+| `/plan` | 开 / 关规划模式（只输出计划不执行）|
+| `/style human\|professional\|raw` | 切换最终答复风格（人话 / 专业语言 / 原始），持久化到 `.dsa/output-style.json` |
+| `/polish` | 按当前风格润色上一条 Agent 回复 |
 | `/cost` | 查看累计 token 用量与费用估算 |
 | `/clear` | 清空对话上下文 |
-| `/skills` | 查看可用技能与管理全局技能白名单 |
-| `/history [关键字]` | 历史对话可视化面板（KPI + 图表 + 可筛选会话列表）|
-| `/style human\|professional\|raw` | 切换最终答复风格（人话 / 专业 / 原始），持久化到 `.dsa/output-style.json` |
-| `/polish` | 按当前风格润色上一条 Agent 回复 |
-| `/exit` | 退出 |
+| `/compact [n]` | 手动压缩上下文（保留最近 n 轮，默认 5；超预算也会自动压缩）|
+| `/watch` | 切换浏览器观察回灌（开 → 每轮后等待浏览器报错并自动续跑调试循环）|
+| `/set-key` 或 `/login` | 更换 API Key（保存后下次启动生效）|
+| `/memory add\|fact\|list\|forget` | 管理跨会话记忆 |
+| `/dream` | 整理记忆库（去除过期 / 矛盾 / 冗余，需 API Key）|
+| `/rollback [n]` | 回退最近 n 次文件变更（默认 1；仅当前工作目录）|
+| `/resume` | 从最近一次会话断点续跑（恢复历史 + 已落盘文件清单）|
+| `/skills list\|allow\|disallow\|clear\|all` | 查看与调整全局技能白名单 |
+| `/exit` 或 `/quit` | 退出（收尾记忆抽取 + 体检）|
+
+> 键盘快捷键：`←`（左方向键）打开会话 / 历史面板；`Ctrl+C` 中断当前思考 / 工具执行；`PageUp` / `PageDown` 翻页查看历史消息；`Ctrl+End` 跳回最新消息。
 
 > 想了解每个命令的具体行为，见 [docs/commands.md](./docs/commands.md)。
 
-### 历史对话可视化（`/history`）
+### 会话 / 历史面板（`←`）
 
-在终端里直接看你的对话历史，无需离开 TUI：
+在终端里按 `←`（左方向键）直接打开会话 / 历史面板，无需离开 TUI：
 
 - **数据来源**：本项目的聊天记录 `<cwd>/.dsa/traces/*.jsonl`（每个文件一个会话）+ 子 Agent 存档 `<cwd>/.dsa/sessions/*.json`。
-- **面板内容**：顶部 KPI（会话数 / 消息数 / 模型数 / 时间跨度）；四张条形图（按模型、权限模式、状态、近 14 天）；可筛选会话列表。
-- **交互**：输入关键字实时筛选；`Enter` 载入选中会话为后续上下文；`Esc` / `←` 返回；聊天视图下按 `h` 也可进入。
+- **面板内容**：顶部 KPI（总会话 / 消息总数 / 模型数 / 时间跨度）；四张条形图（按模型、权限模式、状态、近 14 天）；可筛选会话列表，当前会话高亮为「● 当前」。
+- **交互**：输入关键字实时筛选（匹配标题 / 目录 / 模型 / 权限模式）；`↑` `↓` 浏览；`Enter` 载入选中会话并返回；`Esc` / `←` 返回。
 
 ### 输出风格（`/style`）
 
@@ -116,13 +125,12 @@ npm run web
 
 ## 工具一览
 
-内置 20+ 工具，按类别列出常用项（复合工具会自动调用内部子步骤，无需手动触发）：
+内置 24 个工具，按类别列出常用项（复合工具会自动调用内部子步骤，无需手动触发）：
 
 **文件与目录**
 
 - `read_file` — 读取文件（支持 `offset` / `limit`）
-- `create_file` — 新建文件
-- `write_file` — 写入 / 覆盖文件
+- `write_file` — 写入 / 覆盖文件（`create_file` 为其向后兼容别名）
 - `edit_file` — 字符串替换修改（写前展示 diff 确认）
 - `delete_file` — 删除文件（需确认）
 - `ensure_dir` — 创建目录
@@ -144,7 +152,7 @@ npm run web
 - `git_diff` — 查看改动
 - `git_commit_msg` — 根据 diff 生成中文提交信息
 
-**中文分析与校验**
+**中文分析与校验**（统一走推理模型 `deepseek-v4-pro`）
 
 - `review_code` — 中文代码审查（风险等级 + 逐条建议）
 - `audit_dependencies` — 中文依赖安全审计（漏洞 / 恶意包 / 升级建议）
@@ -154,8 +162,9 @@ npm run web
 - `verify_answer` — 回答验证
 - `deep_gen` — 深度生成
 
-**委派与技能**
+**交互与委派**
 
+- `awaitUser` — 执行中向用户提问，等待回复后再继续
 - `delegate` — 派发子 Agent 执行独立子任务（上下文隔离），结果回灌主对话
 - `use_skill` — 按名称加载技能完整指引
 
@@ -169,26 +178,33 @@ npm run web
 
 ```
 src/
-  cli/        CLI 交互层（REPL、Markdown、配置、成本、auth）
-  gui/        网页后端（HTTP 静态服务 + WebSocket 桥接、账户、多任务）
-  gui/web/    网页前端（React + Vite）
-  app/        CLI / Web 共用内核装配与类型
-  agent/      Agent 运行时（主循环、Plan Mode、Reflection、子 Agent）
-  llm/        DeepSeek API 封装（流式、双模型路由、tool_calls）
-  tools/      工具实现 + 安全 / 护栏
-  context/    多轮历史、上下文压缩、JSONL trace
-  memory/     记忆层（本地向量检索）
-  skills/     技能加载器
-  mcp/        MCP 客户端（stdio + Streamable HTTP）
+  cli/         CLI 交互层（REPL、Markdown、配置、成本、auth、会话面板）
+  gui/         网页后端（HTTP 静态服务 + WebSocket 桥接、账户、多任务、按 taskId 路由）
+  gui/web/     网页前端（React + Vite）
+  app/         CLI / Web 共用内核装配与类型
+  agent/       Agent 运行时（主循环、Plan Mode、Reflection、子 Agent、输出风格）
+  llm/         DeepSeek API 封装（流式、双模型路由、tool_calls、定价）
+  tools/       工具实现 + 安全 / 护栏
+  context/     多轮历史、上下文压缩、JSONL trace
+  history/     会话 / 历史面板（终端可视化）
+  memory/      记忆层（本地向量检索 / embedder）
+  auth/        账户与凭证（scrypt 哈希、token 签发）
+  permission/  三模式权限控制
+  review/      审查 / 反思编排
+  skills/      技能加载器
+  mcp/         MCP 客户端（stdio + Streamable HTTP）
+  utils/       通用工具
 ```
 
 ## 开发
 
 ```bash
-npm run typecheck   # TypeScript strict 类型检查
-npm test            # 单元测试（node:test，零依赖）
-npm run eval:check  # 评测集结构静态校验（无需 API key）
-npm run dev         # 以 watch 模式启动 CLI（开发用）
+npm run typecheck        # TypeScript strict 类型检查
+npm test                 # 单元测试（node:test，零依赖）
+npm run eval:check       # 评测集结构静态校验（无需 API key）
+npm run dev              # 以 watch 模式启动 CLI（开发用）
+npm run check:mcp        # 检查 MCP 连接配置
+npm run check:providers  # 检查模型 provider 配置
 ```
 
 - 类型检查开启 `strict`，无显式 `any`。
