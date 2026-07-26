@@ -73,7 +73,8 @@ export const REVIEW_JSON_SCHEMA: JsonSchemaDef = {
           properties: {
             severity: { type: 'string', enum: ['high', 'medium', 'low'] },
             file: { type: 'string' },
-            line: { type: ['number', 'null'] },
+            // strict 模式不支持 type:['number','null']（数组 type 与 null 均非法），用 anyOf 表达可空
+            line: { anyOf: [{ type: 'number' }, { type: 'null' }] },
             summary: { type: 'string' },
             detail: { type: 'string' },
             suggestion: { type: 'string' },

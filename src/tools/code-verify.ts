@@ -73,7 +73,8 @@ export const VERIFY_CODE_JSON_SCHEMA: JsonSchemaDef = {
           type: 'object',
           properties: {
             severity: { type: 'string', enum: ['high', 'medium', 'low'] },
-            line: { type: ['number', 'null'] },
+            // strict 模式不支持 type:['number','null']（数组 type 与 null 均非法），用 anyOf 表达可空
+            line: { anyOf: [{ type: 'number' }, { type: 'null' }] },
             problem: { type: 'string' },
             fix: { type: 'string' },
           },
