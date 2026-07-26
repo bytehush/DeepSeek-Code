@@ -9,6 +9,7 @@ import { MarkdownMessage } from './Markdown.tsx';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
 import { styleLabel } from '../agent/output-style.ts';
+import { getMode, modeLabel } from '../agent/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
 import { runExtraction } from '../app/chat.ts';
@@ -33,6 +34,11 @@ function Banner(props: { version: string; primaryModel: string; reasonerModel?: 
         ) : (
           <Text color="#7ec699">{props.primaryModel}</Text>
         )}
+        <Text>
+          <Text color="#7ec699">/model</Text>
+          <Text dimColor> 当前：</Text>
+          <Text color="#7ec8e3">{modeLabel(getMode())}</Text>
+        </Text>
         <Text dimColor>{cwdShow}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={1} flexBasis={0}>
@@ -59,6 +65,10 @@ function Banner(props: { version: string; primaryModel: string; reasonerModel?: 
         <Text>
           <Text color="#7ec699">Safety</Text>
           <Text dimColor>: 已自动拦截 taskkill</Text>
+        </Text>
+        <Text>
+          <Text color="#7ec699">/model</Text>
+          <Text dimColor> flash|pro -&gt; 切换推理模型</Text>
         </Text>
         <Text>
           <Text color="#7ec8e3">/cost</Text>

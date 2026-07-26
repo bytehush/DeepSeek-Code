@@ -21,6 +21,7 @@ import { runAgent, type AgentEvent, type PermissionMode } from '../agent/loop.ts
 import type { StreamErrorCategory } from '../llm/deepseek.ts';
 import type { OutputStyle } from '../agent/output-style.ts';
 import { styleLabel, styleInstruction, parseStyle, saveStyle } from '../agent/output-style.ts';
+import { getMode, setMode, parseMode, modeLabel } from '../agent/model-mode.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
 import { MEMORY_RECALL_MARKER } from '../memory/pipeline.ts';
@@ -101,7 +102,8 @@ const SHORTCUTS = [
   '命令：',
   '  /mode explore|ask|execute   切换权限模式',
   '  /plan                       开/关规划模式（只输出计划不执行）',
-  '  /style human|pro|raw      切换最终答复风格（人话/专业语言/原始）',
+  '  /style human|professional|raw   切换最终答复风格（人话/专业语言/原始）',
+  '  /model flash|pro         切换主推理模型：Flash（日常/轻量）| PRO（开发/严肃工程）',
   '  /polish                     按当前风格润色上一条回复',
   '  /cost                       显示累计用量与费用',
   '  /clear                      清空对话上下文',
@@ -324,6 +326,26 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
         ctx.setOutputStyle(s);
         saveStyle(ctx.cwd, s);
         ctx.push('system', `输出风格已切换为：${styleLabel(s)}`);
+      }
+    }
+    return true;
+  }
+  if (text === '/model' || text.startsWith('/model ')) {
+    const arg = text.slice('/model'.length).trim();
+    const cur = getMode();
+    if (!arg) {
+      ctx.push('system',
+        `当前模型模式：${modeLabel(cur)}\n` +
+        `  /model flash   日常/轻量：快速问答、解释代码、简单改错、跑命令看输出、成本敏感多轮（不触发强推理）\n` +
+        `  /model pro     开发/严肃工程：架构设计、跨文件重构、深度审查、依赖审计、多步规划、需深度推理的生成（触发强推理）\n` +
+        `  提示：coding agent 里几乎所有事都是开发，「日常」指轻量交互而非「非开发」；拿不准要深度就切 pro。`);
+    } else {
+      const m = parseMode(arg);
+      if (!m) {
+        ctx.push('system', '用法：/model flash | pro');
+      } else {
+        setMode(ctx.cwd, m);
+        ctx.push('system', `模型模式已切换为：${modeLabel(m)}`);
       }
     }
     return true;
