@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { fetchSSE, type FetchSSEResult, type SSEErrorKind, SSEHttpError } from './sse';
+import { getMode } from '../agent/model-mode.ts';
 
 /** 错误提取：unknown 收窄为可读信息（供 catch 块统一使用） */
 export function errMsg(e: unknown): string {
@@ -199,15 +200,24 @@ export class DeepSeekClient {
     return this.model;
   }
 
-  /** 获取推理模型名称（用于复合工具的深度分析） */
-  get reasoningModel(): string {
-    return this.reasonerModel;
+  /**
+   * 当前模式实际使用的模型身份。
+   * flash → 主模型（deepseek-v4-flash）；pro → 推理模型（deepseek-v4-pro）。
+   * 由 model-mode 模块的用户手动切换决定，取代早期自动路由。
+   */
+  private activeModel(): string {
+    return getMode() === 'pro' ? this.reasonerModel : this.model;
+  }
+
+  /** 当前模式实际模型的展示名（供工具输出标签使用，避免硬编码推理模型）。 */
+  get activeModelId(): string {
+    return this.activeModel();
   }
 
   async *streamChat(
     messages: ChatMessage[],
     tools: unknown[],
-    options?: { signal?: AbortSignal; timeoutMs?: number },
+    options?: { signal?: AbortSignal; timeoutMs?: number; modelOverride?: string },
   ): AsyncGenerator<StreamEvent> {
     // 流级总超时：覆盖「本次流式响应的整体生成时长」（默认 180s）。
     // 原生 EventSource / OpenAI SDK 的 timeout 仅控制 chunk 间读取超时，
@@ -338,13 +348,15 @@ export class DeepSeekClient {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: this.model,
+        model: options?.modelOverride ?? this.activeModel(),
         messages: messages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
         tools: tools as unknown as OpenAI.Chat.ChatCompletionTool[],
         stream: true,
         temperature: 0.1,
         stream_options: { include_usage: true },
-        thinking: { type: 'disabled' }, // 等价于 SDK 的 extra_body.thinking（V4 关闭思考，规避 400 陷阱）
+        // 主循环始终关闭思考：规避 V4「思考+工具调用需回传 reasoning_content」的 400 陷阱。
+        // PRO 的「强推理」通过 pro 模型身份 + 复合工具 reasoning 体现，而非主循环开思考。
+        thinking: { type: 'disabled' },
       }),
       signal: options?.signal,
       connectTimeoutMs: 10_000, // 连接建立超时（仅「请求 → 响应头」），生成时长不在此限
@@ -387,7 +399,7 @@ export class DeepSeekClient {
    *
    * @param messages 对话消息
    * @param temperature 温度（分析任务默认 0.3；思考模式下该值被忽略，不影响结果）
-   * @param options.modelOverride 指定使用的模型（不传则用 reasonerModel，即 v4-pro）
+   * @param options.modelOverride 指定使用的模型（不传则跟随当前模式：flash→主模型 / pro→推理模型，见 model-mode）；显式值优先于模式
    * @param options.jsonMode 是否启用 JSON 结构化输出模式（基础约束：仅保证合法 JSON 对象）
    * @param options.jsonSchema 严格 JSON Schema 模式（高级约束：API 层锁定字段名/类型/枚举值）；
    *        与 jsonMode 互斥，优先级更高。格式见 JsonSchemaDef。
@@ -410,7 +422,12 @@ export class DeepSeekClient {
       timeoutMs?: number;
     },
   ): Promise<string> {
-    const useModel = options?.modelOverride ?? this.reasonerModel;
+    // 模式全权接管：默认跟随当前模式选模型；显式 modelOverride（如 history/memory
+    // 系统任务固定用 primaryModel）始终优先，不被模式带偏。
+    const useModel = options?.modelOverride ?? this.activeModel();
+    // 仅 PRO 模式启用思考（reasoning）；flash 模式即使调用方传了 reasoning 也关闭，
+    // 以忠实「Flash=不触发强推理」。effort 取调用方指定或默认 high。
+    const proMode = getMode() === 'pro';
     const effort = options?.reasoning?.effort ?? 'high';
     try {
       // 结构化输出优先级：jsonSchema > jsonMode > 无约束
@@ -426,7 +443,7 @@ export class DeepSeekClient {
         stream: false,
         temperature,
         ...(responseFormat ? { response_format: responseFormat } : {}),
-        ...(options?.reasoning ? { reasoning_effort: effort } : {}),
+        ...(proMode ? { reasoning_effort: effort } : {}),
       } as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
 
       const reqOptions = {
@@ -434,7 +451,7 @@ export class DeepSeekClient {
         // 子任务调用硬性超时兜底：与 streamChat 同理，避免复合工具/压缩摘要卡死主循环。
         timeout: options?.timeoutMs ?? 180_000,
         extra_body: {
-          thinking: options?.reasoning ? { type: 'enabled' as const } : { type: 'disabled' as const },
+          thinking: proMode ? { type: 'enabled' as const } : { type: 'disabled' as const },
         },
       } as OpenAI.RequestOptions;
 
