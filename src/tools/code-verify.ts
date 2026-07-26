@@ -179,13 +179,13 @@ export async function runCodeVerify(
         ran: true,
         pass: false,
         hasHigh: false,
-        rendered: `# 快速验证 (verify_code)\n文件: ${target} | 模型: ${client.reasoningModel}\n\n## 验证结果: FAIL\n[Pro 校验 JSON 解析失败，验证未完成，请人工复核]\n[错误: ${result.errors?.join('; ')}]`,
+        rendered: `# 快速验证 (verify_code)\n文件: ${target} | 模型: ${client.activeModelId}\n\n## 验证结果: FAIL\n[Pro 校验 JSON 解析失败，验证未完成，请人工复核]\n[错误: ${result.errors?.join('; ')}]`,
         inconclusive: true,
       };
     }
 
     const report = result.data!;
-    const rendered = renderVerifyMarkdown(report, target, client.reasoningModel);
+    const rendered = renderVerifyMarkdown(report, target, client.activeModelId);
     const hasHigh = (report.issues ?? []).some((i) => i.severity === 'high');
     return { ran: true, pass: report.pass, hasHigh, rendered, inconclusive: false };
   } catch {

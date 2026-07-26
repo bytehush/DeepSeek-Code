@@ -313,7 +313,6 @@ export function createProjectDiscoverTool(client: DeepSeekClient): ToolDef {
         ];
 
         const interpretation = await client.complete(msgs, 0.3, {
-          modelOverride: client.reasoningModel,
           reasoning: { effort: 'medium' },
           signal: ctx.signal,
           timeoutMs: 180_000,

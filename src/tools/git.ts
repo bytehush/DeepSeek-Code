@@ -169,7 +169,6 @@ export function createGitCommitMsgTool(client: DeepSeekClient): ToolDef {
       ];
       try {
         const commitMsg = await client.complete(msgs, 0.2, {
-          modelOverride: client.reasoningModel,
           reasoning: { effort: 'medium' },
           signal: ctx.signal,
           timeoutMs: 180_000,

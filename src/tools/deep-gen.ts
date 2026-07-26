@@ -188,7 +188,6 @@ export function createDeepGenTool(client: DeepSeekClient): ToolDef {
         taskType === 'code' || taskType === 'refactor' ? 'high' : 'medium';
 
       const result = await client.complete(msgs, 0.3, {
-        modelOverride: client.reasoningModel,
         reasoning: { effort },
         signal: ctx.signal,
         timeoutMs: 300_000, // 深度生成可给更长超时（5 分钟）
@@ -201,7 +200,7 @@ export function createDeepGenTool(client: DeepSeekClient): ToolDef {
 
       return {
         ok: true,
-        output: `# deep_gen: ${typeLabel}\n模型: ${client.reasoningModel} | reasoning: ${effort} | 任务: ${task.slice(0, 100)}...\n\n${result}`,
+        output: `# deep_gen: ${typeLabel}\n模型: ${client.activeModelId} | reasoning: ${effort} | 任务: ${task.slice(0, 100)}...\n\n${result}`,
       };
     },
   };

@@ -193,7 +193,7 @@ export function createVerifyAnswerTool(client: DeepSeekClient): ToolDef {
       const rendered = renderVerifyAnswerJSON(result.rawText, result);
       return {
         ok: true,
-        output: `# 答复审核 (verify_answer) | 模型: ${client.reasoningModel}\n\n${rendered}`,
+        output: `# 答复审核 (verify_answer) | 模型: ${client.activeModelId}\n\n${rendered}`,
       };
     },
   };

@@ -198,14 +198,14 @@ export function createAuditTool(client: DeepSeekClient): ToolDef {
         if (!result.ok) {
           return {
             ok: true,
-            output: `# 依赖安全审计（audit_dependencies）\n项目: ${pkg.name ?? dir} | 模型: ${client.reasoningModel}\n\n[JSON 解析失败，返回原始输出]\n${result.rawText}`,
+            output: `# 依赖安全审计（audit_dependencies）\n项目: ${pkg.name ?? dir} | 模型: ${client.activeModelId}\n\n[JSON 解析失败，返回原始输出]\n${result.rawText}`,
           };
         }
 
         const rendered = renderAudit(result.data!, pkg.name ?? dir);
         return {
           ok: true,
-          output: `# 依赖安全审计（audit_dependencies）\n项目: ${pkg.name ?? dir} | 模型: ${client.reasoningModel}\n\n${rendered}`,
+          output: `# 依赖安全审计（audit_dependencies）\n项目: ${pkg.name ?? dir} | 模型: ${client.activeModelId}\n\n${rendered}`,
         };
       } catch (e: unknown) {
         return { ok: false, output: `审计失败: ${msgOf(e)}` };

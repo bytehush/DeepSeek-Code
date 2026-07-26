@@ -247,14 +247,14 @@ export function createReviewTool(client: DeepSeekClient): ToolDef {
         if (!result.ok) {
           return {
             ok: true,
-            output: `# 中文代码审查（review_code）\n目标: ${target} | 模型: ${client.reasoningModel}\n\n[JSON 解析失败，返回原始输出]\n${result.rawText}`,
+            output: `# 中文代码审查（review_code）\n目标: ${target} | 模型: ${client.activeModelId}\n\n[JSON 解析失败，返回原始输出]\n${result.rawText}`,
           };
         }
 
         const rendered = renderReview(result.data!);
         return {
           ok: true,
-          output: `# 中文代码审查（review_code）\n目标: ${target} | 模型: ${client.reasoningModel}\n\n${rendered}`,
+          output: `# 中文代码审查（review_code）\n目标: ${target} | 模型: ${client.activeModelId}\n\n${rendered}`,
         };
       } catch (e: unknown) {
         return { ok: false, output: `审查失败: ${e instanceof Error ? e.message : String(e)}` };
