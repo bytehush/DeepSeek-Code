@@ -1500,6 +1500,42 @@ body {
   color: var(--muted);
 }
 .modal-hint a { color: var(--blue-600); }
+
+/* 模型模式切换（Flash 日常 / PRO 开发） */
+.model-mode-block {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+.field-label {
+  display: block;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.model-mode-toggle {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0;
+}
+.toggle-btn {
+  flex: 1;
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
+  color: var(--ink-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.toggle-btn:hover { border-color: var(--blue); color: var(--blue-600); }
+.toggle-btn.active {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: #fff;
+}
 .modal h3 { margin: 0 0 10px; font-size: 15px; color: var(--ink); }
 .modal-error {
   background: var(--danger-bg);

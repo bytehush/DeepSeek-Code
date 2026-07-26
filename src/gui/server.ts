@@ -28,6 +28,7 @@ import {
   userDataDir,
   type Credentials,
 } from '../auth/credentials.ts';
+import { getMode, setMode, parseMode, modeLabel } from '../agent/model-mode.ts';
 import {
   register as registerAccount,
   verify as verifyAccount,
@@ -347,6 +348,39 @@ const server = createServer(async (req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'invalid body' }));
     }
+    return;
+  }
+
+  // ── 模型模式端点（手动切换 Flash/PRO 主推理模型）──
+  if (urlPath === '/api/model-mode') {
+    if (req.method === 'GET') {
+      const mode = getMode();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ mode, label: modeLabel(mode) }));
+      return;
+    }
+    if (req.method === 'POST') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      try {
+        const body = JSON.parse(raw) as { mode?: string };
+        const m = parseMode(body.mode ?? '');
+        if (!m) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'mode 必须是 flash 或 pro' }));
+          return;
+        }
+        setMode(process.cwd(), m);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, mode: m, label: modeLabel(m) }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid body' }));
+      }
+      return;
+    }
+    res.writeHead(405);
+    res.end('Method Not Allowed');
     return;
   }
 

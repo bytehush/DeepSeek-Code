@@ -422,6 +422,36 @@ export function App() {
   const [modelInput, setModelInput] = useState('');
   const [reasonerModelInput, setReasonerModelInput] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // 模型模式（Flash 日常 / PRO 开发）：会话级，由后端持久化到 .dsa/model-mode.json
+  const [modelMode, setModelMode] = useState<'flash' | 'pro'>('flash');
+  const loadModelMode = useCallback(async () => {
+    try {
+      const r = await fetch('/api/model-mode');
+      if (r.ok) {
+        const d = await r.json();
+        if (d.mode === 'flash' || d.mode === 'pro') setModelMode(d.mode);
+      }
+    } catch {
+      // 忽略：后端未启动时不影响渲染
+    }
+  }, []);
+  const switchModelMode = useCallback(async (m: 'flash' | 'pro') => {
+    try {
+      const r = await fetch('/api/model-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: m }),
+      });
+      if (r.ok) setModelMode(m);
+    } catch {
+      // 忽略：网络异常时保持本地状态不变
+    }
+  }, []);
+
+  // 进入应用后拉取当前模型模式（Flash/PRO），供设置面板显示与切换
+  useEffect(() => {
+    if (view === 'app') loadModelMode();
+  }, [view, loadModelMode]);
 
   // 设置浮层内的标签页（API / 记忆）
   const [settingsTab, setSettingsTab] = useState<'api' | 'memory' | 'project'>('api');
@@ -1099,6 +1129,8 @@ export function App() {
       { id: 'style-human', group: '输出风格', title: '人话', hint: '/style human · 大白话', run: () => runCmd('/style human') },
       { id: 'style-pro', group: '输出风格', title: '专业', hint: '/style professional · 规范术语', run: () => runCmd('/style professional') },
       { id: 'style-raw', group: '输出风格', title: '原始', hint: '/style raw · 不加修饰', run: () => runCmd('/style raw') },
+      { id: 'model-flash', group: '模型', title: 'Flash（日常）', hint: '/model flash · 轻量交互，不触发强推理', run: () => runCmd('/model flash') },
+      { id: 'model-pro', group: '模型', title: 'PRO（开发）', hint: '/model pro · 严肃工程，触发强推理', run: () => runCmd('/model pro') },
       { id: 'polish', group: '动作', title: '润色', hint: '/polish · 优化最近一次回答', run: () => runCmd('/polish') },
       { id: 'clear', group: '动作', title: '清空对话', hint: '/clear · 清掉当前消息', run: () => runCmd('/clear') },
       { id: 'compact', group: '动作', title: '压缩上下文', hint: '/compact [n] · 摘要旧对话，保留最近 n 轮', run: () => runCmd('/compact') },
@@ -1943,6 +1975,33 @@ export function App() {
                       </label>
                     </>
                   )}
+
+                  {/* 模型模式（Flash 日常 / PRO 开发）：手动切换主推理模型 */}
+                  <div className="model-mode-block">
+                    <span className="field-label">主推理模型模式</span>
+                    <p className="modal-hint">
+                      Flash（日常/轻量）：快速问答、解释代码、简单改错、跑命令看输出、成本敏感多轮（不触发强推理）。<br />
+                      PRO（开发/严肃工程）：架构设计、跨文件重构、深度审查、依赖审计、多步规划、需深度推理的生成（触发强推理）。<br />
+                      提示：coding agent 里几乎所有事都是开发，「日常」指轻量交互而非「非开发」；拿不准要深度就切 PRO。
+                    </p>
+                    <div className="model-mode-toggle">
+                      <button
+                        type="button"
+                        className={`toggle-btn ${modelMode === 'flash' ? 'active' : ''}`}
+                        onClick={() => switchModelMode('flash')}
+                      >
+                        Flash（日常）
+                      </button>
+                      <button
+                        type="button"
+                        className={`toggle-btn ${modelMode === 'pro' ? 'active' : ''}`}
+                        onClick={() => switchModelMode('pro')}
+                      >
+                        PRO（开发）
+                      </button>
+                    </div>
+                    <div className="modal-hint">当前：{modelMode === 'flash' ? 'Flash（日常/轻量）' : 'PRO（开发/严肃工程）'}（会话级，刷新后沿用）</div>
+                  </div>
 
                   <div className="modal-actions">
                     {keyDialog.reason === 'change' && (
