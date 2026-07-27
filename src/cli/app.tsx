@@ -9,7 +9,7 @@ import { MarkdownMessage } from './Markdown.tsx';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
 import { styleLabel } from '../agent/output-style.ts';
-import { getMode, modeLabel } from '../agent/model-mode.ts';
+import { getMode, modeLabel } from '../config/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
 import { runExtraction } from '../app/chat.ts';

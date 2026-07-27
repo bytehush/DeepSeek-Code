@@ -21,7 +21,7 @@ import { runAgent, type AgentEvent, type PermissionMode } from '../agent/loop.ts
 import type { StreamErrorCategory } from '../llm/deepseek.ts';
 import type { OutputStyle } from '../agent/output-style.ts';
 import { styleLabel, styleInstruction, parseStyle, saveStyle } from '../agent/output-style.ts';
-import { getMode, setMode, parseMode, modeLabel } from '../agent/model-mode.ts';
+import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
 import { MEMORY_RECALL_MARKER } from '../memory/pipeline.ts';

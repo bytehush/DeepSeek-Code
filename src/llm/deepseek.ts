@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import { fetchSSE, type FetchSSEResult, type SSEErrorKind, SSEHttpError } from './sse';
-import { getMode } from '../agent/model-mode.ts';
+import { getMode } from '../config/model-mode.ts';
 
 /** 错误提取：unknown 收窄为可读信息（供 catch 块统一使用） */
 export function errMsg(e: unknown): string {

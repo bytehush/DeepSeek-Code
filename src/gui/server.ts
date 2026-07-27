@@ -28,7 +28,7 @@ import {
   userDataDir,
   type Credentials,
 } from '../auth/credentials.ts';
-import { getMode, setMode, parseMode, modeLabel } from '../agent/model-mode.ts';
+import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
 import {
   register as registerAccount,
   verify as verifyAccount,
