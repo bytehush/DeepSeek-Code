@@ -182,6 +182,7 @@ src/
   gui/         网页后端（HTTP 静态服务 + WebSocket 桥接、账户、多任务、按 taskId 路由）
   gui/web/     网页前端（React + Vite）
   app/         CLI / Web 共用内核装配与类型
+  config/      模型模式配置（flash / pro 显式切换，无自动路由）
   agent/       Agent 运行时（主循环、Plan Mode、Reflection、子 Agent、输出风格）
   llm/         DeepSeek API 封装（流式、双模型路由、tool_calls、定价）
   tools/       工具实现 + 安全 / 护栏
