@@ -1,4 +1,4 @@
-import { ChatMessage, DeepSeekClient, ToolCall, Role } from '../llm/deepseek.ts';
+import type { ChatMessage, DeepSeekClient, ToolCall, Role } from '../llm/deepseek.ts';
 
 /**
  * 内部消息类型：在公共 ChatMessage 之上附一个可选的 `_marker`，
