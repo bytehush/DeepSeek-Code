@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { startApp } from './app.tsx';
-import { assembleAppProps } from './assemble.ts';
+import { assembleAppProps } from '../app/assemble.ts';
 import { resolveCredentials, saveCredentials, loadStoredCredentials, maskKey, type Credentials } from './auth.ts';
 import { runLogin } from './login.tsx';
 

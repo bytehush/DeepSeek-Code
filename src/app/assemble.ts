@@ -22,7 +22,7 @@ import { SessionManager, type Session } from '../agent/session.ts';
 import { SessionStore } from '../agent/session-store.ts';
 import { SkillManager } from '../skills/loader.ts';
 import { createUseSkillTool } from '../tools/use_skill.ts';
-import type { Credentials } from './auth.ts';
+import type { Credentials } from '../auth/credentials.ts';
 import type { AppProps } from '../app/types.ts';
 
 /** 全局信号清理函数集合（每个 assembleAppProps 注册一个），仅注册一次处理器避免监听器无限累积 */

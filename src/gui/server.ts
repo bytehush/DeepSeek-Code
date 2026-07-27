@@ -20,7 +20,7 @@ import { extname, join, dirname, relative, resolve, isAbsolute, basename } from 
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { assembleAppProps } from '../cli/assemble.ts';
+import { assembleAppProps } from '../app/assemble.ts';
 import { AgentHost } from './agent-host.ts';
 import {
   loadUserCredentials,
