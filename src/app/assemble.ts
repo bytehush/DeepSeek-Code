@@ -1,150 +1,48 @@
 /**
- * 内核装配（CLI 与 网页后端共用的「组装」逻辑）。
+ * 内核装配（CLI 共用的「组装」逻辑）。
  *
- * 把原 main.ts 里「组装 AppProps」的全部代码抽到这里，由 main.ts（终端登录后）
- * 与 server.ts（无头启动）共同调用。这样内核只组装一次、定义一处，UI 形态随便换。
+ * 极简模式：只装配「Pi 持久化 Agent + 4 个 stock-Pi 原子工具 + DeepSeek Models」，
+ * 不接记忆 / 技能 / 多 Agent 会话 / Trace / 账户体系。UI 形态（TUI）直接消费本结果。
  */
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
-import { DeepSeekClient } from '../llm/deepseek.ts';
-import { ConversationHistory } from '../context/history.ts';
-import { TraceLogger } from '../context/trace.ts';
 import { SYSTEM_PROMPT } from '../agent/system-prompt.ts';
-import type { ChatMessage } from '../llm/deepseek.ts';
-import { createEmbedder } from '../memory/embedder-backend.ts';
-import { MemoryManager } from '../memory/manager.ts';
-import { MemoryOrchestrator } from '../memory/orchestrator.ts';
-import { loadMemoryConfig } from '../memory/config.ts';
-import { SessionManager, type Session } from '../agent/session.ts';
-import { SessionStore } from '../agent/session-store.ts';
-import { SkillManager } from '../skills/loader.ts';
-import type { Credentials } from '../auth/credentials.ts';
 import { createModels } from '@earendil-works/pi-ai';
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { createAtomicTools } from '../agent/pi-tools.ts';
 import { getMode } from '../config/model-mode.ts';
-import type { AppProps } from '../app/types.ts';
-
-/** 全局信号清理函数集合（每个 assembleAppProps 注册一个），仅注册一次处理器避免监听器无限累积 */
-const signalCleanups = new Set<() => void>();
-let signalHandlerRegistered = false;
-function registerSignalCleanup(fn: () => void): void {
-  signalCleanups.add(fn);
-  if (!signalHandlerRegistered) {
-    signalHandlerRegistered = true;
-    const handler = (): void => {
-      for (const c of signalCleanups) {
-        try {
-          c();
-        } catch {
-          /* 忽略单个清理失败 */
-        }
-      }
-    };
-    process.on('SIGINT', handler);
-    process.on('SIGTERM', handler);
-  }
-}
+import type { Credentials } from '../auth/credentials.ts';
+import type { AppProps } from './types.ts';
 
 /**
- * 装配一份完整的 AppProps（内核全部服务已初始化，可直接交给任意 UI 层）。
+ * 装配一份最小 AppProps（内核服务已初始化，可直接交给 TUI）。
  *
- * @param creds    DeepSeek 凭证
- * @param opts.dataDir  内核「用户数据」根目录（会话/历史/记忆/日志落盘处）。
- *                      - 不传 → 用 process.cwd()（CLI 终端行为，保持原样）。
- *                      - 网页版传每账号目录 ~/.dsa/users/<username>，实现「每账号独立」。
- *                      注意：技能目录(SkillManager)始终用 projectRoot（应用级能力，不随账号变）；
- *                      工具的「工作目录」与此 dataDir 一致（即每账号独立沙箱）。
- * @param opts.workspace  agent 真正「编辑/浏览」的代码项目目录（文件工具、git、delegate 子代理的工作根）。
- *                      - 不传 → 与 dataDir 一致（CLI 直接在该目录运行，二者本就相同）。
- *                      - 网页版传用户在设置里指定的「项目目录」，使 agent 操作的是用户自己的项目，
- *                        而非工具源码或每账号数据目录；会话/记忆/Trace 仍按 dataDir 隔离。
+ * @param creds    DeepSeek 凭证（apiKey 等）
+ * @param opts.workspace  agent 真正「编辑/浏览」的代码项目目录（文件工具、bash 的工作根）。
+ *                       - 不传 → process.cwd()（CLI 直接在该目录运行）。
  */
 export async function assembleAppProps(
   creds: Credentials,
-  opts?: { dataDir?: string; workspace?: string },
+  opts?: { workspace?: string },
 ): Promise<AppProps> {
-  const projectRoot = resolve(import.meta.dirname ?? '.', '../../');
-  const cwd = opts?.dataDir ?? process.cwd();
-  const workspace = opts?.workspace ?? cwd;
+  const workspace = opts?.workspace ?? process.cwd();
 
-  const cfg: Credentials & { baseURL: string; model: string } = {
-    apiKey: creds.apiKey,
-    baseURL: creds.baseURL || 'https://api.deepseek.com',
-    model: creds.model || 'deepseek-v4-flash',
-    reasonerModel: creds.reasonerModel,
-  };
-  const version = `v${(createRequire(import.meta.url)('../../package.json').version as string) ?? '0.1.0'}`;
-  const client = new DeepSeekClient(cfg);
+  // 凭证注入 Pi 所需的 DEEPSEEK_API_KEY 环境变量（deepseekProvider 走 envApiKeyAuth）
+  process.env.DEEPSEEK_API_KEY = creds.apiKey;
 
-  const memoryConfig = loadMemoryConfig();
-  // 测试/离线环境可通过 DSA_EMBEDDER=off 跳过本地 BGE 模型加载（用 NullEmbedder，
-  // embed 恒返回 null → 关键词召回），让 assemble 在无法下载模型时也能跑通；
-  // 默认行为不变（embedderMirror 开 → remote，否则 local BGE）。
-  const embedderMode =
-    process.env.DSA_EMBEDDER === 'off' ? 'off' : memoryConfig.embedderMirror ? 'remote' : 'local';
-  // M7: embedderMirror 开启 → 走 RemoteEmbedder（有 key 远程 / 无 key 本地降级 + 镜像）；
-  // 关闭（默认）→ 等价于 new BgeEmbedder()，与 baseline 逐字节一致。
-  const embedder = createEmbedder(embedderMode, {
-    mirror: memoryConfig.embedderMirror,
-  });
-  // M8: 启动预热——提前加载嵌入模型，使首条记忆检索不卡顿；fire-and-forget，
-  // 失败（离线/无 key）优雅降级，不阻塞 assemble。compose 的首次 embed 复用同一加载。
-  void embedder.warmup?.().catch(() => {});
-  const memory = memoryConfig.useOrchestrator
-    ? new MemoryOrchestrator(cwd, embedder)
-    : new MemoryManager(cwd, embedder);
-
-  // 技能目录用应用根（projectRoot），不随账号 dataDir 变化——技能是应用级能力
-  const skillManager = new SkillManager(projectRoot);
-  await skillManager.init();
-
-  const traceLogger = new TraceLogger({ workspaceDir: cwd });
-
-  const recentTraces = await TraceLogger.recentSummary(cwd);
-  const lastSessionMessages = await TraceLogger.replay(cwd);
-
-  const query = lastUserQuery(lastSessionMessages ?? []);
-  const systemPrompt =
-    (await memory.compose(SYSTEM_PROMPT, query, 5)) +
-    (skillManager.renderCatalog() ? '\n\n' + skillManager.renderCatalog() : '');
-
-  const history = new ConversationHistory(systemPrompt, { client });
-
-  const mainSession: Session = {
-    id: 'main',
-    title: 'main',
-    kind: 'main',
-    status: 'working',
-    history,
-    output: '',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-  const sessionManager = new SessionManager(mainSession);
-
-  const sessionStore = new SessionStore(cwd);
-  sessionManager.attachStore(sessionStore);
-  const restoredCount = await sessionManager.restore();
-
-  // —— Pi Agent 运行时（P1 引擎切换）——
-  // 注：P2 已删除旧的 ToolProviderManager / 自研 20+ 领域工具；引擎只消费 agent 内置的 4 个
-  // stock-Pi 原子工具，MCP 工具将在 P4 经 mcp/pi-bridge.ts 桥接回 Agent 工具列表。
-  // 凭证注入 Pi 所需的 DEEPSEEK_API_KEY 环境变量（deepseekProvider 走 envApiKeyAuth）。
-  // 旧 DeepSeekClient(cfg) 仍保留，仅为记忆 extract/revise 与 /polish 等指令服务。
-  process.env.DEEPSEEK_API_KEY = cfg.apiKey;
   const models = createModels();
   models.setProvider(deepseekProvider());
-  const piModel = models.getModel('deepseek', getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash');
+  const modelId = getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
+  const piModel = models.getModel('deepseek', modelId);
   if (!piModel) {
-    throw new Error(`Pi 模型未找到: deepseek/${getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash'}`);
+    throw new Error(`Pi 模型未找到: deepseek/${modelId}`);
   }
-  // 持久化 Agent：跨轮累积上下文；beforeToolCall/transformContext 由 runPiAgent 每轮按当前状态重设。
-  // 工具 = stock-Pi 4 原子工具，操作 workspace（agent 真正编辑的项目目录）。
+
+  // 持久化 Agent：跨轮累积上下文；工具 = stock-Pi 4 原子工具，操作 workspace。
   const agent = new Agent({
     initialState: {
-      systemPrompt,
+      systemPrompt: SYSTEM_PROMPT,
       model: piModel,
       thinkingLevel: 'off',
       tools: createAtomicTools({ cwd: workspace }),
@@ -153,29 +51,7 @@ export async function assembleAppProps(
     toolExecution: 'sequential',
   });
 
-  return {
-    client,
-    history,
-    cfg,
-    traceLogger,
-    recentTraces,
-    sessionManager,
-    restoredSessions: restoredCount,
-    memoryStore: memory,
-    version,
-    skillManager,
-    agent,
-    models,
-  };
-}
+  const version = `v${(createRequire(import.meta.url)('../../package.json').version as string) ?? '0.1.0'}`;
 
-/** 取最近一条用户消息，作为启动语义预取的 query（无则返回空串）。 */
-function lastUserQuery(messages: ReadonlyArray<ChatMessage>): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === 'user' && typeof m.content === 'string' && m.content.trim()) {
-      return m.content.trim();
-    }
-  }
-  return '';
+  return { agent, models, version };
 }

@@ -9,15 +9,7 @@
   "scripts": {
     "start": "tsx src/cli/main.ts",
     "dev": "tsx watch src/cli/main.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test \"test/**/*.test.ts\"",
-    "eval:check": "node --import tsx --test \"test/eval-cases.test.ts\"",
-    "check:providers": "tsx scripts/check-providers.ts",
-    "check:mcp": "tsx scripts/check-mcp-connect.ts",
-    "check:mcp:http": "tsx scripts/check-mcp-http.ts",
-    "web:build": "vite build",
-    "web:start": "tsx src/gui/server.ts",
-    "web": "npm run web:build && npm run web:start"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",

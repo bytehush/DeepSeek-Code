@@ -50,7 +50,7 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [busy, setBusyState] = useState(false);
   const busyRef = useRef(false);
-  const [mode, setMode] = useState<PermissionMode>(props.cfg.reasonerModel ? 'ask' : 'execute');
+  const [mode, setMode] = useState<PermissionMode>('execute');
   const [planMode, setPlanMode] = useState(false);
   const [outputStyle, setOutputStyle] = useState<OutputStyle>(() => loadStyle(process.cwd()));
   const [costCny, setCostCny] = useState(0);

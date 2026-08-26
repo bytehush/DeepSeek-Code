@@ -11,10 +11,8 @@
  */
 import type { Agent } from '@earendil-works/pi-agent-core';
 import type { Models } from '@earendil-works/pi-ai';
-import type { StreamErrorCategory } from '../llm/deepseek.ts';
 import type { PermissionMode } from '../permission/index.ts';
 import type { OutputStyle } from './output-style.ts';
-import type { MemoryService } from '../memory/service.ts';
 import { runPiAgent } from './pi-agent.ts';
 
 export type { PermissionMode };
@@ -29,7 +27,7 @@ export interface AgentEvent {
   granted?: boolean;
   error?: string;
   /** 服务端错误分类（仅 type==='error' 时有意义），供上层差异化提示 */
-  errorCategory?: StreamErrorCategory;
+  errorCategory?: string;
   /**
    * ReAct 可观测：当前推理-行动循环的步数（从 1 开始递增）。
    */
@@ -68,8 +66,6 @@ export interface RunOptions {
   models: Models;
   /** 权限模式 */
   permission: PermissionMode;
-  /** RAG 记忆服务（可选，P3 接入 per-turn 注入） */
-  memory?: MemoryService;
   /** 可取消当前运行的 AbortSignal */
   signal?: AbortSignal;
   /** 工具执行期间的实时流式输出回调（如 bash stdout） */
@@ -78,8 +74,6 @@ export interface RunOptions {
   ask?: (prompt: string) => Promise<boolean>;
   /** 模型主动 awaitUser 时的自由文本回复回调 */
   askText?: (prompt: string) => Promise<string>;
-  /** Trace 日志记录器（可选，不传则不记录） */
-  trace?: unknown;
   /** Plan Mode 开关。true 时 Agent 只输出计划不执行工具 */
   planMode?: boolean;
   /** 最大自我重试次数（Reflection 深化） */
