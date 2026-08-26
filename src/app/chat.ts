@@ -24,10 +24,12 @@ import { styleLabel, styleInstruction, parseStyle, saveStyle } from '../agent/ou
 import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
 import { detectMemoryIntent } from '../memory/intent.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
-import { MEMORY_RECALL_MARKER } from '../memory/pipeline.ts';
 import type { ReviseResult } from '../memory/revise.ts';
 import { scheduleIdleRevise } from '../memory/revise.ts';
 import { msgOf } from '../utils/logger.ts';
+// 注：MEMORY_RECALL_MARKER 曾用于把每轮召回写进 ConversationHistory，但 P1 后 Pi 引擎
+// 只读自己的 agent.messages 上下文，那条路对其无效；召回注入已迁到 pi-agent.ts 的
+// transformContext（见下 runChatTurn 内注释），故此处不再 import 该 marker。
 import { handleMemory, handleSkills, applyMemoryIntent } from './commands.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
 import { TraceLogger } from '../context/trace.ts';
@@ -570,21 +572,9 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
   ctx.setActiveAbort(abortController);
   taskStart = Date.now();
 
-  // M5 · P2a：每轮重算语义召回并注入为带标记消息（perTurnCompose 开启时）。
-  // 先移除上一轮的同标记消息、再注入本轮召回块，避免历史无限膨胀（冲突 D）。
-  // flag 关闭（默认）不注入，行为与原 boot-only compose 逐字节一致。
-  if (!isCommand && loadMemoryConfig().perTurnCompose) {
-    try {
-      const base = ctx.props.history.systemPromptText;
-      const recall = await ctx.props.memoryStore.composeForTurn(base, runText, 5);
-      if (recall) {
-        ctx.props.history.removeMarked(MEMORY_RECALL_MARKER);
-        ctx.props.history.addMarked('system', recall, MEMORY_RECALL_MARKER);
-      }
-    } catch {
-      /* 召回失败安全降级：不注入，不影响本轮对话 */
-    }
-  }
+  // 每轮语义召回注入已迁移到 Pi 引擎：src/agent/pi-agent.ts 的 transformContext
+  // 在 perTurnCompose flag 开启时，每轮用当前用户输入重算召回并前置注入 Pi 上下文。
+  // 此处不再写 ConversationHistory（P1 后 Pi 引擎只读自己的 agent.messages，那条路无效）。
 
   try {
     for await (const ev of runAgent(runText, {

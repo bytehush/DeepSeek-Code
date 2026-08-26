@@ -8,9 +8,10 @@
  * 权限闸：Pi 的 `beforeToolCall` 钩子映射自研 PermissionMode（explore/ask/execute）。
  * 记忆注入（transformContext）在 P3 接入 RAG；P1 仅保留启动期的 systemPrompt 记忆合成。
  */
-import { type Agent, type AgentTool, type BeforeToolCallResult, type AgentToolResult } from '@earendil-works/pi-agent-core';
-import { type Models, type AssistantMessage } from '@earendil-works/pi-ai';
+import { type Agent, type AgentTool, type AgentMessage, type BeforeToolCallResult, type AgentToolResult } from '@earendil-works/pi-agent-core';
+import { type Models, type AssistantMessage, type UserMessage } from '@earendil-works/pi-ai';
 import { getMode } from '../config/model-mode.ts';
+import { loadMemoryConfig } from '../memory/config.ts';
 import type { AgentEvent, RunOptions } from './loop.ts';
 import type { PermissionMode } from '../permission/index.ts';
 import type { MemoryService } from '../memory/service.ts';
@@ -57,9 +58,31 @@ export async function* runPiAgent(input: string, opts: RunOptions): AsyncGenerat
     return undefined;
   };
 
-  // —— 记忆注入（P3 深化；P1 预留钩子）——
-  if (memory) {
-    agent.transformContext = async (messages) => messages; // 占位：P3 接入 RAG composeForTurn
+  // —— 记忆注入（P3：每轮把语义召回块真正注入 Pi 上下文）——
+  // 复用 perTurnCompose flag 作开关（默认关，与旧路径逐字节一致，安全回退锚点）：
+  // 开 → 每轮用当前用户输入重算召回，作为带 timestamp 的 user 消息前置注入上下文；
+  // 关 / 无 memory → transformContext 留空（行为同基线）。
+  // 根因：旧路径把召回写进 ConversationHistory，但 Pi 持久化 Agent 只读自己的
+  // agent.messages 上下文，那条路对 Pi 引擎是死代码；本处改为经 transformContext
+  // 直接注入 Pi 每轮 LLM 调用的上下文，召回才能真正到达模型。
+  const perTurn = loadMemoryConfig().perTurnCompose;
+  if (memory && perTurn) {
+    agent.transformContext = async (messages): Promise<AgentMessage[]> => {
+      try {
+        const recall = await memory.composeForTurn(agent.state.systemPrompt, input, 5);
+        if (!recall) return messages;
+        const recallMsg: UserMessage = {
+          role: 'user',
+          content: recall,
+          timestamp: Date.now(),
+        };
+        // 前置注入：召回块作为上下文放在最前，不破坏原对话序列的轮次语义
+        return [recallMsg, ...messages];
+      } catch {
+        // 召回失败安全降级：不注入，不影响本轮对话
+        return messages;
+      }
+    };
   } else {
     agent.transformContext = undefined;
   }
