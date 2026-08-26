@@ -14,6 +14,20 @@ import { getMode } from '../config/model-mode.ts';
 import type { AgentEvent, RunOptions } from './loop.ts';
 import type { PermissionMode } from '../permission/index.ts';
 
+/**
+ * 把底层抛出的原始错误归类，便于上层（chat.ts friendlyErrorMessage）给出差异化友好提示。
+ * 返回值对应 friendlyErrorMessage 的分支 key。
+ */
+function classifyError(raw: string): string | undefined {
+  const r = raw.toLowerCase();
+  if (/401|authentication fails|api[ _-]?key|unauthorized|incorrect api key/.test(r)) return 'auth';
+  if (/moderation|sensitive|content.*policy/.test(r)) return 'moderation';
+  if (/context length|maximum context|token.*limit|too many tokens/.test(r)) return 'token_limit';
+  if (/429|rate limit|quota|503|502|server error|timeout|timed out|connection/.test(r))
+    return 'server_unavailable';
+  return undefined;
+}
+
 /** 破坏性工具判定（P1 内置，后续可迁出到 permission/ 复用） */
 function isMutatingTool(toolName: string): boolean {
   return toolName === 'write_file' || toolName === 'edit_file' || toolName === 'bash';
@@ -117,7 +131,8 @@ export async function* runPiAgent(input: string, opts: RunOptions): AsyncGenerat
         // event.message 是 AgentMessage(=Message)，需收窄到 AssistantMessage 取 stopReason
         const m = event.message as AssistantMessage;
         if (m.role === 'assistant' && m.stopReason === 'error') {
-          push({ type: 'error', error: m.errorMessage ?? '模型返回错误' });
+          const errText = m.errorMessage ?? '模型返回错误';
+          push({ type: 'error', error: errText, errorCategory: classifyError(errText) });
         }
         break;
       }
@@ -145,7 +160,12 @@ export async function* runPiAgent(input: string, opts: RunOptions): AsyncGenerat
     }
     await promptPromise;
   } catch (e: unknown) {
-    push({ type: 'error', error: e instanceof Error ? e.message : String(e) });
+    const msg = e instanceof Error ? e.message : String(e);
+    const cat = classifyError(msg);
+    // 去重：若 message_end 已上报过 error，避免再补一条重复报错刷屏
+    if (!queue.some((q) => q.type === 'error')) {
+      push({ type: 'error', error: msg, errorCategory: cat });
+    }
     // 把错误也 yield 出去
     while (queue.length > 0) yield queue.shift()!;
   } finally {

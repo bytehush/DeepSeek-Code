@@ -97,6 +97,20 @@ function friendlyErrorMessage(category: string | undefined, raw: string): string
       return '📏 上下文 / token 超出上限：当前对话历史过长，已无法继续生成。建议新开一个会话再试。';
     case 'server_unavailable':
       return '🔌 服务端暂时不可用（限流或服务过载）：请稍候片刻后重试；若持续出现，请检查 API Key 配额或网络连通性。';
+    case 'auth': {
+      // 从脱敏后的报错里提取当前 Key 末尾 4 位（如 "Your api key: ****90c1 is invalid"）。
+      // 该串由 DeepSeek 服务端脱敏，不含完整 Key，安全可展示。
+      const tail = /api key:\s*\*+([0-9a-zA-Z]{4})/i.exec(raw);
+      const tailText = tail ? `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）` : '';
+      return (
+        '🔑 API Key 无效或未授权（DeepSeek 返回 401 鉴权失败）\n' +
+        '   修复方式（任选其一）：\n' +
+        '     · 修改项目根 .env 的 DEEPSEEK_API_KEY，或编辑 ~/.dsa/credentials.json\n' +
+        '     · 输入 /set-key 按提示填新 Key（下次启动生效）\n' +
+        '     · 确认该 Key 在 DeepSeek 后台处于「启用」状态且有可用额度\n' +
+        tailText
+      );
+    }
     default:
       return `⚠️ 生成出错：${raw || '未知错误'}`;
   }
@@ -217,7 +231,9 @@ function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
   } else if (ev.type === 'tool_result') {
     ctx.push('tool', `[工具结果] ${String(ev.result ?? '')}`);
   } else if (ev.type === 'error') {
-    ctx.appendError(ev.error ?? '未知错误');
+    const isAuth = ev.errorCategory === 'auth';
+    // auth 类错误：思考盒只放一句短提示（避免把原始 401 报文塞进折叠盒），完整修复指引走 system 消息
+    ctx.appendError(isAuth ? '[鉴权失败] API Key 无效，请运行 /set-key 更换' : (ev.error ?? '未知错误'));
     ctx.push('system', friendlyErrorMessage(ev.errorCategory, ev.error ?? '未知错误'));
   } else if (ev.type === 'system') {
     ctx.push('system', ev.text ?? '');
