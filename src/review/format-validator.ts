@@ -12,7 +12,7 @@
  */
 
 import { z } from 'zod';
-import { parseJSON } from '../tools/structured-parse.ts';
+import { parseJSON } from '../utils/structured-parse.ts';
 import type { ReviewInput, ReviewReport, Reviewer } from './types.ts';
 
 export interface FormatValidatorDeps {

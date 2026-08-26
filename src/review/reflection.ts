@@ -11,7 +11,7 @@
  */
 
 import { z } from 'zod';
-import { fetchStructured, formatAnchor, PRO_COMMON_PREFIX } from '../tools/structured-parse.ts';
+import { fetchStructured, formatAnchor, PRO_COMMON_PREFIX } from '../utils/structured-parse.ts';
 import type { DeepSeekClient, ChatMessage, JsonSchemaDef } from '../llm/deepseek.ts';
 import type { ReviewInput, ReviewReport, Reviewer, ReflectionState } from './types.ts';
 

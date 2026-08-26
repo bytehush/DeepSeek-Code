@@ -21,6 +21,9 @@ import { join, dirname, relative, isAbsolute } from 'node:path';
  *
  * 关键安全约束：rollback 自身执行的「还原写盘」不再入栈，避免
  * 「回滚也能被无限回滚」导致的状态抖动。
+ *
+ * 原位于 src/tools/rollback.ts，P2 自研领域工具清理时迁出到 utils/，
+ * 因 /rollback 命令（app/chat.ts）仍依赖它，与具体 agent 工具无关。
  */
 export type RollOp = 'create' | 'edit' | 'delete';
 

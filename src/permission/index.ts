@@ -11,6 +11,13 @@
 
 export type PermissionMode = 'explore' | 'ask' | 'execute';
 
+/**
+ * 工具风险档位（low/mid/high）。
+ * 原定义于 src/tools/types.ts，P2 自研领域工具清理时迁入本权限模块
+ * —— 它是权限闸门决策（permission-system.ts）的核心输入，与具体工具实现无关。
+ */
+export type Risk = 'low' | 'mid' | 'high';
+
 // 破坏性命令静态检测（安全底线：即使 execute 模式也升级为 high 并确认）
 const DESTRUCTIVE_PATTERNS = [
   /rm\s+-rf\s+\//,

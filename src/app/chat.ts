@@ -31,7 +31,7 @@ import { msgOf } from '../utils/logger.ts';
 import { handleMemory, handleSkills, applyMemoryIntent } from './commands.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
 import { TraceLogger } from '../context/trace.ts';
-import { rollbackManager } from '../tools/rollback.ts';
+import { rollbackManager } from '../utils/rollback.ts';
 import type { ChatMessage } from '../llm/deepseek.ts';
 
 /**
@@ -588,18 +588,16 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
 
   try {
     for await (const ev of runAgent(runText, {
-      client: ctx.props.client,
-      history: ctx.props.history,
+      agent: ctx.props.agent,
+      models: ctx.props.models,
       permission: ctx.getState().mode,
-      cwd: ctx.cwd,
-      tools: ctx.props.tools,
+      memory: ctx.props.memoryStore,
       signal: abortController.signal,
       ask: ctx.requestConfirm,
       askText: ctx.requestAskText,
       trace: ctx.props.traceLogger,
       planMode: ctx.getState().planMode,
       outputStyle: ctx.getState().outputStyle,
-      maxIterations: ctx.maxIterations || undefined, // 0=无上限，不传则默认无上限
       onToolProgress: (toolName: string, out: string) => {
         // 实时工具输出：仅当确实在执行某工具时挂到当前工具消息
         if (toolName) ctx.appendTool(out);

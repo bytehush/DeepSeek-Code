@@ -245,10 +245,8 @@ export function App(props: AppProps) {
   const spawnFromPanel = useCallback(
     (text: string) => {
       const id = mgr.spawn(text, {
-        client: props.client,
-        tools: props.tools,
+        models: props.models,
         cwd: process.cwd(),
-        trace: new TraceLogger({ workspaceDir: process.cwd() }),
         permission: c.mode,
       });
       c.push('system', `已派发后台会话: ${text.slice(0, 24) || '(空任务)'}`);
@@ -257,7 +255,7 @@ export function App(props: AppProps) {
       setPanelSel(0);
       return id;
     },
-    [mgr, props.client, props.tools, c.mode, c.push],
+    [mgr, props.models, c.mode, c.push],
   );
 
   // ══ 终端输入处理（useInput）—— 仅做按键→动作映射，聊天逻辑走控制器 ══

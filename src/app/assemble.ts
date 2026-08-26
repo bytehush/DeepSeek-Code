@@ -15,14 +15,15 @@ import { createEmbedder } from '../memory/embedder-backend.ts';
 import { MemoryManager } from '../memory/manager.ts';
 import { MemoryOrchestrator } from '../memory/orchestrator.ts';
 import { loadMemoryConfig } from '../memory/config.ts';
-import { createDelegateTool } from '../agent/subagent.ts';
-import { createTools, isDestructive } from '../tools/index.ts';
-import { ToolProviderManager } from '../mcp/manager.ts';
 import { SessionManager, type Session } from '../agent/session.ts';
 import { SessionStore } from '../agent/session-store.ts';
 import { SkillManager } from '../skills/loader.ts';
-import { createUseSkillTool } from '../tools/use_skill.ts';
 import type { Credentials } from '../auth/credentials.ts';
+import { createModels } from '@earendil-works/pi-ai';
+import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
+import { Agent } from '@earendil-works/pi-agent-core';
+import { createAtomicTools } from '../agent/pi-tools.ts';
+import { getMode } from '../config/model-mode.ts';
 import type { AppProps } from '../app/types.ts';
 
 /** 全局信号清理函数集合（每个 assembleAppProps 注册一个），仅注册一次处理器避免监听器无限累积 */
@@ -127,36 +128,34 @@ export async function assembleAppProps(
   sessionManager.attachStore(sessionStore);
   const restoredCount = await sessionManager.restore();
 
-  const delegateTool = createDelegateTool({
-    runner: async (input: string, signal?: AbortSignal): Promise<string> => {
-      const session = sessionManager.spawn(input, {
-        client,
-        tools: createTools(client),
-        cwd: workspace,
-        trace: new TraceLogger({ workspaceDir: workspace }),
-        permission: 'execute',
-        signal,
-        ask: (question?: string) => Promise.resolve(!isDestructive(question ?? '')),
-      });
-      const done = await sessionManager.whenDone(session.id, signal);
-      return done.output.slice(-2000);
+  // —— Pi Agent 运行时（P1 引擎切换）——
+  // 注：P2 已删除旧的 ToolProviderManager / 自研 20+ 领域工具；引擎只消费 agent 内置的 4 个
+  // stock-Pi 原子工具，MCP 工具将在 P4 经 mcp/pi-bridge.ts 桥接回 Agent 工具列表。
+  // 凭证注入 Pi 所需的 DEEPSEEK_API_KEY 环境变量（deepseekProvider 走 envApiKeyAuth）。
+  // 旧 DeepSeekClient(cfg) 仍保留，仅为记忆 extract/revise 与 /polish 等指令服务。
+  process.env.DEEPSEEK_API_KEY = cfg.apiKey;
+  const models = createModels();
+  models.setProvider(deepseekProvider());
+  const piModel = models.getModel('deepseek', getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash');
+  if (!piModel) {
+    throw new Error(`Pi 模型未找到: deepseek/${getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash'}`);
+  }
+  // 持久化 Agent：跨轮累积上下文；beforeToolCall/transformContext 由 runPiAgent 每轮按当前状态重设。
+  // 工具 = stock-Pi 4 原子工具，操作 workspace（agent 真正编辑的项目目录）。
+  const agent = new Agent({
+    initialState: {
+      systemPrompt,
+      model: piModel,
+      thinkingLevel: 'off',
+      tools: createAtomicTools({ cwd: workspace }),
     },
+    streamFn: models.streamSimple.bind(models),
+    toolExecution: 'sequential',
   });
-
-  const toolManager = new ToolProviderManager(client, projectRoot, workspace);
-  await toolManager.init();
-  const mcpTools = await toolManager.getAllTools();
-  const tools = [...mcpTools, delegateTool, createUseSkillTool(skillManager)];
-
-  const cleanup = () => {
-    void toolManager.closeAll();
-  };
-  registerSignalCleanup(cleanup);
 
   return {
     client,
     history,
-    tools,
     cfg,
     traceLogger,
     recentTraces,
@@ -165,6 +164,8 @@ export async function assembleAppProps(
     memoryStore: memory,
     version,
     skillManager,
+    agent,
+    models,
   };
 }
 

@@ -7,10 +7,11 @@
 import type { DeepSeekClient } from '../llm/deepseek.ts';
 import type { ConversationHistory } from '../context/history.ts';
 import type { TraceLogger } from '../context/trace.ts';
-import type { ToolDef } from '../tools/index.ts';
 import type { SessionManager } from '../agent/session.ts';
 import type { MemoryService } from '../memory/service.ts';
 import type { SkillManager } from '../skills/loader.ts';
+import type { Agent } from '@earendil-works/pi-agent-core';
+import type { Models } from '@earendil-works/pi-ai';
 
 /** 消息角色（UI 与内核共用） */
 export type MsgRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
@@ -37,7 +38,6 @@ export interface UiMessage {
 export interface AppProps {
   client: DeepSeekClient;
   history: ConversationHistory;
-  tools: ToolDef[];
   cfg: { apiKey: string; baseURL: string; model: string; reasonerModel?: string };
   traceLogger: TraceLogger;
   recentTraces: string[];
@@ -50,4 +50,8 @@ export interface AppProps {
   version: string;
   /** 技能子系统管理器（项目级 + 全局级，白名单过滤） */
   skillManager: SkillManager;
+  /** Pi Agent 运行时实例（持久化，跨轮累积上下文）；P1 引擎切换后由内核驱动 */
+  agent: Agent;
+  /** Pi Models 实例（provider 已设 deepseekProvider） */
+  models: Models;
 }

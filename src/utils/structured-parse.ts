@@ -9,6 +9,9 @@
  * 设计约束：
  * - 不与具体工具耦合；任何需要「模型返回 → 结构化对象」的工具都可以复用。
  * - 类型驱动：工具只需提供 zod schema，解析器自动做类型转换 + 校验。
+ *
+ * 原位于 src/tools/structured-parse.ts，P2 自研领域工具清理时迁出到 utils/，
+ * 因 review/* 子系统仍依赖它（纯 JSON 解析基础设施，与具体 agent 工具无关）。
  */
 
 import { z } from 'zod';

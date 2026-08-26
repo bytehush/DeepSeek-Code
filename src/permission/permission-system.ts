@@ -11,8 +11,7 @@
  * 本函数只消费最终风险，不做破坏性二次判定。
  */
 
-import type { PermissionMode } from './index.ts';
-import type { Risk } from '../tools/index.ts';
+import type { PermissionMode, Risk } from './index.ts';
 
 export type PermissionVerdict =
   | { action: 'allow' }
