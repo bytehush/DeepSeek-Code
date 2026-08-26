@@ -140,6 +140,22 @@ function ScrollIndicator(props: { linesAbove: number; linesBelow: number }) {
   );
 }
 
+/** 右侧比例滚动条：track=消息区行数，thumb 高度/位置按「上方隐藏行数 / 总行数」比例 */
+function Scrollbar(props: { linesAbove: number; total: number; area: number }) {
+  const { linesAbove, total, area } = props;
+  const track = Math.max(1, area);
+  const content = Math.max(1, total);
+  const thumbH = Math.max(1, Math.round((area / content) * track));
+  const maxPos = Math.max(0, track - thumbH);
+  const scrollable = Math.max(1, total - area);
+  const pos = Math.min(maxPos, Math.round((linesAbove / scrollable) * maxPos));
+  const lines: string[] = [];
+  for (let i = 0; i < track; i++) {
+    lines.push(i >= pos && i < pos + thumbH ? '█' : '┊');
+  }
+  return <Text color="#4aa3e0">{lines.join('\n')}</Text>;
+}
+
 /** 底部输入框 */
 function InputBar(props: {
   input: string;
@@ -438,20 +454,25 @@ export function App(props: AppProps) {
         borderColor="#2f6fb0"
         paddingX={1}
       >
-        <Box flexDirection="column" height={sliceArea}>
-          {window.rendered.map((it) =>
-            it.msg.role === 'assistant' && !it.isClipped ? (
-              <MarkdownMessage
-                key={it.msg.id}
-                text={it.text}
-                role={it.msg.role}
-                phase={it.msg.phase}
-              />
-            ) : (
-              <PlainTextMessage key={it.msg.id} m={it.msg} text={it.text} />
-            ),
-          )}
-          {c.busy && <ThinkingIndicator />}
+        <Box flexDirection="row" height={sliceArea}>
+          <Box flexDirection="column" flexGrow={1}>
+            {window.rendered.map((it) =>
+              it.msg.role === 'assistant' && !it.isClipped ? (
+                <MarkdownMessage
+                  key={it.msg.id}
+                  text={it.text}
+                  role={it.msg.role}
+                  phase={it.msg.phase}
+                />
+              ) : (
+                <PlainTextMessage key={it.msg.id} m={it.msg} text={it.text} />
+              ),
+            )}
+            {c.busy && <ThinkingIndicator />}
+          </Box>
+          {window.linesAbove > 0 || window.linesBelow > 0 ? (
+            <Scrollbar linesAbove={window.linesAbove} total={layout.total} area={sliceArea} />
+          ) : null}
         </Box>
         <Box flexGrow={1} />
         <ScrollIndicator linesAbove={window.linesAbove} linesBelow={window.linesBelow} />
