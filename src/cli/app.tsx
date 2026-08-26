@@ -114,6 +114,32 @@ const PlainTextMessage = memo(
   (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role,
 );
 
+/** 底部滚动指示：贴底显示「● 已贴底」；有历史/新消息时显示两侧行数 */
+function ScrollIndicator(props: { linesAbove: number; linesBelow: number }) {
+  const { linesAbove, linesBelow } = props;
+  const left = linesAbove > 0 ? `↑ ${linesAbove} 行` : '';
+  const right = linesBelow > 0 ? `↓ ${linesBelow} 行 · PgDn 回底部` : '● 已贴底';
+  if (!left) {
+    return (
+      <Box flexDirection="row" justifyContent="flex-end" width="100%">
+        <Text color="#9aa0a6" dimColor>
+          {right}
+        </Text>
+      </Box>
+    );
+  }
+  return (
+    <Box flexDirection="row" justifyContent="space-between" width="100%">
+      <Text color="#4aa3e0" dimColor>
+        {left}
+      </Text>
+      <Text color="#4aa3e0" dimColor>
+        {right}
+      </Text>
+    </Box>
+  );
+}
+
 /** 底部输入框 */
 function InputBar(props: {
   input: string;
@@ -191,11 +217,24 @@ export function App(props: AppProps) {
     return { items, total };
   }, [c.messages, innerW]);
 
-  // M1：固定贴底尾窗（M2 引入 c.scrollOffset 后可上翻查看历史）
+  // 尾窗选择：scrollOffset 为距底端隐藏的消息条数（0=贴底显示最新；滚动键驱动）
   const window = useMemo(
-    () => selectViewWindow(layout.items, sliceArea, 0, innerW),
-    [layout.items, sliceArea, innerW],
+    () => selectViewWindow(layout.items, sliceArea, c.scrollOffset, innerW),
+    [layout.items, sliceArea, c.scrollOffset, innerW],
   );
+
+  // ── 滚动引用（useInput 闭包内读取最新值，避免陈旧闭包）──
+  const sliceAreaRef = useRef(sliceArea);
+  sliceAreaRef.current = sliceArea;
+  const windowRef = useRef(window);
+  windowRef.current = window;
+  const maxHiddenMsgsRef = useRef(Math.max(0, layout.items.length - 1));
+  maxHiddenMsgsRef.current = Math.max(0, layout.items.length - 1);
+  // 贴底跟随：true = 新内容到达时自动回到底部（用户在底部时滚动不打断）
+  const stickRef = useRef(true);
+  useEffect(() => {
+    if (stickRef.current) c.setScrollOffset(0);
+  }, [layout.total]);
 
   // ══ 终端输入处理（按键→动作映射，聊天逻辑走控制器）══
   useInput(
@@ -321,6 +360,23 @@ export function App(props: AppProps) {
     { isActive: true },
   );
 
+  // 聊天区滚动（独立 useInput、isActive 恒真：流式输出期间也能翻历史）
+  useInput(
+    (_ch, key) => {
+      if (c.showKeyModal) return;
+      if (!key.pageUp && !key.pageDown) return;
+      const cur = c.scrollOffsetRef.current;
+      const max = maxHiddenMsgsRef.current;
+      const page = Math.max(1, windowRef.current.rendered.length);
+      let next = cur;
+      if (key.pageUp) next = Math.min(max, cur + page);
+      else if (key.pageDown) next = Math.max(0, cur - page);
+      stickRef.current = next === 0;
+      c.setScrollOffset(next);
+    },
+    { isActive: true },
+  );
+
   // 更换 API Key 遮罩：开启时不渲染主界面，由 KeyCapture 独占输入
   if (c.showKeyModal) {
     return (
@@ -371,6 +427,7 @@ export function App(props: AppProps) {
           {c.busy && <ThinkingIndicator />}
         </Box>
         <Box flexGrow={1} />
+        <ScrollIndicator linesAbove={window.linesAbove} linesBelow={window.linesBelow} />
       </Box>
       {c.confirm && (
         <Box paddingX={1}>
