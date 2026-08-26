@@ -8,6 +8,7 @@ import { runAgent, type AgentEvent, type PermissionMode } from '../agent/loop.ts
 import type { OutputStyle } from '../agent/output-style.ts';
 import { styleLabel, parseStyle, saveStyle } from '../agent/output-style.ts';
 import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
+import { getApiKeyTail } from './keyContext.ts';
 import { msgOf } from '../utils/logger.ts';
 import { rollbackManager } from '../utils/rollback.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
@@ -98,10 +99,17 @@ function friendlyErrorMessage(category: string | undefined, raw: string): string
     case 'server_unavailable':
       return '🔌 服务端暂时不可用（限流或服务过载）：请稍候片刻后重试；若持续出现，请检查 API Key 配额或网络连通性。';
     case 'auth': {
-      // 从脱敏后的报错里提取当前 Key 末尾 4 位（如 "Your api key: ****90c1 is invalid"）。
-      // 该串由 DeepSeek 服务端脱敏，不含完整 Key，安全可展示。
-      const tail = /api key:\s*\*+([0-9a-zA-Z]{4})/i.exec(raw);
-      const tailText = tail ? `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）` : '';
+      // 优先用启动时就捕获的 Key 末 4 位（assemble 在 Agent 构造前存入 keyContext），
+      // 避免：① pi-ai 把 process.env 改写成脱敏串（如 "****ined"）；② 服务商报文中被二次变形的尾号。
+      // 末 4 位不含完整 Key，安全可展示。
+      const captured = getApiKeyTail();
+      let tailText = '';
+      if (captured) {
+        tailText = `   当前使用的 Key 末尾 4 位：${captured}（来自本地配置，非完整 Key）`;
+      } else {
+        const tail = /api key:\s*\*+([0-9a-zA-Z]{4})/i.exec(raw);
+        if (tail) tailText = `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）`;
+      }
       return (
         '🔑 API Key 无效或未授权（DeepSeek 返回 401 鉴权失败）\n' +
         '   修复方式（任选其一）：\n' +

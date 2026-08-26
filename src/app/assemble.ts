@@ -12,6 +12,7 @@ import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { createAtomicTools } from '../agent/pi-tools.ts';
 import { getMode } from '../config/model-mode.ts';
+import { setApiKeyTail } from './keyContext.ts';
 import type { Credentials } from '../auth/credentials.ts';
 import type { AppProps } from './types.ts';
 
@@ -30,6 +31,9 @@ export async function assembleAppProps(
 
   // 凭证注入 Pi 所需的 DEEPSEEK_API_KEY 环境变量（deepseekProvider 走 envApiKeyAuth）
   process.env.DEEPSEEK_API_KEY = creds.apiKey;
+  // 在 Agent 构造之前捕获 Key 末 4 位：pi-ai 在请求命中 401 时会改写 env 为脱敏串，
+  // 届时再读就拿不到真值了。末 4 位不含完整 Key，安全可展示。
+  setApiKeyTail(creds.apiKey.length >= 4 ? creds.apiKey.slice(-4) : null);
 
   const models = createModels();
   models.setProvider(deepseekProvider());
