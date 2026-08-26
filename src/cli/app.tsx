@@ -1,4 +1,4 @@
-import { Box, Text, render, useInput, useApp, useStdout } from 'ink';
+import { Box, Text, render, useInput, useApp, useStdout, useStdin } from 'ink';
 import { useState, useCallback, useRef, useEffect, memo, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
@@ -376,6 +376,33 @@ export function App(props: AppProps) {
     },
     { isActive: true },
   );
+
+  // 鼠标滚轮滚动（xterm SGR 编码：\x1b[?1000h + \x1b[?1006h）
+  // 仅真实 TTY 启用（headless 测试 / 管道 / CI 环境 process.stdin.isTTY=false 自动跳过）。
+  // 监听器只解析滚轮序列、不消费非鼠标字节，ink 的键盘解析不受影响。
+  const { stdin: ttyStdin } = useStdin();
+  useEffect(() => {
+    if (!process.stdin.isTTY) return;
+    process.stdout.write('\x1b[?1000h\x1b[?1006h');
+    const onData = (buf: Buffer | string) => {
+      const s = typeof buf === 'string' ? buf : buf.toString('utf8');
+      const m = /\x1b\[<(\d+);\d+;\d+[Mm]/.exec(s);
+      if (!m) return;
+      const code = Number(m[1]);
+      if (code !== 64 && code !== 65) return; // 仅滚轮：64=上滚 65=下滚
+      const cur = c.scrollOffsetRef.current;
+      const max = maxHiddenMsgsRef.current;
+      const page = Math.max(1, Math.ceil(windowRef.current.rendered.length / 3));
+      const next = code === 64 ? Math.min(max, cur + page) : Math.max(0, cur - page);
+      stickRef.current = next === 0;
+      c.setScrollOffset(next);
+    };
+    ttyStdin?.on('data', onData);
+    return () => {
+      ttyStdin?.off('data', onData);
+      process.stdout.write('\x1b[?1006l\x1b[?1000l');
+    };
+  }, [ttyStdin]);
 
   // 更换 API Key 遮罩：开启时不渲染主界面，由 KeyCapture 独占输入
   if (c.showKeyModal) {
