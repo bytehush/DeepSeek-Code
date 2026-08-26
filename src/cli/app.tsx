@@ -255,6 +255,16 @@ export function App(props: AppProps) {
   // ══ 终端输入处理（按键→动作映射，聊天逻辑走控制器）══
   useInput(
     (ch, key) => {
+      // ↓↓↓ 新增：过滤鼠标 SGR 序列（详见 docs/Bug修复-鼠标滚轮字符泄漏到输入框.md）
+      // 实测：Node readline 消费掉 \x1b 前缀后，useInput 收到的是残余 "[<65;66;19M"（以 [ 开头、不含 ESC）；
+      // 不同终端也可能保留完整 "\x1b[<65;66;19M" 或只剩 "<65;66;19M"。统一用正则匹配三种形态：
+      //   可选 ESC + 可选 [ + <数字;数字;数字 + M/m（M=按下，m=释放）
+      if (ch && ch.length > 1 && /^(?:\x1b)?\[?<\d+;\d+;\d+[Mm]$/.test(ch)) {
+        // 不让 SGR 鼠标事件进入 input state；滚轮逻辑由 data 监听器处理
+        return;
+      }
+      // ↑↑↑ 新增结束
+
       // 权限确认 y/n
       if (c.confirm) {
         if (ch === 'y' || ch === 'Y') {
