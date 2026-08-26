@@ -65,44 +65,69 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   const confirmRef = useRef<{ prompt: string; resolve: (b: boolean) => void } | null>(null);
   const askTextRef = useRef<{ prompt: string; resolve: (t: string) => void } | null>(null);
 
+  // ── 流式批处理：同一 microtask tick 内的多次 setMessages 合并为一次 React 渲染 ──
+  // 流式输出时每个 token 触发一次状态更新，若不合并，高频 setState 会让事件循环被
+  // React reconcile + ink stdout 写出占满，键盘/鼠标输入排队，产生"流式期间卡死"观感。
+  const pendingProducers = useRef<((prev: UiMessage[]) => UiMessage[])[]>([]);
+  const batchScheduled = useRef(false);
+  const batchedSetMessages = useCallback((producer: (prev: UiMessage[]) => UiMessage[]) => {
+    pendingProducers.current.push(producer);
+    if (batchScheduled.current) return;
+    batchScheduled.current = true;
+    queueMicrotask(() => {
+      const list = pendingProducers.current.splice(0, pendingProducers.current.length);
+      batchScheduled.current = false;
+      setMessages((prev) => list.reduce((acc, p) => p(acc), prev));
+    });
+  }, []);
+
   // 让 getState 始终读到最新 state（避免 runChatTurn 闭包过期）
   const stateRef = useRef({ mode, planMode, outputStyle });
   stateRef.current = { mode, planMode, outputStyle };
   const messagesRef = useRef<UiMessage[]>(messages);
   messagesRef.current = messages;
 
-  const push = useCallback((role: MsgRole, text: string): number => {
-    const id = msgId.current++;
-    setMessages((m) => [...m, { id, role, text }]);
-    return id;
-  }, []);
+  const push = useCallback(
+    (role: MsgRole, text: string): number => {
+      const id = msgId.current++;
+      batchedSetMessages((m) => [...m, { id, role, text }]);
+      return id;
+    },
+    [batchedSetMessages],
+  );
 
-  const appendTo = useCallback((id: number, chunk: string) => {
-    setMessages((m) => m.map((x) => (x.id === id ? { ...x, text: x.text + chunk } : x)));
-  }, []);
+  const appendTo = useCallback(
+    (id: number, chunk: string) => {
+      batchedSetMessages((m) => m.map((x) => (x.id === id ? { ...x, text: x.text + chunk } : x)));
+    },
+    [batchedSetMessages],
+  );
 
   const appendStreaming = useCallback(
     (chunk: string, _reactPhase?: 'thought' | 'action' | 'observation' | 'final' | 'progress') => {
       if (streamingId.current === null) {
         const id = msgId.current++;
         streamingId.current = id;
-        setMessages((m) => [...m, { id, role: 'assistant', text: chunk }]);
+        batchedSetMessages((m) => [...m, { id, role: 'assistant', text: chunk }]);
       } else {
         appendTo(streamingId.current, chunk);
       }
     },
-    [appendTo],
+    [appendTo, batchedSetMessages],
   );
 
-  const endStreaming = useCallback((phase?: 'progress' | 'final', interrupted?: boolean) => {
-    const id = streamingId.current;
-    if (id !== null && (phase || interrupted)) {
-      setMessages((m) =>
-        m.map((x) => (x.id === id ? { ...x, ...(phase ? { phase } : {}), ...(interrupted ? { interrupted: true } : {}) } : x)),
-      );
-    }
-    streamingId.current = null;
-  }, []);
+  const endStreaming = useCallback(
+    (phase?: 'progress' | 'final', interrupted?: boolean) => {
+      const id = streamingId.current;
+      if (id !== null && (phase || interrupted)) {
+        batchedSetMessages((m) =>
+          m.map((x) => (x.id === id ? { ...x, ...(phase ? { phase } : {}), ...(interrupted ? { interrupted: true } : {}) } : x)),
+        );
+      }
+      streamingId.current = null;
+    },
+    [batchedSetMessages],
+  );
 
   // 网页路径的思考盒晋升由 agent-host（Node）处理；CLI/TUI 此处无对应概念，置空操作。
   const prometeThinkingToFinal = useCallback((): void => {}, []);
@@ -112,9 +137,9 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
       endStreaming();
       const id = msgId.current++;
       toolMsgId.current = id;
-      setMessages((m) => [...m, { id, role: 'tool', text: `🔧 执行工具 ${toolName}` }]);
+      batchedSetMessages((m) => [...m, { id, role: 'tool', text: `🔧 执行工具 ${toolName}` }]);
     },
-    [endStreaming],
+    [endStreaming, batchedSetMessages],
   );
 
   const appendTool = useCallback(

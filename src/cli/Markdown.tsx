@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import { useMemo, type ReactNode } from 'react';
+import { memo, useMemo, type ReactNode } from 'react';
 import type { MsgRole } from '../app/types.ts';
 
 /**
@@ -149,29 +149,40 @@ function buildBlocks(text: string, opts: BuildOpts): ReactNode[] {
   return blocks;
 }
 
-export function MarkdownMessage(props: {
-  text: string;
-  role: MsgRole;
-  phase?: 'progress' | 'final';
-}) {
-  const { text, role, phase } = props;
-  const isProgress = role === 'assistant' && phase === 'progress';
-  const prefix =
-    role === 'user' ? '你> '
-    : role === 'tool' || role === 'system' || role === 'error' ? ''
-    : isProgress ? '⋯ ' : 'Agent> ';
-  const roleColor =
-    role === 'user' ? '#7ec8e3'
-    : role === 'error' ? '#ff6b6b'
-    : role === 'tool' ? '#d98cff'
-    : role === 'system' ? '#9aa0a6'
-    : '#e8e8e8'; // assistant 前缀色（正文为默认白，与原实现一致）
+/**
+ * memo：父级 messages 数组每次变化都会重建子组件；仅当 text/role/phase 实际变化时
+ * 才重新渲染，避免流式输出期间全列表消息都跟着 reconcile（长会话性能关键）。
+ */
+export const MarkdownMessage = memo(
+  function MarkdownMessage(props: { text: string; role: MsgRole; phase?: 'progress' | 'final' }) {
+    const { text, role, phase } = props;
+    const isProgress = role === 'assistant' && phase === 'progress';
+    const prefix =
+      role === 'user'
+        ? '你> '
+        : role === 'tool' || role === 'system' || role === 'error'
+          ? ''
+          : isProgress
+            ? '⋯ '
+            : 'Agent> ';
+    const roleColor =
+      role === 'user'
+        ? '#7ec8e3'
+        : role === 'error'
+          ? '#ff6b6b'
+          : role === 'tool'
+            ? '#d98cff'
+            : role === 'system'
+              ? '#9aa0a6'
+              : '#e8e8e8'; // assistant 前缀色（正文为默认白，与原实现一致）
 
-  // text 不变则不重算，避免长会话每次重渲染都重新解析
-  const blocks = useMemo(
-    () => buildBlocks(text, { isProgress, prefix, roleColor }),
-    [text, isProgress, prefix, roleColor]
-  );
+    // text 不变则不重算，避免长会话每次重渲染都重新解析
+    const blocks = useMemo(
+      () => buildBlocks(text, { isProgress, prefix, roleColor }),
+      [text, isProgress, prefix, roleColor],
+    );
 
-  return <Box flexDirection="column">{blocks}</Box>;
-}
+    return <Box flexDirection="column">{blocks}</Box>;
+  },
+  (a, b) => a.text === b.text && a.role === b.role && a.phase === b.phase,
+);

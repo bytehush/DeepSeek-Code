@@ -1,5 +1,5 @@
-import { Box, Text, render, useInput, useApp } from 'ink';
-import { useState, useCallback, useRef } from 'react';
+import { Box, Text, render, useInput, useApp, useStdout } from 'ink';
+import { useState, useCallback, useRef, useEffect, memo, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
 import { ThinkingIndicator } from './thinkingIndicator.tsx';
@@ -10,6 +10,7 @@ import { styleLabel } from '../agent/output-style.ts';
 import { getMode, modeLabel } from '../config/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
+import { computeAreaHeight, estimateLines, prefixWidthOf, selectViewWindow } from '../app/viewport.ts';
 
 /** Abyssal Pixel 风格 Banner */
 function Banner(props: { version: string; model: string; cwd: string }) {
@@ -89,6 +90,30 @@ function WhaleMascot(props: { compact?: boolean }) {
   );
 }
 
+/** 非 assistant 消息（user/tool/system/error）的纯文本行，memo 防长会话全列表重渲染 */
+const PlainTextMessage = memo(
+  function PlainTextMessage({ m, text }: { m: UiMessage; text: string }) {
+    const color =
+      m.role === 'user'
+        ? '#7ec8e3'
+        : m.role === 'error'
+          ? '#ff6b6b'
+          : m.role === 'tool'
+            ? '#d98cff'
+            : m.role === 'system'
+              ? '#9aa0a6'
+              : '#e8e8e8';
+    const prefix = m.role === 'user' ? '你> ' : m.role === 'assistant' ? 'Agent> ' : '';
+    return (
+      <Text wrap="wrap">
+        <Text color={color}>{prefix}</Text>
+        <Text>{text}</Text>
+      </Text>
+    );
+  },
+  (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role,
+);
+
 /** 底部输入框 */
 function InputBar(props: {
   input: string;
@@ -142,6 +167,35 @@ export function App(props: AppProps) {
   const { exit } = useApp();
 
   const modelShort = getMode() === 'pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
+
+  // ── 视口：消息区（圆角边框盒内部）可用行数 + 行数布局 + 尾窗切片 ──
+  const { stdout } = useStdout();
+  const cols = stdout.columns ?? 80;
+  const rows = stdout.rows ?? 24;
+
+  // 切片行数 = 消息区可用行数 - 指示器 1 行 - (busy ? 思考指示 1 行)
+  const areaHeight = computeAreaHeight(rows);
+  const sliceArea = Math.max(1, areaHeight - 1 - (c.busy ? 1 : 0));
+  // 边框 2 + paddingX 2 + 滚动条/间距预留 2
+  const innerW = Math.max(10, cols - 6);
+
+  // 消息行数布局：每条消息的估高（消息/宽度变化才重算）
+  const layout = useMemo(() => {
+    const items: { msg: UiMessage; start: number; height: number }[] = [];
+    let total = 0;
+    for (const m of c.messages) {
+      const h = estimateLines(m.text, innerW, prefixWidthOf(m.role, m.phase));
+      items.push({ msg: m, start: total, height: h });
+      total += h;
+    }
+    return { items, total };
+  }, [c.messages, innerW]);
+
+  // M1：固定贴底尾窗（M2 引入 c.scrollOffset 后可上翻查看历史）
+  const window = useMemo(
+    () => selectViewWindow(layout.items, sliceArea, 0, innerW),
+    [layout.items, sliceArea, innerW],
+  );
 
   // ══ 终端输入处理（按键→动作映射，聊天逻辑走控制器）══
   useInput(
@@ -294,33 +348,29 @@ export function App(props: AppProps) {
   return (
     <Box flexDirection="column" height="100%">
       <Banner version={props.version} model={modelShort} cwd={process.cwd()} />
-      <Box flexGrow={1} flexDirection="column" paddingX={1}>
-        {c.messages.map((m: UiMessage) => {
-          if (m.role === 'assistant') {
-            return <MarkdownMessage key={m.id} text={m.text} role={m.role} phase={m.phase} />;
-          }
-          return (
-            <Text key={m.id} wrap="wrap">
-              <Text
-                color={
-                  m.role === 'user'
-                    ? '#7ec8e3'
-                    : m.role === 'error'
-                      ? '#ff6b6b'
-                      : m.role === 'tool'
-                        ? '#d98cff'
-                        : m.role === 'system'
-                          ? '#9aa0a6'
-                          : '#e8e8e8'
-                }
-              >
-                {m.role === 'user' ? '你> ' : m.role === 'tool' ? '' : m.role === 'system' ? '' : 'Agent> '}
-              </Text>
-              <Text>{m.text}</Text>
-            </Text>
-          );
-        })}
-        {c.busy && <ThinkingIndicator />}
+      <Box
+        flexGrow={1}
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="#2f6fb0"
+        paddingX={1}
+      >
+        <Box flexDirection="column" height={sliceArea}>
+          {window.rendered.map((it) =>
+            it.msg.role === 'assistant' && !it.isClipped ? (
+              <MarkdownMessage
+                key={it.msg.id}
+                text={it.text}
+                role={it.msg.role}
+                phase={it.msg.phase}
+              />
+            ) : (
+              <PlainTextMessage key={it.msg.id} m={it.msg} text={it.text} />
+            ),
+          )}
+          {c.busy && <ThinkingIndicator />}
+        </Box>
+        <Box flexGrow={1} />
       </Box>
       {c.confirm && (
         <Box paddingX={1}>
@@ -345,7 +395,19 @@ export function App(props: AppProps) {
 
 /** 引导入口：由 main.ts 调用，接管整个终端渲染 */
 export async function startApp(props: AppProps): Promise<void> {
+  // 进入备用屏幕缓冲 + 隐藏光标 + 清屏：清除 npm start / tsx / [auth] 等前置输出，
+  // 只保留 TUI 画面（等价于 vim/less 的全屏接管行为）。
+  process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H');
+  // 退出恢复：显示光标 + 离开备用屏幕（任何退出路径都恢复，避免终端"卡住"）
+  const restore = () => process.stdout.write('\x1b[?25h\x1b[?1049l');
+  process.on('exit', restore);
+
   // 禁用 ink 默认的 Ctrl+C 退出；退出程序统一走 /exit 命令。
   const { waitUntilExit } = render(<App {...props} />, { exitOnCtrlC: false });
-  await waitUntilExit();
+  try {
+    await waitUntilExit();
+  } finally {
+    restore();
+    process.removeListener('exit', restore);
+  }
 }
