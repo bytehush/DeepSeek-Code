@@ -1,6 +1,6 @@
 # TUI Bug 修复——全屏状态下滑到顶部时聊天区底部出现空白
 
-> **状态**：待修复（文档就绪，等用户拍板）
+> **状态**：已修复（`c524dde`，2026-08-27）
 > **类型**：Bug 修复（视觉瑕疵）
 > **关联**：本文与 `docs/UX优化-连续滚动与滚动条拖动.md` §9.1 优化 A 后的回退场景强相关
 > **截图**：2026-08-27 193505（顶部+ ↓52行）/ 193512（中部+ ↓49行）/ 193516（贴底 无指示器）
@@ -186,3 +186,39 @@ npm start
 - `src/app/viewport.ts:32-57` estimateLines / computeAreaHeight / prefixWidthOf
 - `src/app/viewport.ts:179-227` selectRowWindow（关键修改点）
 - `src/app/markdown-lines.ts:40-69` splitTextToLines（精确折行，与 estimateLines 度量差 +1）
+
+---
+
+## 9. 实施记录（2026-08-27，已修复）
+
+> 本节记录实际实现与文档规划（§2-§4）的差异，作为未来维护的依据。提交 `c524dde`。
+
+### 9.1 实证修正：文档 §2 根因分析的部分推断不成立
+
+按「证据驱动」纪律，用 ink-testing-library 逐 hidden 采样实测（bug-check2），发现文档 §2 的分析有两处需要修正：
+
+| 文档 §2 推断 | 实测结论 |
+|---|---|
+| §2.1/§2.2：「selectRowWindow 的渲染行数会少于 sliceArea」（不变量破裂） | **不成立**。`selectRowWindow` 声明的 `height` 之和恒等于 `sliceArea`（`sum === expect` 在全部采样点成立）。行数分配逻辑没有 bug。 |
+| §2.3：两套度量（estimateLines +1 与 splitTextToLines）导致偏差 | **部分成立**。真正的偏差是 **`innerW` 估算列宽比实际渲染窄 1 列**：`innerW = cols - 6`（预留边框2+padding2+滚动条2），但 Scrollbar 每行只占 1 字符列 → 消息列实际渲染宽 = `cols - 5`。估算折行更窄 → 估算行数 ≥ 实际渲染行数 → 固定高度 Box（flex-start 顶部对齐）底部留白。全屏 sliceArea 大时被放大成"大片空白"。 |
+| §2.2 场景 B：「最后一条可见消息只渲染了部分尾部」 | 实测的另一个根因是 **省略标记折行溢出**：`…(省略前/后 N 行)` 替换首/末行时未考虑渲染前缀（`Agent> `/`你> `），标记+前缀超 innerW → 折成 2 行 → 实际渲染行数比声明多 1（hidden=0 时 declared=5 real=6）。 |
+
+### 9.2 落地改动（2 文件，+27/−5 净代码）
+
+1. **`src/cli/app.tsx:222`**：`innerW = Math.max(10, cols - 6)` → `cols - 5`（与消息列实际渲染宽度精确一致）。这是修复主体。
+2. **`src/app/markdown-lines.ts`**：新增 `fitMark`，省略标记按「前缀预算」压缩（headMark 预算 `innerW - prefixW`、tailMark 预算 `innerW`；`…(省略前 N 行)` → `…(略N)` → `…N`），保证「前缀+标记」单行放下，不折行溢出。
+
+### 9.3 曾被尝试但否决的方案（保留教训）
+
+- **selectRowWindow 末尾补齐空行**（文档 §4.2 B 方向）：实测 `shown < sliceArea` 只在「内容不足一屏」时触发，且**MarkdownMessage（buildBlocks）会吞掉尾部空行**（`"…\n\n\n\n"` 渲染后仍 1 行）→ 补齐对 assistant 消息无效、行为不一致。否决：内容不足一屏时留白是正常 UI 行为，不需要填满。
+- **文档 §4.1 A 方向（改布局让消息列 flexGrow）**：实测根因不在布局而在估算宽度，布局无需动。
+
+### 9.4 验证方式（沙箱无 TTY 替代方案）
+
+- **纯函数实证**（bug-check2）：`selectRowWindow` + ink 渲染，逐 hidden ∈ {0, 1, mid, max-1, max} 断言 `declared === real`。修复前 hidden=maxHidden 时 declared=5 real=4；修复后全部一致（含 hidden=0 的标记溢出 case）。
+- **综合回归**（boot-check）：18 项全过，其中新增「滚到顶后无 ↑ 有 ↓ N 行」+「滚到顶后空白行数 = 0」两个断言直接覆盖用户主诉。
+- `tsc --noEmit` 0 errors。
+
+### 9.5 待用户本机手测
+
+`npm start` → 最大化窗口 → 3 次 `/help` → PgUp 滚到顶：聊天区底部应紧贴边框（无空白）；滚动条 thumb 位置与内容同步。
