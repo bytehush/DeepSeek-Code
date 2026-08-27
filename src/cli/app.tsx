@@ -140,7 +140,13 @@ function ScrollIndicator(props: { linesAbove: number; linesBelow: number }) {
   );
 }
 
-/** 右侧比例滚动条：track=消息区行数，thumb 高度/位置按「上方隐藏行数 / 总行数」比例 */
+/**
+ * 右侧比例滚动条：track=消息区行数，thumb 高度/位置按「上方隐藏行数 / 总行数」比例。
+ * 视觉语言（2026-08-28 优化）：track 用空格（不渲染可见轨道），只有 thumb 一个实心块
+ * 随滚动移动——避免满屏 `┊` 与内容色系混淆（用户误判为内容渲染瑕疵，见
+ * docs/Bug修复-滚动条track字符与内容色系混淆.md）。thumb 用品牌深蓝，与行内代码
+ * cyan 拉开差距，保证「一看就不是内容」。拖动/点击 hit-test 按列位置判定，不依赖字符。
+ */
 function Scrollbar(props: { linesAbove: number; total: number; area: number }) {
   const { linesAbove, total, area } = props;
   const track = Math.max(1, area);
@@ -151,9 +157,9 @@ function Scrollbar(props: { linesAbove: number; total: number; area: number }) {
   const pos = Math.min(maxPos, Math.round((linesAbove / scrollable) * maxPos));
   const lines: string[] = [];
   for (let i = 0; i < track; i++) {
-    lines.push(i >= pos && i < pos + thumbH ? '█' : '┊');
+    lines.push(i >= pos && i < pos + thumbH ? '█' : ' ');
   }
-  return <Text color="#4aa3e0">{lines.join('\n')}</Text>;
+  return <Text color="#185FA5">{lines.join('\n')}</Text>;
 }
 
 /** 底部输入框 */
