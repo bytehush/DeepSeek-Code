@@ -10,7 +10,7 @@ import { styleLabel } from '../agent/output-style.ts';
 import { getMode, modeLabel } from '../config/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
-import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow } from '../app/viewport.ts';
+import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow, BANNER_ROWS } from '../app/viewport.ts';
 
 /** Abyssal Pixel 风格 Banner */
 function Banner(props: { version: string; model: string; cwd: string }) {
@@ -405,30 +405,97 @@ export function App(props: AppProps) {
     { isActive: true },
   );
 
-  // 鼠标滚轮滚动（xterm SGR 编码：\x1b[?1000h + \x1b[?1006h）
+  // 鼠标滚轮 + 滚动条 hit-test / 拖动（xterm SGR：\x1b[?1000h + \x1b[?1002h + \x1b[?1006h）
+  // - 滚轮（code 64/65）→ 行级滚动（3 行/格）
+  // - 滚动条列（内容区最右列）内：按下（code 0/1/2）→ 点在 thumb 上进入拖动、
+  //   点在 track 空白跳转；移动（code 32-35，需 ?1002h cell motion）→ 拖动实时更新；
+  //   尾部小写 m = 释放 → 清拖动状态
   // 仅真实 TTY 启用（headless 测试 / 管道 / CI 环境 process.stdin.isTTY=false 自动跳过）。
-  // 监听器只解析滚轮序列、不消费非鼠标字节，ink 的键盘解析不受影响。
+  // 监听器只解析鼠标字节、不消费普通键盘字节，ink 的键盘解析不受影响。
   const { stdin: ttyStdin } = useStdin();
   useEffect(() => {
     if (!process.stdin.isTTY) return;
-    process.stdout.write('\x1b[?1000h\x1b[?1006h');
+    process.stdout.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+    let dragState: { startInTrack: number; startLinesAbove: number } | null = null;
     const onData = (buf: Buffer | string) => {
       const s = typeof buf === 'string' ? buf : buf.toString('utf8');
-      const m = /\x1b\[<(\d+);\d+;\d+[Mm]/.exec(s);
-      if (!m) return;
-      const code = Number(m[1]);
-      if (code !== 64 && code !== 65) return; // 仅滚轮：64=上滚 65=下滚
-      const cur = c.scrollOffsetRef.current;
-      const max = maxHiddenRowsRef.current;
-      const page = 3; // 行级滚动：滚轮一格 = 3 行（连续滑动的体感粒度）
-      const next = code === 64 ? Math.min(max, cur + page) : Math.max(0, cur - page);
-      stickRef.current = next === 0;
-      c.setScrollOffset(next);
+      // 一次 data 事件可能粘连多个 SGR 序列，逐个解析
+      const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(s)) !== null) {
+        const code = Number(m[1]);
+        const col = Number(m[2]);
+        const row = Number(m[3]);
+        const isRelease = m[4] === 'm';
+
+        // 滚轮：64=上滚 65=下滚（行级滚动，3 行/格）
+        if (code === 64 || code === 65) {
+          const cur = c.scrollOffsetRef.current;
+          const max = maxHiddenRowsRef.current;
+          const next = code === 64 ? Math.min(max, cur + 3) : Math.max(0, cur - 3);
+          stickRef.current = next === 0;
+          c.setScrollOffset(next);
+          continue;
+        }
+        // 任何释放（尾部小写 m）→ 结束拖动（可能在滚动条外松开，须无条件清）
+        if (isRelease) {
+          dragState = null;
+          continue;
+        }
+        // 仅处理按下（0/1/2）与移动（32-35）；其余（如 3 无键移动）忽略
+        if (code > 35) continue;
+
+        // ── 滚动条 hit-test ──
+        const cols = stdout.columns ?? 80;
+        const trackTop = BANNER_ROWS + 2; // Banner 15 行 + chat 顶边框 1 行 + 1 = track 首行（1-based）
+        const scrollbarCol = cols - 2; // 内容区最右列 = 总宽 - 右边框 1 - paddingX 1（1-based）
+        if (col !== scrollbarCol) continue; // 不在滚动条列
+        const trackH = Math.max(1, sliceAreaRef.current);
+        const inTrack = row - trackTop;
+        if (inTrack < 0 || inTrack >= trackH) continue; // 不在 track 行范围
+
+        const totalRows = windowRef.current.totalRows;
+        const area = sliceAreaRef.current;
+        const thumbH = Math.max(1, Math.round((area / Math.max(1, totalRows)) * trackH));
+        const maxPos = Math.max(0, trackH - thumbH);
+        if (maxPos <= 0) continue; // 内容不足一屏，无需滚动
+        const scrollable = Math.max(1, totalRows - area);
+        const curHidden = c.scrollOffsetRef.current;
+        // 统一用 linesAbove（视口上方隐藏行数，与 Scrollbar 组件同向）：
+        // thumb 在底部（maxPos）⇔ linesAbove 最大（贴底），在顶部（0）⇔ linesAbove=0（滚到顶）
+        const linesAboveNow = Math.max(0, totalRows - area - curHidden);
+        const thumbTop = Math.round((linesAboveNow / scrollable) * maxPos);
+        const clampLA = (n: number) => Math.min(Math.max(0, n), scrollable);
+        // linesAbove → hidden（scrollOffset）
+        const hiddenOf = (la: number) => scrollable - la;
+
+        if (code === 0 || code === 1 || code === 2) {
+          // 按下：点在 thumb 上 → 进入拖动；点在 track 空白 → thumb 跳到该位置
+          if (inTrack >= thumbTop && inTrack < thumbTop + thumbH) {
+            dragState = { startInTrack: inTrack, startLinesAbove: linesAboveNow };
+          } else {
+            // 点 track 空白：thumb 中心对齐点击点 → linesAbove → hidden
+            const la = clampLA(Math.round(((inTrack - thumbH / 2) / maxPos) * scrollable));
+            const target = hiddenOf(la);
+            stickRef.current = target === 0;
+            c.setScrollOffset(target);
+          }
+        } else if (dragState) {
+          // 移动（?1002h cell motion）：thumb 上移 → 内容向上滚（hidden 增大）
+          const delta = inTrack - dragState.startInTrack;
+          const la = clampLA(
+            dragState.startLinesAbove + Math.round((delta / maxPos) * scrollable),
+          );
+          const target = hiddenOf(la);
+          stickRef.current = target === 0;
+          c.setScrollOffset(target);
+        }
+      }
     };
     ttyStdin?.on('data', onData);
     return () => {
       ttyStdin?.off('data', onData);
-      process.stdout.write('\x1b[?1006l\x1b[?1000l');
+      process.stdout.write('\x1b[?1002l\x1b[?1006l\x1b[?1000l');
     };
   }, [ttyStdin]);
 
