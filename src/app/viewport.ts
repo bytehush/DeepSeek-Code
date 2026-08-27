@@ -3,6 +3,7 @@
  * 纯函数、无 React 依赖，CLI 视图层与控制器共用。
  */
 import type { UiMessage } from './types.ts';
+import { splitTextToLines, clipMessageRows } from './markdown-lines.ts';
 
 /** 终端显示宽度（CJK 等双宽字符按 2 列计，近似 east-asian-width） */
 export function displayWidth(s: string): number {
@@ -156,4 +157,71 @@ export function selectViewWindow(
     rendered.push({ msg: items[i].msg, text: items[i].msg.text, height: items[i].height, isClipped: false });
   }
   return { rendered, linesAbove, linesBelow };
+}
+
+/** 行级窗口结果：在 ViewWindow 基础上补充总行数（供滚动条比例） */
+export interface RowWindow extends ViewWindow {
+  totalRows: number;
+}
+
+/**
+ * 行级窗口选择（优化 A，替代 selectViewWindow 成为主路径）：
+ * hiddenRows 单位是「行」、语义为「距底部隐藏的行数」——0=贴底显示最新
+ * sliceArea 行；滚动到 maxHidden 时显示头部（滚到顶）。与既有
+ * 「scrollOffset=0 贴底」交互语义保持一致（文档 §5.2 原伪代码方向相反，
+ * 已在实施中修正，见 docs/UX优化-连续滚动与滚动条拖动.md §9）。
+ *
+ * 相比消息窗口模型（整条消息切换 → 大段空白 + 跳页感）：
+ * - 单条消息可「从中间某行开始 / 到中间某行结束」渲染，行数精确 == 分配区间；
+ * - 被裁剪消息由 clipMessageRows 加「省略前/后 N 行」标记（标记替换首/末行，不额外占行）；
+ * - 渲染总行数严格 == sliceArea，不再有大段空白。
+ */
+export function selectRowWindow(
+  items: { msg: UiMessage; height: number }[],
+  sliceArea: number,
+  hiddenRows: number,
+  innerW: number,
+): RowWindow {
+  if (items.length === 0) return { rendered: [], linesAbove: 0, linesBelow: 0, totalRows: 0 };
+
+  // 每条消息的精确显示行数（splitTextToLines 无 +1 保险，与渲染精确一致）
+  const rowCounts = items.map((it) =>
+    splitTextToLines(it.msg.text, innerW, prefixWidthOf(it.msg.role, it.msg.phase)).length,
+  );
+  const totalRows = rowCounts.reduce((s, n) => s + n, 0);
+  const maxHidden = Math.max(0, totalRows - sliceArea);
+  const hidden = Math.min(Math.max(0, hiddenRows), maxHidden);
+  const endRow = totalRows - hidden; // 视口可见的最后一行（不含）；hidden=0 时 = 贴底
+  const startRow = Math.max(0, endRow - sliceArea);
+
+  const rendered: ViewWindowItem[] = [];
+  let acc = 0;
+  let shown = 0;
+  for (let i = 0; i < items.length; i++) {
+    const msgStart = acc;
+    const msgEnd = acc + rowCounts[i];
+    acc = msgEnd;
+    if (msgEnd <= startRow) continue; // 完全在视口上方
+    if (msgStart >= endRow) break; // 完全在视口下方（消息有序，可提前结束）
+    const visStart = Math.max(0, startRow - msgStart);
+    const visEnd = Math.min(rowCounts[i], endRow - msgStart);
+    const slice = clipMessageRows(
+      items[i].msg.text,
+      innerW,
+      prefixWidthOf(items[i].msg.role, items[i].msg.phase),
+      visStart,
+      visEnd,
+    );
+    const lines = Math.min(sliceArea - shown, visEnd - visStart);
+    rendered.push({ msg: items[i].msg, text: slice.text, height: lines, isClipped: slice.isClipped });
+    shown += lines;
+    if (shown >= sliceArea) break; // 视口已填满
+  }
+
+  return {
+    rendered,
+    linesAbove: startRow,
+    linesBelow: Math.max(0, totalRows - endRow),
+    totalRows,
+  };
 }

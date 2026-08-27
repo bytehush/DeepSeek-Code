@@ -33,7 +33,7 @@ export interface AgentController {
   askTextPrompt: string | null;
   showKeyModal: boolean;
   setShowKeyModal: (v: boolean) => void;
-  /** 滚动：距底端隐藏的消息条数（0=贴底）；由 TUI 视图层驱动 */
+  /** 滚动：距顶部隐藏的行数（0=贴底显示最新，行级滚动模型）；由 TUI 视图层驱动 */
   scrollOffset: number;
   setScrollOffset: (n: number) => void;
   scrollOffsetRef: MutableRefObject<number>;
@@ -61,7 +61,7 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   const [confirm, setConfirm] = useState<{ prompt: string } | null>(null);
   const [askTextPrompt, setAskTextPrompt] = useState<string | null>(null);
   const [showKeyModal, setShowKeyModal] = useState(false);
-  /** 滚动状态：距底端隐藏的消息条数（0=贴底显示最新） */
+  /** 滚动状态：距顶部隐藏的行数（0=贴底显示最新，行级滚动模型） */
   const [scrollOffset, setScrollOffset] = useState(0);
   const scrollOffsetRef = useRef(0);
   scrollOffsetRef.current = scrollOffset;

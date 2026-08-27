@@ -10,7 +10,7 @@ import { styleLabel } from '../agent/output-style.ts';
 import { getMode, modeLabel } from '../config/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
-import { computeAreaHeight, estimateLines, prefixWidthOf, selectViewWindow } from '../app/viewport.ts';
+import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow } from '../app/viewport.ts';
 
 /** Abyssal Pixel 风格 Banner */
 function Banner(props: { version: string; model: string; cwd: string }) {
@@ -233,9 +233,9 @@ export function App(props: AppProps) {
     return { items, total };
   }, [c.messages, innerW]);
 
-  // 尾窗选择：scrollOffset 为距底端隐藏的消息条数（0=贴底显示最新；滚动键驱动）
+  // 行级窗口选择：scrollOffset 为距顶部隐藏的行数（0=贴底显示最新；滚动键/滚轮驱动）
   const window = useMemo(
-    () => selectViewWindow(layout.items, sliceArea, c.scrollOffset, innerW),
+    () => selectRowWindow(layout.items, sliceArea, c.scrollOffset, innerW),
     [layout.items, sliceArea, c.scrollOffset, innerW],
   );
 
@@ -244,8 +244,9 @@ export function App(props: AppProps) {
   sliceAreaRef.current = sliceArea;
   const windowRef = useRef(window);
   windowRef.current = window;
-  const maxHiddenMsgsRef = useRef(Math.max(0, layout.items.length - 1));
-  maxHiddenMsgsRef.current = Math.max(0, layout.items.length - 1);
+  // 最大可隐藏行数（行级）：总行数 - 视口行数；0 = 内容不足一屏
+  const maxHiddenRowsRef = useRef(Math.max(0, window.totalRows - sliceArea));
+  maxHiddenRowsRef.current = Math.max(0, window.totalRows - sliceArea);
   // 贴底跟随：true = 新内容到达时自动回到底部（用户在底部时滚动不打断）
   const stickRef = useRef(true);
   useEffect(() => {
@@ -387,12 +388,13 @@ export function App(props: AppProps) {
   );
 
   // 聊天区滚动（独立 useInput、isActive 恒真：流式输出期间也能翻历史）
+  // 行级滚动：PgUp/PgDn = 一页（sliceArea 行）；↑↓ 保留给输入历史导航
   useInput(
     (_ch, key) => {
       if (c.showKeyModal) return;
       if (!key.pageUp && !key.pageDown) return;
       const cur = c.scrollOffsetRef.current;
-      const max = maxHiddenMsgsRef.current;
+      const max = maxHiddenRowsRef.current;
       const page = Math.max(1, windowRef.current.rendered.length);
       let next = cur;
       if (key.pageUp) next = Math.min(max, cur + page);
@@ -417,8 +419,8 @@ export function App(props: AppProps) {
       const code = Number(m[1]);
       if (code !== 64 && code !== 65) return; // 仅滚轮：64=上滚 65=下滚
       const cur = c.scrollOffsetRef.current;
-      const max = maxHiddenMsgsRef.current;
-      const page = Math.max(1, Math.ceil(windowRef.current.rendered.length / 3));
+      const max = maxHiddenRowsRef.current;
+      const page = 3; // 行级滚动：滚轮一格 = 3 行（连续滑动的体感粒度）
       const next = code === 64 ? Math.min(max, cur + page) : Math.max(0, cur - page);
       stickRef.current = next === 0;
       c.setScrollOffset(next);
@@ -481,7 +483,7 @@ export function App(props: AppProps) {
             {c.busy && <ThinkingIndicator />}
           </Box>
           {window.linesAbove > 0 || window.linesBelow > 0 ? (
-            <Scrollbar linesAbove={window.linesAbove} total={layout.total} area={sliceArea} />
+            <Scrollbar linesAbove={window.linesAbove} total={window.totalRows} area={sliceArea} />
           ) : null}
         </Box>
         <Box flexGrow={1} />
