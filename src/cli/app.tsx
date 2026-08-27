@@ -218,8 +218,10 @@ export function App(props: AppProps) {
   // 切片行数 = 消息区可用行数 - 指示器 1 行 - (busy ? 思考指示 1 行)
   const areaHeight = computeAreaHeight(rows);
   const sliceArea = Math.max(1, areaHeight - 1 - (c.busy ? 1 : 0));
-  // 边框 2 + paddingX 2 + 滚动条/间距预留 2
-  const innerW = Math.max(10, cols - 6);
+  // 消息列实际渲染宽度 = 总宽 - 边框2 - paddingX 2 - 滚动条 1 列（Scrollbar 每行 1 字符）
+  // 注意：若按 cols-6 估算（多预留 1 列），splitTextToLines 会比 ink 实际折行更窄 → 估算行数偏大
+  // → 渲染不满 sliceArea → 滚到顶时底部空白（全屏放大）。精确对齐为 cols-5。
+  const innerW = Math.max(10, cols - 5);
 
   // 消息行数布局：每条消息的估高（消息/宽度变化才重算）
   const layout = useMemo(() => {

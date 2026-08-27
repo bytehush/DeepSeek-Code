@@ -69,6 +69,20 @@ export function splitTextToLines(text: string, innerW: number, prefixW = 0): str
 }
 
 /**
+ * 省略标记按可用宽度压缩：标记行渲染时可能带前缀（首行 headMark 会被加
+ * "Agent> "/"你> " 等前缀），若超出预算会折行成 2 行 → 实际渲染行数比声明
+ * 多 1 → 溢出。因此标记必须保证「前缀 + 标记」单行放得下。
+ * 压缩策略：…(省略前 N 行) → …(略N) → …N
+ */
+function fitMark(mark: string, budget: number): string {
+  if (displayWidth(mark) <= budget) return mark;
+  const n = mark.match(/\d+/)?.[0] ?? '';
+  const short = `…(略${n})`;
+  if (displayWidth(short) <= budget) return short;
+  return `…${n}`;
+}
+
+/**
  * 按行区间切片消息文本，加省略标记（标记替换可见区间首/末行，不额外占行）：
  * - 仅裁头部：`…(省略前 N 行)` + 可见行（头部标记替换第一行）
  * - 仅裁尾部：可见行 + `…(省略后 M 行)`（尾部标记替换最后一行）
@@ -76,6 +90,8 @@ export function splitTextToLines(text: string, innerW: number, prefixW = 0): str
  * - 未裁：原样返回
  *
  * 保证：返回文本的渲染行数 == (visEnd - visStart) 行，精确不溢出。
+ * 标记文本按「前缀预算」压缩（headMark 首行带前缀 → 预算 innerW-prefixW；
+ * tailMark 中间行无前缀 → 预算 innerW），避免折行。
  */
 export function clipMessageRows(
   text: string,
@@ -92,13 +108,17 @@ export function clipMessageRows(
   const visible = rows.slice(keepStart, keepEnd);
   if (visible.length === 0) return { text: '', isClipped: true };
 
-  const headMark = keepStart > 0 ? `…(省略前 ${keepStart} 行)` : null;
-  const tailMark = keepEnd < total ? `…(省略后 ${total - keepEnd} 行)` : null;
+  const headBudget = Math.max(1, innerW - prefixW); // 首行带前缀
+  const tailBudget = Math.max(1, innerW); // 中间/末尾行无前缀
+  const headMark = keepStart > 0 ? fitMark(`…(省略前 ${keepStart} 行)`, headBudget) : null;
+  const tailMark = keepEnd < total ? fitMark(`…(省略后 ${total - keepEnd} 行)`, tailBudget) : null;
 
   // 标记替换首/末行：head 占第 0 行，tail 占最后一行；若同时存在且只够 1 行，合并
   if (headMark && tailMark) {
     if (visible.length === 1) {
-      return { text: `${headMark} ${tailMark}`, isClipped: true };
+      // 合并行位于首行，也按前缀预算压缩
+      const merged = fitMark(`${headMark} ${tailMark}`, headBudget);
+      return { text: merged, isClipped: true };
     }
     visible[0] = headMark;
     visible[visible.length - 1] = tailMark;
