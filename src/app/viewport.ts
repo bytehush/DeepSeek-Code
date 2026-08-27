@@ -5,11 +5,12 @@
 import type { UiMessage } from './types.ts';
 import { splitTextToLines, clipMessageRows } from './markdown-lines.ts';
 
-/** 终端显示宽度（CJK 等双宽字符按 2 列计，近似 east-asian-width） */
+/** 终端显示宽度（CJK 等双宽字符按 2 列计，零宽字符按 0 列计，近似 east-asian-width） */
 export function displayWidth(s: string): number {
   let w = 0;
   for (const ch of s) {
     const c = ch.codePointAt(0) ?? 0;
+    if (c === 0x200b || c === 0x200c || c === 0x200d || c === 0xfeff) continue; // 零宽字符
     const wide =
       (c >= 0x1100 && c <= 0x115f) || // Hangul Jamo
       (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) || // CJK 部首/符号/文字
