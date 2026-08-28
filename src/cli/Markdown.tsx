@@ -1,6 +1,7 @@
 import { Box, Text } from 'ink';
 import { memo, useMemo, type ReactNode } from 'react';
 import type { MsgRole } from '../app/types.ts';
+import { sanitizeBoxDrawing } from './sanitize.ts';
 
 /**
  * ink 版 Markdown 渲染器（替代 utils/markdown.ts 的 chalk/ANSI 版）。
@@ -62,18 +63,23 @@ function buildBlocks(text: string, opts: BuildOpts): ReactNode[] {
     if (!codeBuf.length) return;
     blocks.push(
       <Box key={key++} flexDirection="column">
-        <Text color="cyan" dimColor>{codeLang ? `┌─ ${codeLang}` : '┌─ code'}</Text>
+        {/* 边框字符用 ASCII（+-- / | / +---），避免 box-drawing 视觉污染
+            （docs/Bug修复-长工具调用时右侧散布box-drawing视觉污染.md 方案 2） */}
+        <Text color="cyan" dimColor>{codeLang ? `+-- ${codeLang}` : '+-- code'}</Text>
         {codeBuf.map((l, idx) => (
-          <Text key={idx} color="gray">{'│ ' + l}</Text>
+          <Text key={idx} color="gray">{'| ' + sanitizeBoxDrawing(l)}</Text>
         ))}
-        <Text color="cyan" dimColor>{'└──────────'}</Text>
+        <Text color="cyan" dimColor>{'+----------'}</Text>
       </Box>
     );
     codeBuf = [];
   };
 
   for (const line of lines) {
-    const trimmed = line.trimStart();
+    // 行级 box-drawing → ASCII（方案 3 全局覆盖：agent 工具输出的
+    // tree / git log --graph / npm ls 等原始字符在此全部落为等宽 ASCII）
+    const safeLine = sanitizeBoxDrawing(line);
+    const trimmed = safeLine.trimStart();
 
     // 代码块分隔符（进入/退出）
     if (trimmed.startsWith('```')) {
@@ -88,7 +94,7 @@ function buildBlocks(text: string, opts: BuildOpts): ReactNode[] {
     }
     // 代码块内部：原样灰显，不做行内渲染
     if (inCode) {
-      codeBuf.push(line);
+      codeBuf.push(safeLine);
       continue;
     }
 
@@ -139,7 +145,7 @@ function buildBlocks(text: string, opts: BuildOpts): ReactNode[] {
     blocks.push(
       <Text key={key++} wrap="wrap" dimColor={isProgress}>
         {firstText && prefix ? <Text color={roleColor}>{prefix}</Text> : null}
-        {renderInline(line)}
+        {renderInline(safeLine)}
       </Text>
     );
     firstText = false;

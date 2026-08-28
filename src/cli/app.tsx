@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { WHALE_ART, WHALE_EYES } from './whaleArt.ts';
 import { ThinkingIndicator } from './thinkingIndicator.tsx';
 import { MarkdownMessage } from './Markdown.tsx';
+import { sanitizeBoxDrawing } from './sanitize.ts';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
 import { styleLabel } from '../agent/output-style.ts';
@@ -107,7 +108,8 @@ const PlainTextMessage = memo(
     return (
       <Text wrap="wrap">
         <Text color={color}>{prefix}</Text>
-        <Text>{text}</Text>
+        {/* tool/error/system 原始内容先过 box-drawing → ASCII（方案 3 全局覆盖） */}
+        <Text>{sanitizeBoxDrawing(text)}</Text>
       </Text>
     );
   },
