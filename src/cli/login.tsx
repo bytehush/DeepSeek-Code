@@ -46,15 +46,17 @@ export function KeyCapture({
     }
   });
 
-  const display = show ? value : value ? '•'.repeat(value.length) : '';
+  // 掩码用 ASCII `*` 而非 `•`（U+2022，EAW=Ambiguous → Windows 中文终端 2 列
+  // → 登录框宽度错位）；占位提示 `...` 同理（`…` 也是 Ambiguous）
+  const display = show ? value : value ? '*'.repeat(value.length) : '';
 
   return (
     <Box flexDirection="column">
       <Text>{label}</Text>
-      <Box borderStyle="single" borderColor="#7ec8e3" paddingX={1} marginTop={1}>
-        <Text color={value ? '#ffffff' : '#888888'}>{display || '在此输入…'}</Text>
+      <Box borderStyle="classic" borderColor="#7ec8e3" paddingX={1} marginTop={1}>
+        <Text color={value ? '#ffffff' : '#888888'}>{display || '在此输入...'}</Text>
       </Box>
-      <Text dimColor>回车确认 · Ctrl+R 显示/隐藏 · Esc 取消</Text>
+      <Text dimColor>回车确认 | Ctrl+R 显示/隐藏 | Esc 取消</Text>
       {error ? <Text color="#ff5555">{error}</Text> : null}
     </Box>
   );
@@ -72,9 +74,9 @@ export function LoginScreen({
 }) {
   return (
     <Box flexDirection="column" height="100%" justifyContent="center" alignItems="center">
-      <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
+      <Box borderStyle="classic" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
         <Text color="#2f6fb0" bold>
-          {`DeepSeek Agent · ${firstRun ? '首次登录' : '更换 API Key'}`}
+          {`DeepSeek Agent | ${firstRun ? '首次登录' : '更换 API Key'}`}
         </Text>
         <Text> </Text>
         <KeyCapture

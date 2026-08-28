@@ -16,9 +16,12 @@ import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow, BANNE
 /** Abyssal Pixel 风格 Banner */
 function Banner(props: { version: string; model: string; cwd: string }) {
   const cwdShow =
-    props.cwd.length > 40 ? '…/' + props.cwd.split(/[\\/]/).slice(-2).join('/') : props.cwd;
+    props.cwd.length > 40 ? '.../' + props.cwd.split(/[\\/]/).slice(-2).join('/') : props.cwd;
   return (
-    <Box borderStyle="single" borderColor="#2f6fb0" paddingX={1} flexDirection="row">
+    // 边框用 ASCII classic（`+ - |`）而非 single（`┌─┐│`）：box-drawing 是
+    // EAW=Ambiguous，Windows 中文终端按 2 列渲染 → 边框撑宽 → 内容区错位
+    // （docs/Bug修复-Windows中文终端Ambiguous字符宽度错位.md）
+    <Box borderStyle="classic" borderColor="#2f6fb0" paddingX={1} flexDirection="row">
       <Box flexDirection="column" flexGrow={1} flexBasis={0} paddingRight={2}>
         <Text color="#2f6fb0" bold>{`DeepSeek Agent ${props.version}`}</Text>
         <Text color="#7ec8e3">欢迎回来！</Text>
@@ -46,7 +49,7 @@ function Banner(props: { version: string; model: string; cwd: string }) {
         <Text color="#2f6fb0" bold>命令</Text>
         <Text>
           <Text color="#7ec8e3">/help</Text>
-          <Text dimColor> 查看全部 · </Text>
+          <Text dimColor> 查看全部 | </Text>
           <Text color="#7ec8e3">/exit</Text>
           <Text dimColor> 退出</Text>
         </Text>
@@ -78,9 +81,11 @@ function WhaleMascot(props: { compact?: boolean }) {
             if (WHALE_EYES.has(`(${j},${r})`) !== isEye) break;
             j++;
           }
+          // 实心块用「背景色空格」而非 `█`（U+2588，EAW=Ambiguous）：Windows 中文
+          // 终端把 `█` 渲染 2 列 → 鲸鱼图案错位 + Banner 高度变化 → 聊天区错位
           segs.push(
-            <Text key={k++} color={isEye ? 'black' : '#2f6fb0'}>
-              {'█'.repeat(j - i)}
+            <Text key={k++} backgroundColor={isEye ? '#000000' : '#2f6fb0'}>
+              {' '.repeat(j - i)}
             </Text>,
           );
           i = j;
@@ -116,11 +121,13 @@ const PlainTextMessage = memo(
   (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role,
 );
 
-/** 底部滚动指示：贴底显示「● 已贴底」；有历史/新消息时显示两侧行数 */
+/** 底部滚动指示：贴底显示「* 已贴底」；有历史/新消息时显示两侧行数
+ * （箭头/圆点/间隔号用 ASCII：↑↓●· 是 EAW=Ambiguous，Windows 中文终端按
+ * 2 列渲染 → 指示器宽度偏差 → 换行 → 聊天区高度溢出） */
 function ScrollIndicator(props: { linesAbove: number; linesBelow: number }) {
   const { linesAbove, linesBelow } = props;
-  const left = linesAbove > 0 ? `↑ ${linesAbove} 行` : '';
-  const right = linesBelow > 0 ? `↓ ${linesBelow} 行 · PgDn 回底部` : '● 已贴底';
+  const left = linesAbove > 0 ? `^ ${linesAbove} 行` : '';
+  const right = linesBelow > 0 ? `v ${linesBelow} 行 | PgDn 回底部` : '* 已贴底';
   if (!left) {
     return (
       <Box flexDirection="row" justifyContent="flex-end" width="100%">
@@ -148,6 +155,11 @@ function ScrollIndicator(props: { linesAbove: number; linesBelow: number }) {
  * 随滚动移动——避免满屏 `┊` 与内容色系混淆（用户误判为内容渲染瑕疵，见
  * docs/Bug修复-滚动条track字符与内容色系混淆.md）。thumb 用品牌深蓝，与行内代码
  * cyan 拉开差距，保证「一看就不是内容」。拖动/点击 hit-test 按列位置判定，不依赖字符。
+ *
+ * thumb 实现：背景色空格（宽度恒 1 列）而非 `█`（U+2588，EAW=Ambiguous）——
+ * Windows 中文终端把 `█` 渲染 2 列 → Scrollbar 组件占 2 列 → 内容区实际可用
+ * 宽度比 innerW（cols-5）窄 1 列 → 每行提前折行 → 行数低估 → 右侧散布碎片
+ * （docs/Bug修复-Windows中文终端Ambiguous字符宽度错位.md）。
  */
 function Scrollbar(props: { linesAbove: number; total: number; area: number }) {
   const { linesAbove, total, area } = props;
@@ -157,11 +169,15 @@ function Scrollbar(props: { linesAbove: number; total: number; area: number }) {
   const maxPos = Math.max(0, track - thumbH);
   const scrollable = Math.max(1, total - area);
   const pos = Math.min(maxPos, Math.round((linesAbove / scrollable) * maxPos));
-  const lines: string[] = [];
-  for (let i = 0; i < track; i++) {
-    lines.push(i >= pos && i < pos + thumbH ? '█' : ' ');
-  }
-  return <Text color="#185FA5">{lines.join('\n')}</Text>;
+  return (
+    <Box flexDirection="column">
+      {Array.from({ length: track }, (_, i) => (
+        <Text key={i} backgroundColor={i >= pos && i < pos + thumbH ? '#185FA5' : undefined}>
+          {' '}
+        </Text>
+      ))}
+    </Box>
+  );
 }
 
 /** 底部输入框 */
@@ -179,12 +195,15 @@ function InputBar(props: {
   const before = input.slice(0, cursor);
   const at = input[cursor] ?? ' ';
   const after = input.slice(cursor + 1);
-  const dashedLine = '╍'.repeat(width);
+  // 虚线用 ASCII `-` 而非 `╍`（U+254D，EAW=Ambiguous）：Windows 中文终端按
+  // 2 列渲染 → repeat(width) 实际 = 2*width 列 → 溢出屏宽 → 输入框错位
+  const dashedLine = '-'.repeat(width);
   return (
     <Box flexDirection="column" width="100%">
       <Text color="#4aa3e0">{dashedLine}</Text>
       <Text>
-        <Text color="cyan">▌ </Text>
+        {/* 光标指示用 `|` 而非 `▌`（U+258C，EAW=Ambiguous → Windows 2 列） */}
+        <Text color="cyan">| </Text>
         <Text>{before}</Text>
         <Text backgroundColor="#4aa3e0" color="#ffffff">{at}</Text>
         <Text>{after}</Text>
@@ -195,7 +214,7 @@ function InputBar(props: {
         <Text dimColor>
           {rightHint ?? (
             <>
-              {`● ${mode} mode · `}
+              {`* ${mode} mode | `}
               <Text color="#7ec699">{model}</Text>
             </>
           )}
@@ -513,7 +532,7 @@ export function App(props: AppProps) {
   if (c.showKeyModal) {
     return (
       <Box flexDirection="column" height="100%" justifyContent="center" alignItems="center">
-        <Box borderStyle="round" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
+        <Box borderStyle="classic" borderColor="#2f6fb0" paddingX={2} paddingY={1} flexDirection="column" width={68}>
           <Text color="#2f6fb0" bold>更换 API Key</Text>
           <Text> </Text>
           <KeyCapture
@@ -539,7 +558,10 @@ export function App(props: AppProps) {
       <Box
         flexGrow={1}
         flexDirection="column"
-        borderStyle="round"
+        // 边框用 ASCII classic（`+ - |`）而非 round（`╭─╮│`）：round 字符是
+        // EAW=Ambiguous，Windows 中文终端按 2 列渲染 → 聊天区撑宽 2 列 →
+        // 内容区实际宽度比 innerW（cols-5）窄 → 每行提前折行 → 布局错位
+        borderStyle="classic"
         borderColor="#2f6fb0"
         paddingX={1}
       >
@@ -581,7 +603,7 @@ export function App(props: AppProps) {
         cursor={cursor}
         mode={c.mode}
         model={modelShort}
-        rightHint={`风格:${styleLabel(c.outputStyle)} · /style 切换`}
+        rightHint={`风格:${styleLabel(c.outputStyle)} | /style 切换`}
       />
     </Box>
   );

@@ -113,13 +113,14 @@ function buildBlocks(text: string, opts: BuildOpts): ReactNode[] {
       continue;
     }
 
-    // 无序列表 - / *
+    // 无序列表 - / *（前缀用 ASCII `- ` 而非 `• `：U+2022 是 EAW=Ambiguous，
+    // Windows 中文终端按 2 列渲染 → 列表行宽度估算偏差 → 行数低估 → 滚动错位）
     const ul = trimmed.match(/^[-*]\s+(.*)$/);
     if (ul) {
       blocks.push(
         <Text key={key++} dimColor={isProgress}>
           {firstText && prefix ? <Text color={roleColor}>{prefix}</Text> : null}
-          {'• '}
+          {'- '}
           {renderInline(ul[1])}
         </Text>
       );
