@@ -1,6 +1,6 @@
 # Windows 中文终端 Ambiguous 字符宽度错位（TUI 渲染残留）
 
-> **状态**：已修复（commit 待回写）
+> **状态**：已修复（commit `ec0720c` + `2a8ba72`）
 > **类型**：Bug 修复（架构加固，第 4 轮同族问题）
 > **关联**：
 > - `docs/Bug修复-TUI渲染层双宽度系统导致右侧散布视觉污染.md`（**已修复**——emoji 双宽分歧；本文是同一族问题的**另一半**：Ambiguous 字符在 Windows 中文终端的 2 列渲染）
@@ -209,7 +209,7 @@ npx tsx --test test/markdown-lines.test.ts  # 省略标记 ... 断言
 | `src/app/markdown-lines.ts` | fitMark/clipMessageRows 省略标记 `…` → `...` |
 | `test/ui-char-width.test.ts`（新增） | UI 源码 Ambiguous 扫描 + 已知字符宽度断言 |
 
-**Commit**：`<待 commit>`
+**Commit**：`ec0720c`（fix）+ `2a8ba72`（docs）
 
 ### §9.3 曾被尝试但否决的方案
 
