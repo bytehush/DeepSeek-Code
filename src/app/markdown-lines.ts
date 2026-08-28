@@ -12,33 +12,26 @@
  * 修复：maskMarkdownMarkers 生成等长掩码（marker 符号→零宽 U+200B）测宽，
  * 且 splitTextToLines 把成对 marker 当「原子单元」整对放置，绝不在 pair 中间换行。
  *
- * 注意：displayWidth 与 viewport.ts 保持同步（避免循环依赖，此处自带实现）。
+ * 注意：displayWidth 统一委托 string-width（与 ink 渲染同源），不再手写宽度表。
  * 纯函数、无 React 依赖。
  */
+import stringWidth from 'string-width';
 
 /** 行内标记正则（与 Markdown.tsx renderInline 同源，仅取全匹配定位区间） */
 const INLINE_MARK_RE = /(\*\*[\s\S]+?\*\*|\*[\s\S]+?\*|`[^`]+`|~~[\s\S]+?~~)/g;
 
 /**
- * 终端显示宽度（CJK 等双宽字符按 2 列计，零宽字符按 0 列计，与 viewport.ts displayWidth 同源）。
- * 零宽字符：U+200B 零宽空格（marker 掩码用）、U+200C/200D 零宽连接符、U+FEFF BOM。
+ * 终端显示宽度：委托 string-width（与 ink 的 wrap-ansi 同源），彻底消除「估算层 vs
+ * 渲染层」双宽度系统分歧（docs/Bug修复-TUI渲染层双宽度系统导致右侧散布视觉污染.md）。
+ *
+ * 为什么不用手写宽度表：旧手写实现只覆盖 13 个 Unicode 区段，emoji（💡🔐💬📁 等
+ * RGI emoji 双宽）、组合字符、ZWJ 序列都会与 ink 的实际渲染宽度不一致，导致
+ * splitTextToLines 低估行数 → selectRowWindow 选错区间 → Box 不剪裁 → 右侧散布碎片。
+ * string-width 走 Intl.Segmenter grapheme 聚类 + East_Asian_Width + RGI emoji 判定，
+ * 与终端渲染一致；零宽字符（U+200B 等）天然计 0 列，marker 掩码语义不破。
  */
 export function displayWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) {
-    const c = ch.codePointAt(0) ?? 0;
-    if (c === 0x200b || c === 0x200c || c === 0x200d || c === 0xfeff) continue; // 零宽字符
-    const wide =
-      (c >= 0x1100 && c <= 0x115f) || // Hangul Jamo
-      (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) || // CJK 部首/符号/文字
-      (c >= 0xac00 && c <= 0xd7a3) || // Hangul 音节
-      (c >= 0xf900 && c <= 0xfaff) || // CJK 兼容
-      (c >= 0xfe10 && c <= 0xfe6f) || // 竖排/兼容形式
-      (c >= 0xff00 && c <= 0xff60) || // 全角
-      (c >= 0xffe0 && c <= 0xffe6); // 全角符号
-    w += wide ? 2 : 1;
-  }
-  return w;
+  return stringWidth(s);
 }
 
 /**

@@ -3,26 +3,7 @@
  * 纯函数、无 React 依赖，CLI 视图层与控制器共用。
  */
 import type { UiMessage } from './types.ts';
-import { splitTextToLines, clipMessageRows } from './markdown-lines.ts';
-
-/** 终端显示宽度（CJK 等双宽字符按 2 列计，零宽字符按 0 列计，近似 east-asian-width） */
-export function displayWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) {
-    const c = ch.codePointAt(0) ?? 0;
-    if (c === 0x200b || c === 0x200c || c === 0x200d || c === 0xfeff) continue; // 零宽字符
-    const wide =
-      (c >= 0x1100 && c <= 0x115f) || // Hangul Jamo
-      (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) || // CJK 部首/符号/文字
-      (c >= 0xac00 && c <= 0xd7a3) || // Hangul 音节
-      (c >= 0xf900 && c <= 0xfaff) || // CJK 兼容
-      (c >= 0xfe10 && c <= 0xfe6f) || // 竖排/兼容形式
-      (c >= 0xff00 && c <= 0xff60) || // 全角
-      (c >= 0xffe0 && c <= 0xffe6); // 全角符号
-    w += wide ? 2 : 1;
-  }
-  return w;
-}
+import { splitTextToLines, clipMessageRows, displayWidth } from './markdown-lines.ts';
 
 /**
  * 估算一条消息占用的终端行数：

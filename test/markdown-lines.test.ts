@@ -34,6 +34,26 @@ test('displayWidth：marker 掩码后按内容宽度计（**bold** → 4 列）'
   assert.equal(displayWidth(maskMarkdownMarkers('*it*')), 2);
 });
 
+test('displayWidth：emoji / 组合字符 / ZWJ 按终端真实宽度计（双宽度系统根因回归）', () => {
+  // 旧手写实现把 emoji 误判为 1 列 → 与 ink（string-width）分歧 → 右侧散布视觉污染
+  // （docs/Bug修复-TUI渲染层双宽度系统导致右侧散布视觉污染.md §5 V1-V3）
+  assert.equal(displayWidth('💡'), 2, '灯泡 emoji 双宽');
+  assert.equal(displayWidth('🔐'), 2, '锁 emoji 双宽');
+  assert.equal(displayWidth('💬'), 2, '聊 emoji 双宽');
+  assert.equal(displayWidth('📁'), 2, '文件夹 emoji 双宽');
+  assert.equal(displayWidth('⭐'), 2, '星 emoji 双宽');
+  assert.equal(displayWidth('✅'), 2, '对勾 emoji 双宽');
+  // CJK / ASCII / box-drawing 回归（§5 V2）
+  assert.equal(displayWidth('中'), 2);
+  assert.equal(displayWidth('x'), 1);
+  assert.equal(displayWidth('─'), 1);
+  assert.equal(displayWidth('│'), 1);
+  assert.equal(displayWidth('┌'), 1);
+  // 组合字符 / ZWJ 序列：string-width 按 grapheme 聚类，比旧实现更准
+  assert.equal(displayWidth('e\u0301'), 1, 'e + 组合重音 = 1 个 grapheme');
+  assert.equal(displayWidth('👨‍👩‍👧‍👦'), 2, 'ZWJ 家庭 emoji = 1 个 cluster');
+});
+
 test('maskMarkdownMarkers：等长 + 内容保留 + 嵌套不处理（文档 §4.1 边界）', () => {
   const src = 'a **bold** b';
   const masked = maskMarkdownMarkers(src);
