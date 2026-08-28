@@ -6,7 +6,7 @@
  */
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
-import { SYSTEM_PROMPT } from '../agent/system-prompt.ts';
+import { SYSTEM_PROMPT, buildSystemPrompt } from '../agent/system-prompt.ts';
 import { createModels } from '@earendil-works/pi-ai';
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import { Agent } from '@earendil-works/pi-agent-core';
@@ -22,12 +22,15 @@ import type { AppProps } from './types.ts';
  * @param creds    DeepSeek 凭证（apiKey 等）
  * @param opts.workspace  agent 真正「编辑/浏览」的代码项目目录（文件工具、bash 的工作根）。
  *                       - 不传 → process.cwd()（CLI 直接在该目录运行）。
+ * @param opts.protectedRoots 受保护目录（写操作禁止落点）：源码根等。
+ *                       - 由 CLI 在 resolveWorkspace 后传入；不传 → 无保护（GUI/旧调用兼容）。
  */
 export async function assembleAppProps(
   creds: Credentials,
-  opts?: { workspace?: string },
+  opts?: { workspace?: string; protectedRoots?: string[] },
 ): Promise<AppProps> {
   const workspace = opts?.workspace ?? process.cwd();
+  const protectedRoots = opts?.protectedRoots ?? [];
 
   // 凭证注入 Pi 所需的 DEEPSEEK_API_KEY 环境变量（deepseekProvider 走 envApiKeyAuth）
   process.env.DEEPSEEK_API_KEY = creds.apiKey;
@@ -46,10 +49,10 @@ export async function assembleAppProps(
   // 持久化 Agent：跨轮累积上下文；工具 = stock-Pi 4 原子工具，操作 workspace。
   const agent = new Agent({
     initialState: {
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt: buildSystemPrompt(workspace, protectedRoots),
       model: piModel,
       thinkingLevel: 'off',
-      tools: createAtomicTools({ cwd: workspace }),
+      tools: createAtomicTools({ cwd: workspace, protectedRoots }),
     },
     streamFn: models.streamSimple.bind(models),
     toolExecution: 'sequential',
@@ -57,5 +60,5 @@ export async function assembleAppProps(
 
   const version = `v${(createRequire(import.meta.url)('../../package.json').version as string) ?? '0.1.0'}`;
 
-  return { agent, models, version };
+  return { agent, models, version, workspace };
 }

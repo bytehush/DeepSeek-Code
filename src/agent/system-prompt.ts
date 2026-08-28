@@ -43,7 +43,8 @@ export const SYSTEM_PROMPT = `你是 DeepSeek 编程助手，一个运行在终�
 
 # 环境说明
 - 当前运行环境为 Windows（win32），执行命令时请使用 Windows 兼容的命令（如 dir、type、node、npm 等）。
-- 工作目录即用户当前项目根目录。
+- 工作空间：{{WORKSPACE}}。所有文件工具（read_file/write_file/edit_file）与 bash 命令都基于工作空间解析路径，路径请使用相对于工作空间的写法。
+- 源码目录（只读保护）：{{PROTECTED_ROOTS}}。这是 Agent 自身的代码目录，**禁止向其中写入/修改/删除任何文件**——只能读取（如查看自己的配置）。若用户要求修改这些文件，请明确拒绝并说明原因。
 
 # 交付标准
 交付经过验证的代码改动，并用中文清晰解释：你做了什么、为什么这么做、如何验证的。
@@ -69,3 +70,16 @@ export const SYSTEM_PROMPT = `你是 DeepSeek 编程助手，一个运行在终�
 当轮次预算耗尽（由用户设定上限或系统自动判定）时，最后一轮将触发 **强制总结**——
 系统会注入一条指令让你输出完整的项目进展报告（已完成工作 + 剩余规划）。
 这意味着：①每轮尽力完成，不拖沓；②质量不妥协——宁可多几轮也要保证正确；③不需要自己写"可以继续"之类的过渡语，最后一轮系统会帮你总结。`;
+
+/**
+ * 注入运行期路径信息的完整 System Prompt：
+ * - {{WORKSPACE}}        → 当前工作空间（工具工作根）
+ * - {{PROTECTED_ROOTS}}  → 受保护目录（源码根等，只读）
+ * 见 docs/UX优化-工作空间路径规划与源码目录保护.md 方案 A R5。
+ */
+export function buildSystemPrompt(workspace: string, protectedRoots: string[]): string {
+  return SYSTEM_PROMPT.replace('{{WORKSPACE}}', workspace).replace(
+    '{{PROTECTED_ROOTS}}',
+    protectedRoots.length > 0 ? protectedRoots.join(', ') : '（未配置）',
+  );
+}

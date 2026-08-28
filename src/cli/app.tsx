@@ -535,7 +535,7 @@ export function App(props: AppProps) {
 
   return (
     <Box flexDirection="column" height="100%">
-      <Banner version={props.version} model={modelShort} cwd={process.cwd()} />
+      <Banner version={props.version} model={modelShort} cwd={props.workspace} />
       <Box
         flexGrow={1}
         flexDirection="column"

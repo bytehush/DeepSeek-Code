@@ -12,9 +12,16 @@ import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSy
 import { resolve, dirname } from 'node:path';
 import { type AgentTool } from '@earendil-works/pi-agent-core';
 import { Type } from 'typebox';
+import { isWithin } from '../config/workspace.ts';
 
 export interface AtomicToolContext {
   cwd: string;
+  /**
+   * 受保护目录（写操作禁止落点）：源码根等——agent 不得写入自身代码目录。
+   * read 不受限（agent 需要读自己的配置/系统提示）。
+   * （docs/UX优化-工作空间路径规划与源码目录保护.md 方案 A R2）
+   */
+  protectedRoots?: string[];
 }
 
 function safePath(cwd: string, p: string): string {
@@ -22,9 +29,27 @@ function safePath(cwd: string, p: string): string {
   return resolve(cwd, p);
 }
 
+/**
+ * 写路径安全校验：解析后若落在任一受保护目录内 → 拒绝（throw 回灌模型）。
+ * 覆盖相对/绝对/`..` 逃逸三形态（isWithin 做路径级包含判定，win32 忽略大小写）。
+ */
+function safeWritePath(cwd: string, p: string, protectedRoots: string[]): string {
+  const full = safePath(cwd, p);
+  for (const root of protectedRoots) {
+    if (isWithin(full, root)) {
+      throw new Error(
+        `拒绝写入受保护目录: ${p}（解析后 ${full} 属于 ${root}）。` +
+          `工作区为 ${cwd}，请使用工作区内的路径。`,
+      );
+    }
+  }
+  return full;
+}
+
 /** 4 个 stock-Pi 原子工具 */
 export function createAtomicTools(ctx: AtomicToolContext): AgentTool[] {
   const { cwd } = ctx;
+  const protectedRoots = ctx.protectedRoots ?? [];
 
   const readFileTool: AgentTool = {
     name: 'read_file',
@@ -55,7 +80,7 @@ export function createAtomicTools(ctx: AtomicToolContext): AgentTool[] {
     }),
     executionMode: 'sequential',
     execute: async (_id, params: any) => {
-      const full = safePath(cwd, params.path);
+      const full = safeWritePath(cwd, params.path, protectedRoots);
       mkdirSync(dirname(full), { recursive: true });
       writeFileSync(full, params.content, 'utf-8');
       return {
@@ -76,7 +101,7 @@ export function createAtomicTools(ctx: AtomicToolContext): AgentTool[] {
     }),
     executionMode: 'sequential',
     execute: async (_id, params: any) => {
-      const full = safePath(cwd, params.path);
+      const full = safeWritePath(cwd, params.path, protectedRoots);
       if (!existsSync(full)) throw new Error(`File not found: ${params.path}`);
       const text = readFileSync(full, 'utf-8');
       if (!text.includes(params.old)) throw new Error(`Pattern not found in ${params.path}: ${params.old}`);

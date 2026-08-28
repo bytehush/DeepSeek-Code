@@ -226,7 +226,9 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   if (!ctxRef.current) {
     ctxRef.current = {
       props,
-      cwd: process.cwd(),
+      // 配置读写根（/style、/model、/rollback）跟随工作空间，而非启动目录——
+      // 避免在源码目录启动时把配置写进源码（docs/UX优化-工作空间路径规划与源码目录保护.md）
+      cwd: props.workspace,
       push,
       appendTo,
       appendStreaming,

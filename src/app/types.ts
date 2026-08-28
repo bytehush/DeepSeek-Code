@@ -36,4 +36,10 @@ export interface AppProps {
   models: Models;
   /** 应用版本号（来自 package.json） */
   version: string;
+  /**
+   * Agent 工作空间（工具 read/write/edit/bash 的工作根；ChatContext.cwd /
+   * Banner / /rollback 配置根 均以此为准）。
+   * 与源码目录（protectedRoots）隔离——见 docs/UX优化-工作空间路径规划与源码目录保护.md
+   */
+  workspace: string;
 }

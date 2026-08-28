@@ -1,8 +1,10 @@
 import { resolve } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { startApp } from './app.tsx';
 import { assembleAppProps } from '../app/assemble.ts';
 import { resolveCredentials, saveCredentials, loadStoredCredentials, maskKey, type Credentials } from './auth.ts';
 import { runLogin } from './login.tsx';
+import { resolveWorkspace, parseWorkspaceFlag } from '../config/workspace.ts';
 
 async function main(): Promise<void> {
   // 非交互终端（管道 / CI / 无 TTY 的远程会话）下 ink 无法接管 stdin，
@@ -21,6 +23,23 @@ async function main(): Promise<void> {
   // 项目根目录：全局命令可能在任意目录启动，但配置/凭证应锚定在项目根
   const projectRoot = resolve(import.meta.dirname ?? '.', '../../');
   const cwd = process.cwd();
+
+  // ── 工作空间解析（方案 A：flag > env > (cwd∈源码根 ? 默认安全工作区 : cwd)）──
+  // 源码根 = 项目根（agent 自身代码目录，受保护只读）——见
+  // docs/UX优化-工作空间路径规划与源码目录保护.md
+  const ws = resolveWorkspace({
+    flag: parseWorkspaceFlag(process.argv),
+    env: process.env.DSA_WORKSPACE ?? null,
+    cwd,
+    sourceRoot: projectRoot,
+  });
+  if (ws.warn) console.warn(ws.warn);
+  // 默认安全工作区需确保存在（首次使用自动创建）
+  try {
+    mkdirSync(ws.workspace, { recursive: true });
+  } catch {
+    // 目录创建失败不阻塞启动（工具写入时仍会尝试创建父目录）
+  }
 
   // ── 凭证解析 + 登录门禁 ──
   const forceSetKey = process.argv.includes('--set-key') || process.argv.includes('-k');
@@ -49,7 +68,10 @@ async function main(): Promise<void> {
   }
 
   // 内核装配（与网页后端共用同一份 assembleAppProps）
-  const props = await assembleAppProps(creds as Credentials);
+  const props = await assembleAppProps(creds as Credentials, {
+    workspace: ws.workspace,
+    protectedRoots: [ws.sourceRoot],
+  });
   await startApp(props);
 }
 
