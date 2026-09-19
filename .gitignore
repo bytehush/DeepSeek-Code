@@ -17,3 +17,9 @@ dist/
 
 # Vite 构建临时文件（构建过程残留，非源码）
 vite.config.ts.timestamp-*.mjs
+
+# 构建/运行日志
+.workbuddy/*.log
+
+# 临时排查产物（如 index_*.log 等）
+/notes_*.md
