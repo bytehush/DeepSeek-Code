@@ -52,7 +52,9 @@ export const CASES: GoldenCase[] = [
     category: '工具选择',
     tier: 'code',
     turns: ['在项目里新建 src/greet.ts，导出一个函数 greet(name: string): string，返回 `你好, ${name}`。'],
-    setup: async (s) => mkdir(path.join(s, 'src'), { recursive: true }),
+    setup: async (s) => {
+      await mkdir(path.join(s, 'src'), { recursive: true });
+    },
     check: (ctx) => {
       const ok = hasTool('create_file', ctx.toolCalls);
       const fp = path.join(ctx.cwd, 'src/greet.ts');
@@ -211,7 +213,9 @@ export const CASES: GoldenCase[] = [
     category: '多轮记忆',
     tier: 'code',
     turns: ['新建 config.ts，导出 const PORT = 3000', '把 PORT 改成 8080'],
-    setup: async (s) => mkdir(s, { recursive: true }),
+    setup: async (s) => {
+      await mkdir(s, { recursive: true });
+    },
     check: (ctx) => {
       let content = '';
       try {
