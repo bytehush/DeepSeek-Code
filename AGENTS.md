@@ -1,85 +1,113 @@
 # AGENTS.md — DeepSeek CLI 编程 Agent 操作手册 & 项目 Spec
 
-> 本文件既是给 Agent 自身的"操作手册"，也是本项目的 **Spec（阶段04 要求：先写 Spec 再 vibe coding）**。
-> 路线引用：05-最后别做万能助手，用一个垂直项目验证能力。本项目就是这个垂直项目。
+> 本文件既是给 Agent 自身的「操作手册」，也是本项目的 **Spec**。
+> **当前形态：极简 CLI**（`6ed6596 refactor(core): 极简模式` 之后的实际状态）。
 
-## 1. 项目定位（垂直，不做万能助手）
+## 1. 项目定位
+
 直接接入 **DeepSeek 原生 API** 的命令行编程 Agent。面向中文开发者，在终端完成
-「读代码 → 理解结构 → 改/建代码 → 跑命令验证」的闭环。不追求聊天百科，只做编程垂直场景。
+「读代码 → 理解结构 → 改 / 建代码 → 跑命令验证」的闭环。
+
+**不做万能助手**，只做编程垂直场景，且保持最小形态。
 
 ## 2. 目标用户 & 高频任务
-- **目标用户**：无法/不愿使用 Claude 海外账户的开发者；中文母语；习惯终端工作流。
+
+- **目标用户**：无法 / 不愿使用 Claude 海外账户的开发者；中文母语；习惯终端工作流。
 - **高频任务**：
-  1. 理解陌生代码库（读文件、搜索符号、看目录结构）
+  1. 理解陌生代码库（读文件、看目录结构）
   2. 实现新功能 / 修复 bug（编辑、新建文件）
   3. 重构（多文件协同修改）
   4. 跑命令验证（构建、测试、lint、git 状态）
-  5. 多轮对话保持上下文记忆
+  5. 多轮对话保持上下文记忆（由持久化 Agent 承担）
 
-## 3. Agent 工具列表（共 15 个工具）
-> 路线精神：工具越多越容易把问题分散到数据源和 UI，而不是 Agent 设计本身。基础动作保持最小集，差异化能力以"复合工具（依赖模型二次推理）"形式叠加，不污染主循环。
+## 3. Agent 工具列表（共 4 个）
 
-### 基础编程动作（7）
-| 工具 | 参数 | 返回值 | 风险级 |
-|------|------|--------|--------|
-| `read_file` | `path`, `offset?`, `limit?` | 文件文本内容（带行号） | 低 |
-| `create_file` | `path`, `content` | 成功 / 失败原因（已存在则失败） | 中（新建） |
-| `edit_file` | `path`, `old_string`, `new_string` | 成功 / 失败原因（old_string 需唯一） | 中（覆写） |
-| `delete_file` | `path` | 成功 / 失败原因 | 高（需确认，不可恢复） |
-| `run_command` | `command`, `cwd?` | `stdout`/`stderr`/`exit_code`（超时兜底 + 进程树清理） | 高（危险命令需确认） |
-| `search_code` | `pattern`, `path?`, `glob?` | 匹配行与位置（上限 200 处） | 低 |
-| `awaitUser` | `question` | 用户回复（由 loop 拦截回灌，不真正执行） | 低 |
+> **设计原则**：工具越少，模型选型越准、行为越可控。
+> 极简模式下只保留 4 个原子工具，复杂能力由模型用这 4 个组合完成，
+> 不再提供自研领域工具（曾经的 `review_code` / `audit_dependencies` / `terminology` /
+> `project_discover` / `delegate` 等已在 `6ed6596` 中删除）。
 
-### Git 一等公民（3）
-| 工具 | 参数 | 返回值 | 风险级 |
-|------|------|--------|--------|
-| `git_status` | 无 | 分支 + 工作区状态 + 变更统计 | 低 |
-| `git_diff` | `path?`, `staged?` | 文件差异内容（超 6K 截断） | 低 |
-| `git_commit_msg` | `type_hint?` | 中文 Conventional Commits 提交信息（预览，需用户确认后自行 commit） | 低（差异化·复合工具） |
+| 工具 | 参数 | 说明 | 风险级 |
+|------|------|------|--------|
+| `read_file` | `path`, `offset?`, `limit?` | 读取文件内容 | 低 |
+| `write_file` | `path`, `content` | 写入 / 覆盖文件 | 中（覆写） |
+| `edit_file` | `path`, `old_string`, `new_string` | 字符串替换（需唯一匹配） | 中（覆写） |
+| `bash` | `command`, `cwd?` | 执行 shell 命令，流式返回 stdout / stderr | 高（需确认） |
 
-### 差异化复合工具（4，依赖 reasoner 二次推理 + JSON mode）
-| 工具 | 参数 | 返回值 | 风险级 |
-|------|------|--------|--------|
-| `review_code` | `path`, `focus?` | 中文代码审查报告（逻辑/边界/安全/命名 + 风险等级） | 低（差异化·复合工具） |
-| `audit_dependencies` | `path?` | 中文依赖安全审计（漏洞/恶意包/升级建议） | 低（差异化·复合工具） |
-| `terminology` | `path?` / `text?` | 中英术语对照表 + 中文摘要 + 易混淆辨析 | 低（差异化·复合工具） |
-| `project_discover` | `path?`, `max_depth?` | 目录树 + 识别技术栈 + 中文项目地图解读 | 低（差异化·复合工具） |
+**路径解析**：相对路径基于 workspace（agent 的工作目录）解析。
 
-### 子 Agent 委派（1）
-| 工具 | 参数 | 返回值 | 风险级 |
-|------|------|--------|--------|
-| `delegate` | `task` | 子 Agent 隔离执行结果（截断 4K 回灌主对话） | 低（差异化） |
+**写路径保护**：写操作若落在受保护目录（源码根）内，直接拒绝并把错误回灌模型。
+覆盖相对路径、绝对路径、`..` 逃逸三种形态。
+
+**失败处理**：工具直接 throw，Pi Agent 会把错误作为 tool error 回灌给模型，
+模型据此自我纠正，不静默跳过。
 
 ## 4. 拒答边界
+
 - **绝不执行**：`rm -rf /`、格式化磁盘、修改系统关键文件、读取并回显 `.env` 等密钥文件内容。
 - **绝不替代人类做不可逆决策**：`git push --force`、`DROP DATABASE`、批量删除需用户显式确认。
+- **绝不写入源码根**：避免 agent 修改自身代码。
 
-## 5. 确认点（权限层，对应 Harness 五子系统之 Permission）
-- 删除文件 / 覆写重要文件 / 危险命令 → 默认 **Ask** 模式，需用户输入 `yes`。
-- 读 / 搜索 / 普通构建命令 → 默认 **Execute** 模式，自动放行。
-- 支持三档切换：Explore（只读安全）/ Ask（需确认）/ Execute（自动放行）。
+## 5. 确认点（权限层）
 
-## 6. 失败回复 & 质量判断（对应 Verification）
-- 工具失败：返回结构化错误，Agent 进入 **Reflection**（自我纠正），不静默跳过。
-- 质量判断：用 `eval/golden-cases.md` 的 23 个黄金 case 评测，三档验证
-  （代码可测 / LLM 裁判 / 人工复核）。完整 trace 记录模型、工具、参数、耗时、token、失败原因。
+- 危险命令 / 覆写重要文件 → 默认 **Ask** 模式，需用户确认。
+- 读 / 普通命令 → 默认 **Execute** 模式，自动放行。
+- 支持三档切换：`Explore`（只读安全）/ `Ask`（需确认）/ `Execute`（自动放行）。
 
-## 7. 差异化特性（vs Claude Code，路线要求：探索独特能力形成竞争优势）
-- **中文工程语境**：system prompt 全程中文，生成的代码注释、Git 提交信息符合中文工程规范。
-- **DeepSeek 原生 tool use**：利用 `deepseek-v4-flash`（非思考模式）的 function calling，让模型精准自主选型
-  （读 vs 搜 vs 改 vs 跑），而非正则解析文本。
-- **Claude Code 不具备的独特能力（均已落地 → 工具）**：
-  1. ✅ `review_code`：中文代码审查报告（逻辑/边界/安全/命名/可读性 + 风险等级）
-  2. ✅ `audit_dependencies`：依赖安全中文审计（已知漏洞/恶意包/升级建议）
-  3. ✅ `git_commit_msg`：中文 Conventional Commits 提交信息生成
-  4. ✅ `terminology`：中英术语对照（读英文文档时给出中文术语映射）
-  5. ✅ `project_discover`：项目结构自动发现（一键中文项目地图）
-  6. ✅ `delegate`：上下文隔离的子 Agent 委派，结果截断回灌
-  7. ✅ 记忆层（RAG-lite）：用户级 + 项目级双层语义记忆，会话结束自动萃取偏好
+## 6. 架构边界
 
-## 8. 架构边界（对应阶段02 五层 / 阶段03 三层）
-- **应用交互层**（`src/cli`）：REPL、流式输出渲染、配置读取。
-- **Agent 运行时层**（`src/agent`）：agent loop、事件流、工具调度、权限决策、上下文压缩。
-- **模型 API 层**（`src/llm`）：DeepSeek 原生调用、流式解析、tool_calls 规范化。
-- **工具层**（`src/tools`）：基础 7 个编程动作（含 `awaitUser`）+ 4 个差异化复合工具（review_code / audit_dependencies / terminology / project_discover）+ `delegate`，依赖 llm 层做中文审查、审计、术语对照与项目发现。
-- **上下文层**（`src/context`）：多轮历史管理、压缩策略、工作目录状态。
+- **应用交互层**（`src/cli`、`src/app`）：TUI 渲染、登录、Markdown 展示、
+  workspace 解析、React 状态控制器。
+- **Agent 运行时层**（`src/agent`）：Pi Agent 适配、原子工具、系统提示、输出风格。
+- **配置层**（`src/config`）：工作区解析与源码目录保护、模型档位（flash / pro）。
+- **权限层**（`src/permission`）：三模式闸门决策。
+- **凭证层**（`src/auth`）：API Key 读写（scrypt 哈希）。
+- **通用层**（`src/utils`）：日志、Markdown 处理、文件回滚栈。
+
+**已删除的层**（`6ed6596`，不再存在于代码中）：
+`gui/`、`gui/web/`、`memory/`（RAG 记忆）、`skills/`（技能加载）、`mcp/`（MCP 客户端）、
+`review/`（审查编排）、`context/`（历史 + trace）、`history/`（会话面板）、
+`llm/`（自研 API 封装，现由 `@earendil-works/pi-ai` 承担）、`tools/`（自研工具集，
+现仅保留 `agent/pi-tools.ts` 的 4 个原子工具）。
+
+## 7. 运行方式
+
+```bash
+npm start          # 启动 TUI
+npm run typecheck  # 类型检查（覆盖 src/test/eval/scripts）
+npm test           # 单元测试（node:test，无需 API Key）
+```
+
+**模型**：`deepseek-v4-flash`（默认，快）/ `deepseek-v4-pro`（深度推理），
+CLI 内用 `/model` 切换。
+
+**工作区**：`--workspace` flag > `DSA_WORKSPACE` env > 自动判定。
+自动判定时若 cwd 在源码根内，切到 `~/.dsa/workspace`。
+
+## 8. 评测
+
+`eval/` 保留了 23 个黄金用例的**定义**（`cases.ts`、`golden-cases.md`）。
+
+> ⚠️ 原评测执行脚本 `eval/run-eval.ts` 依赖已删除的 `src/llm/`、`src/context/`、
+> `src/tools/`，已在极简模式收尾时移除。当前评测套件**不可直接运行**，
+> `cases.ts` 作为未来重写评测时的素材保留。
+
+## 9. 开发纪律
+
+- **受控改动**：不重构、不过度优化、不动无关代码。
+- **改前先列清单**：改动文件 + 原因 + 影响范围，确认后才动手。
+- **typecheck 是底线**：`npx tsc --noEmit` 零错误才能提交。
+  （tsconfig 的 `include` 已覆盖 `src` / `test` / `eval` / `scripts`，
+  避免出现「检查不到坏引用」的盲区。）
+- **单元测试**：不依赖外部服务的用例必须通过（`npm test`）。
+- **发现无用代码走 git 历史**：删除前确认目标确实无引用，删除后 commit message
+  说明原因。
+
+## 10. 后续演进
+
+当前阶段目标：**把 CLI 做扎实**。这是进入后续发展的前提。
+
+不在当前范围（如需引入，应新建结构化设计文档后再实施）：
+- 自研差异化工具（代码审查、依赖审计、术语对照等）
+- 记忆层 / 技能系统 / MCP 接入
+- Web GUI

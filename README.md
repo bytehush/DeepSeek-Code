@@ -1,119 +1,96 @@
 # DeepSeek Code Agent
 
-一个直连 DeepSeek 官方 API 的中文编程 Agent。它把 DeepSeek 当作一等公民来设计 Harness，在中文工程语境下提供代码阅读、编辑、运行、审查、依赖审计、Git 集成等能力，并同时提供 **命令行（CLI）** 与 **网页（Web GUI）** 两种使用方式。
+一个直连 DeepSeek 官方 API 的**终端编程 Agent**。用中文交互，在终端里完成
+「读代码 → 理解结构 → 改 / 建代码 → 跑命令验证」的闭环。
 
-适合谁：想在本地用 DeepSeek 模型做编程辅助、代码审查、依赖审计，且希望交互与产出都是中文的开发者。
+适合：想在本地用 DeepSeek 模型做编程辅助、且希望交互与产出都是中文的开发者。
 
-## 功能概览
+> **当前形态：极简 CLI**。
+> 2026-08-26 的 `6ed6596` 做过一次「极简模式」重构，砍掉了 Web GUI、RAG 记忆层、
+> 技能系统、MCP、审查编排、Trace 等附加层，只保留 coding agent 本质。
+> 本文档描述的是重构后的实际状态。
+
+## 功能
 
 - **直连官方 API**：无中转、无代理，密钥只保存在本地。
-- **双模型路由**：主循环用 `deepseek-v4-flash`（非思考模式，负责工具调度，快、省）；审查 / 审计 / 术语 / 项目发现 / 提交信息 / 深度生成 / 校验等复合分析统一走推理模型 `deepseek-v4-pro`（思考模式，深度推理）。
-- **全中文交互**：对话、提交信息、代码审查、依赖审计均为中文。
-- **CLI + Web 双界面**：终端里跑，或开网页用（账户登录、多任务线程、实时流式渲染）。
-- **会话持久化**：对话以 JSONL 记录，可 `/resume` 恢复；Web 端按任务线程隔离。
-- **实时流式渲染（Web）**：助手回答与思考过程逐字呈现，界面实时更新；思考盒（思考过程）随 trace 落盘，刷新页面后仍可恢复，无需前端缓存。
-- **权限三模式**：`explore`（只读）/ `ask`（需确认）/ `execute`（自动执行），文件写操作默认展示 diff 再确认。
+- **全中文交互**：对话、代码注释均为中文。
+- **持久化 Agent**：基于 `@earendil-works/pi-agent-core`，跨轮累积上下文。
+- **4 个原子工具**：`read_file` / `write_file` / `edit_file` / `bash`，复杂能力由模型组合完成。
+- **权限三模式**：`explore`（只读）/ `ask`（需确认）/ `execute`（自动执行）。
 - **Plan Mode**：先输出执行步骤，确认后再动手。
-- **成本可视**：`/cost` 查看累计 token 与费用估算。
-- **技能系统**：项目级 + 全局技能，模型按需调用；全局技能可设白名单。
-- **记忆层**：本地轻量向量检索（RAG-lite），跨会话记住项目事实。
-- **账户体系（Web）**：密码登录，每账号独立数据目录与 API Key。
+- **源码目录保护**：agent 的工作区与自身源码目录分离，写操作禁止落到源码根。
+- **文件回滚**：`/rollback` 撤销最近的文件变更，按工作目录作用域隔离。
+- **双模型档位**：`/model` 在 `flash`（快、省）与 `pro`（深度推理）间切换。
 
 ## 安装
 
 要求 **Node.js ≥ 22**。
 
 ```bash
-git clone https://github.com/wjq0407/DeepSeek-Code.git
-cd deepseek-code-agent
+git clone https://github.com/bytehush/DeepSeek-Code.git
+cd DeepSeek-Code
 npm install
 ```
 
-> 依赖安装后占用本地 `node_modules/`，已被 `.gitignore` 排除，不会进入仓库。
-
 ## 配置 API Key
 
-两种方式，任选其一：
+两种方式，任选其一。
 
-**方式 A：CLI（`.env`）**
-
-在项目根目录创建 `.env`：
+**方式 A：项目根目录 `.env`**
 
 ```bash
 DEEPSEEK_API_KEY=sk-你的密钥
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-MODEL_ID=deepseek-v4-flash
-REASONER_MODEL_ID=deepseek-v4-pro
 ```
 
-| 变量 | 说明 |
-|------|------|
-| `DEEPSEEK_API_KEY` | 在 [platform.deepseek.com](https://platform.deepseek.com) 获取 |
-| `DEEPSEEK_BASE_URL` | API 地址，默认 `https://api.deepseek.com` |
-| `MODEL_ID` | 主循环模型（非思考模式，负责工具调度），默认 `deepseek-v4-flash` |
-| `REASONER_MODEL_ID` | 复合工具（审查 / 审计 / 术语 / 项目发现 / 提交信息 / 深度生成 / 校验）使用的推理模型，默认 `deepseek-v4-pro`；不配置时回退到该固定模型 |
+**方式 B：首次启动时输入**
 
-> `.env` 已被 `.gitignore` 排除，不会误提交。DeepSeek V4 旧别名 `deepseek-chat` / `deepseek-reasoner` 目前仍可识别（过渡期兼容），但建议统一使用上述 V4 模型名。
+直接 `npm start`，首次运行会进入登录界面提示输入 API Key，保存到 `~/.dsa/credentials.json`。
+之后想更换，在 CLI 里用 `/set-key`。
 
-**方式 B：Web GUI（设置里填）**
+> `.env` 已被 `.gitignore` 排除，不会误提交。
 
-启动网页版后，先注册 / 登录账户，再在「设置 → API Key」中填写你的 DeepSeek API Key；展开「高级设置」可配置主模型（默认 `deepseek-v4-flash`）与推理模型（默认 `deepseek-v4-pro`）。每个账户的 Key 独立保存。
+在 [platform.deepseek.com](https://platform.deepseek.com) 获取 API Key。
 
 ## 使用
 
-### 命令行（CLI）
-
 ```bash
-npm start
-# 等价于 npx tsx src/cli/main.ts
+npm start          # 启动 TUI
+npm run dev        # watch 模式（开发用）
 ```
 
-### 网页（Web GUI）
+> CLI 是终端交互程序，需要在**交互式终端**（Windows Terminal / PowerShell / Git Bash 等）中运行。
+> 管道或无 TTY 环境下会直接给出提示并退出。
 
-```bash
-npm run web
+### 工作区
+
+agent 的文件工具与 bash 的工作根目录（workspace）优先级：
+
+```
+--workspace <路径>  >  DSA_WORKSPACE 环境变量  >  自动判定
 ```
 
-首次会先构建前端再启动服务，打开 **http://localhost:4173**（仅绑定本机 `127.0.0.1`）。
+自动判定：若当前目录在源码根内 → 警告并切到 `~/.dsa/workspace`（自动创建）；
+否则使用当前目录。
 
-- **账户**：首次用任意用户名 + 密码注册（密码用 scrypt 哈希存本机 `~/.dsa/accounts.json`，不存明文）；登录后签发 30 天有效 token 并存于浏览器 localStorage，刷新可免登录。
-- **实时流式渲染**：助手回答与思考过程逐字呈现，界面实时更新；思考盒（思考过程）随 trace 落盘，刷新页面后仍可恢复，无需前端缓存。
-- **多任务与隔离**：每个账户可新建 / 切换 / 删除 / 复制多个任务线程，互不干扰；每个任务独立 host 实例，事件按 `taskId` 路由，切换任务不串流。
-- **换端口**：设置环境变量 `DSA_WEB_PORT`（如 `DSA_WEB_PORT=4199 npm run web`）。
-- **数据隔离**：每个账户的数据落在 `~/.dsa/users/<用户名>/`（任务 / 历史 / 记忆 / 日志），互不可见。
+这样设计是为了避免在源码目录直接启动时，agent 把改动写进自身代码。
+源码根作为**受保护目录**，写操作会被拒绝（读不受限）。
 
-### 交互命令（CLI）
+### 交互命令
 
 | 命令 | 作用 |
 |------|------|
 | `/help` 或 `?` | 显示帮助面板 |
 | `/mode explore\|ask\|execute` | 切换权限模式 |
-| `/plan` | 开 / 关规划模式（只输出计划不执行）|
-| `/style human\|professional\|raw` | 切换最终答复风格（人话 / 专业语言 / 原始），持久化到 `.dsa/output-style.json` |
-| `/polish` | 按当前风格润色上一条 Agent 回复 |
-| `/cost` | 查看累计 token 用量与费用估算 |
+| `/plan` | 开 / 关规划模式（只输出计划不执行） |
+| `/style human\|professional\|raw` | 切换答复风格 |
+| `/model flash\|pro` | 切换模型档位 |
+| `/rollback [n]` | 回退最近 n 次文件变更（默认 1，仅当前工作目录） |
+| `/set-key` 或 `/login` | 更换 API Key |
 | `/clear` | 清空对话上下文 |
-| `/compact [n]` | 手动压缩上下文（保留最近 n 轮，默认 5；超预算也会自动压缩）|
-| `/watch` | 切换浏览器观察回灌（开 → 每轮后等待浏览器报错并自动续跑调试循环）|
-| `/set-key` 或 `/login` | 更换 API Key（保存后下次启动生效）|
-| `/memory add\|fact\|list\|forget` | 管理跨会话记忆 |
-| `/dream` | 整理记忆库（去除过期 / 矛盾 / 冗余，需 API Key）|
-| `/rollback [n]` | 回退最近 n 次文件变更（默认 1；仅当前工作目录）|
-| `/resume` | 从最近一次会话断点续跑（恢复历史 + 已落盘文件清单）|
-| `/skills list\|allow\|disallow\|clear\|all` | 查看与调整全局技能白名单 |
-| `/exit` 或 `/quit` | 退出（收尾记忆抽取 + 体检）|
+| `/exit` 或 `/quit` | 退出 |
 
-> 键盘快捷键：`←`（左方向键）打开会话 / 历史面板；`Ctrl+C` 中断当前思考 / 工具执行；`PageUp` / `PageDown` 翻页查看历史消息；`Ctrl+End` 跳回最新消息。
-
-> 想了解每个命令的具体行为，见 [docs/commands.md](./docs/commands.md)。
-
-### 会话 / 历史面板（`←`）
-
-在终端里按 `←`（左方向键）直接打开会话 / 历史面板，无需离开 TUI：
-
-- **数据来源**：本项目的聊天记录 `<cwd>/.dsa/traces/*.jsonl`（每个文件一个会话）+ 子 Agent 存档 `<cwd>/.dsa/sessions/*.json`。
-- **面板内容**：顶部 KPI（总会话 / 消息总数 / 模型数 / 时间跨度）；四张条形图（按模型、权限模式、状态、近 14 天）；可筛选会话列表，当前会话高亮为「● 当前」。
-- **交互**：输入关键字实时筛选（匹配标题 / 目录 / 模型 / 权限模式）；`↑` `↓` 浏览；`Enter` 载入选中会话并返回；`Esc` / `←` 返回。
+**键盘快捷键**：`←` 打开会话 / 历史面板；`Ctrl+C` 中断当前思考 / 工具执行；
+`PageUp` / `PageDown` 翻页；`Ctrl+End` 跳回最新消息。
 
 ### 输出风格（`/style`）
 
@@ -121,102 +98,52 @@ npm run web
 - **professional**：规范术语、结论先行、保留技术细节。
 - **raw**：保留模型默认输出。
 
-`/polish`：按当前风格把上一条回复改写得更通顺（只改表达，不改事实与代码）。
+## 工具
 
-## 工具一览
+只有 4 个原子工具。复杂能力（代码审查、依赖审计、项目结构分析等）由模型组合这 4 个工具完成。
 
-内置 24 个工具，按类别列出常用项（复合工具会自动调用内部子步骤，无需手动触发）：
+| 工具 | 说明 |
+|------|------|
+| `read_file` | 读取文件（支持 `offset` / `limit`） |
+| `write_file` | 写入 / 覆盖文件 |
+| `edit_file` | 字符串替换修改 |
+| `bash` | 执行 shell 命令，流式返回输出 |
 
-**文件与目录**
-
-- `read_file` — 读取文件（支持 `offset` / `limit`）
-- `write_file` — 写入 / 覆盖文件（`create_file` 为其向后兼容别名）
-- `edit_file` — 字符串替换修改（写前展示 diff 确认）
-- `delete_file` — 删除文件（需确认）
-- `ensure_dir` — 创建目录
-- `list_dir` — 列出目录内容
-
-**命令与搜索**
-
-- `run_command` — 执行 shell 命令，返回 stdout / stderr / 退出码
-- `search_code` — 正则搜索代码内容
-- `search_files` — 按文件名 / 通配符搜索
-
-**任务管理**
-
-- `todo_write` — 维护任务清单，跟踪多步任务进度
-
-**Git**
-
-- `git_status` — 查看工作区状态
-- `git_diff` — 查看改动
-- `git_commit_msg` — 根据 diff 生成中文提交信息
-
-**中文分析与校验**（统一走推理模型 `deepseek-v4-pro`）
-
-- `review_code` — 中文代码审查（风险等级 + 逐条建议）
-- `audit_dependencies` — 中文依赖安全审计（漏洞 / 恶意包 / 升级建议）
-- `terminology` — 中英术语对照
-- `project_discover` — 扫描项目结构，生成中文项目地图
-- `verify_code` — 代码验证
-- `verify_answer` — 回答验证
-- `deep_gen` — 深度生成
-
-**交互与委派**
-
-- `awaitUser` — 执行中向用户提问，等待回复后再继续
-- `delegate` — 派发子 Agent 执行独立子任务（上下文隔离），结果回灌主对话
-- `use_skill` — 按名称加载技能完整指引
-
-## 技能系统
-
-- **作用域**：项目级技能放 `<cwd>/.workbuddy/skills/`（随项目提交，始终可用）；全局技能放 `~/.workbuddy/skills/`（跨项目共用）。同名时项目级覆盖全局级。
-- **全局白名单**：避免无关全局技能灌入上下文。优先级：环境变量 `DSA_GLOBAL_SKILLS_ALLOW` > 配置文件 `~/.workbuddy/skills.allow.json`（`{ "allow": [...] }`，显式 `[]` = 排除全部全局）；设 `DSA_INCLUDE_GLOBAL_SKILLS=0` 可关闭全局扫描。
-- **管理**：运行时用 `/skills` 查看与调整（`/skills list | allow <名> | disallow <名> | clear | all`）。
+路径相对工作区解析。写操作受源码目录保护约束（详见「工作区」一节）。
 
 ## 项目结构
 
 ```
 src/
-  cli/         CLI 交互层（REPL、Markdown、配置、成本、auth、会话面板）
-  gui/         网页后端（HTTP 静态服务 + WebSocket 桥接、账户、多任务、按 taskId 路由）
-  gui/web/     网页前端（React + Vite）
-  app/         CLI / Web 共用内核装配与类型
-  config/      模型模式配置（flash / pro 显式切换，无自动路由）
-  agent/       Agent 运行时（主循环、Plan Mode、Reflection、子 Agent、输出风格）
-  llm/         DeepSeek API 封装（流式、双模型路由、tool_calls、定价）
-  tools/       工具实现 + 安全 / 护栏
-  context/     多轮历史、上下文压缩、JSONL trace
-  history/     会话 / 历史面板（终端可视化）
-  memory/      记忆层（本地向量检索 / embedder）
-  auth/        账户与凭证（scrypt 哈希、token 签发）
-  permission/  三模式权限控制
-  review/      审查 / 反思编排
-  skills/      技能加载器
-  mcp/         MCP 客户端（stdio + Streamable HTTP）
-  utils/       通用工具
+  cli/         CLI 交互层（TUI 入口、登录、Markdown 渲染、字符净化）
+  app/         内核装配、聊天主逻辑、viewport 计算、React 控制器
+  agent/       Agent 运行时（Pi 适配、原子工具、系统提示、输出风格）
+  config/      工作区解析与保护、模型档位配置
+  auth/        凭证读写（scrypt 哈希）
+  permission/  三模式权限闸门
+  utils/       通用工具（日志、Markdown、文件回滚）
+test/          单元测试（node:test，零额外依赖，无需 API Key）
+eval/          评测用例定义与历史结果
+scripts/       排查 / 验证脚本（非构建产物）
+docs/          设计文档与 Bug 修复记录
 ```
 
 ## 开发
 
 ```bash
-npm run typecheck        # TypeScript strict 类型检查
-npm test                 # 单元测试（node:test，零依赖）
-npm run eval:check       # 评测集结构静态校验（无需 API key）
-npm run dev              # 以 watch 模式启动 CLI（开发用）
-npm run check:mcp        # 检查 MCP 连接配置
-npm run check:providers  # 检查模型 provider 配置
+npm run typecheck   # TypeScript strict 类型检查（覆盖 src/test/eval/scripts）
+npm test            # 单元测试（node:test，无需 API Key）
 ```
 
 - 类型检查开启 `strict`，无显式 `any`。
-- 评测套件见 `eval/`；真实跑分需配置 API key 后执行 `npx tsx eval/run-eval.ts`。
+- `npm test` 只跑不依赖外部服务的用例，可在无网络、无密钥环境下执行。
 
 ## 安全说明
 
-- 密钥只保存在本地 `.env`（CLI）或账户设置（Web），均不入库。
-- 通过 `run_command` / MCP 启动子进程时，疑似密钥的环境变量会被自动剥离，防止泄露。
-- 文件工具限制在项目目录内，路径遍历会被拒绝。
-- Web 账户密码用 scrypt 加盐哈希存储，无明文；会话 token 30 天有效。
+- 密钥只保存在本地 `.env` 或 `~/.dsa/credentials.json`，均不入库。
+- 文件工具的写操作限制在工作区内，路径遍历会被拒绝。
+- 源码根作为受保护目录，agent 无法写入自身代码。
+- 凭证用 scrypt 加盐哈希存储，无明文。
 
 ## License
 
