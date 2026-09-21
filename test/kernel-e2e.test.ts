@@ -36,12 +36,15 @@ interface Scripted {
 
 class MockAdapter implements ProviderAdapter {
   id = 'mock';
-  models = [{ id: 'mock-actor', label: 'Mock', contextWindow: 100_000, supportsThinking: false }];
+  models: Array<{ id: string; label: string; contextWindow: number; supportsThinking: boolean }>;
   /** 收到的请求（断言 system/messages/tools 用） */
   readonly requests: Array<StreamRequest & { apiKey: string }> = [];
   private cursor = 0;
 
-  constructor(private script: Scripted[]) {}
+  /** contextWindow 可调：降详的预算闸门据此判定「窗口压力」，测试要能造出小窗口 */
+  constructor(private script: Scripted[], contextWindow = 100_000) {
+    this.models = [{ id: 'mock-actor', label: 'Mock', contextWindow, supportsThinking: false }];
+  }
 
   endpoint(): string {
     return 'https://mock.local/v1/chat/completions';
@@ -66,7 +69,10 @@ class MockAdapter implements ProviderAdapter {
   }
 }
 
-function makeHub(script: Scripted[]): { hub: ModelHub; mock: MockAdapter; ledger: OutboundLedger } {
+function makeHub(
+  script: Scripted[],
+  contextWindow?: number,
+): { hub: ModelHub; mock: MockAdapter; ledger: OutboundLedger } {
   const dir = mkdtempSync(join(tmpdir(), 'dsa-ledger-'));
   const ledger = new OutboundLedger({ dir });
   const cfg: HubConfig = {
@@ -78,16 +84,16 @@ function makeHub(script: Scripted[]): { hub: ModelHub; mock: MockAdapter; ledger
     keys: { mock: 'test-key-never-from-env' },
   };
   const hub = new ModelHub(cfg, ledger);
-  const mock = new MockAdapter(script);
+  const mock = new MockAdapter(script, contextWindow);
   hub.register(mock);
   return { hub, mock, ledger };
 }
 
 function makeKernel(
   script: Scripted[],
-  opts?: { protectedRoots?: string[] },
+  opts?: { protectedRoots?: string[]; contextWindow?: number },
 ): { kernel: AgentKernel; mock: MockAdapter; ledger: OutboundLedger; hub: ModelHub; registry: ToolRegistry; dir: string } {
-  const { hub, mock, ledger } = makeHub(script);
+  const { hub, mock, ledger } = makeHub(script, opts?.contextWindow);
   const registry = new ToolRegistry();
   for (const t of createCoreTools()) registry.register(t);
   const dir = mkdtempSync(join(tmpdir(), 'dsa-ws-'));
@@ -547,6 +553,98 @@ test('无进展交代同样不入历史，且收尾轮确实收到它', async ()
     const last = mock.requests[3]!.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
     assert.match(last, /不要再尝试任何操作/, '交代要求必须送达收尾轮');
     assert.ok(kernel.history.every((m) => m.role !== 'system'), '交代不得进历史');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * ③ 上下文降详：模型视图与用户视图分叉，但只折「可重跑且已过时」的读结果。
+ *
+ * 触发判据不是「这条太长」，而是**这条已与后来的事实矛盾**（读过后同路径又成功写入）。
+ * 四条反向断言各挡一种会把降详变成事故的做法。
+ */
+test('降详：读过后同路径成功写入 → 下一步请求里旧读结果换成引用，不再是原文', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'big.ts' } }] },
+    { text: '', toolCalls: [{ id: 'e1', name: 'edit_file', args: { path: 'big.ts', old: 'A = 1', new: 'A = 2' } }] },
+    { text: '已改完' },
+  ]);
+  try {
+    writeFileSync(join(dir, 'big.ts'), 'export const A = 1;\n' + '// 填充行\n'.repeat(600), 'utf-8');
+    await collect(kernel.prompt('把 A 改成 2', { ...base, permission: 'execute' }));
+
+    // 第 3 次请求（edit 之后）：那次 read 的原文必须已被降详
+    const third = mock.requests[2]!.messages.filter((m) => m.role === 'tool');
+    assert.equal(third.length, 2, '应有两条工具结果（read + edit）');
+    assert.match(third[0]!.content, /已降详/, '过时的 read 结果应被换成引用');
+    assert.ok(!/填充行/.test(third[0]!.content), '原文不得再发给模型');
+    // 但 edit 结果（一次性事实）必须原样在
+    assert.match(third[1]!.content, /已编辑/, '写入结果不可折');
+    // 用户视图未受影响：内核历史仍是原文
+    const hist = kernel.history.filter((m) => m.role === 'tool');
+    assert.match(hist[0]!.content, /填充行/, '内核历史必须保留原文（模型视图≠用户视图）');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('降详不得碰失败结果：错误正文是「为什么失败」的唯一载体', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'big.ts' } }] },
+    { text: '', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'big.ts', content: 'x' } }] },
+    { text: '', toolCalls: [{ id: 'r2', name: 'read_file', args: { path: 'nope.ts' } }] },
+    { text: '文件有问题' },
+  ]);
+  try {
+    writeFileSync(join(dir, 'big.ts'), 'export const A = 1;\n' + '// 填充\n'.repeat(600), 'utf-8');
+    await collect(kernel.prompt('读改再读', { ...base, permission: 'execute' }));
+    const last = mock.requests[3]!.messages.filter((m) => m.role === 'tool');
+    const failed = last.find((m) => m.content.includes('工具执行失败'));
+    assert.ok(failed, '失败结果应仍在请求里');
+    assert.ok(!/已降详/.test(failed!.content), '失败正文不得被降详——折掉就把事实变成缺席');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('降详不得碰仍成立的读结果：没写过的文件，模型刚读到的内容必须还在', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'big.ts' } }] },
+    { text: '关键常量是 A' },
+  ]);
+  try {
+    writeFileSync(join(dir, 'big.ts'), 'export const A = 1;\n' + '// 填充\n'.repeat(600), 'utf-8');
+    await collect(kernel.prompt('读 big.ts 并汇报', { ...base, permission: 'execute' }));
+    const second = mock.requests[1]!.messages.filter((m) => m.role === 'tool');
+    assert.match(second[0]!.content, /填充/, '无压力且未过时的读结果必须原样保留');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('窗口压力：估算输入超阈值时折叠最近之外的读结果，且最近一条保住', async () => {
+  // 小窗口逼出压力路径：读两个大文件，第二个必须原文在，第一个可折
+  const { kernel, mock, dir } = makeKernel(
+    [
+      { text: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'a.ts' } }] },
+      { text: '', toolCalls: [{ id: 'r2', name: 'read_file', args: { path: 'b.ts' } }] },
+      { text: '两个都读完了' },
+    ],
+    { contextWindow: 4_000 },
+  );
+  try {
+    writeFileSync(join(dir, 'a.ts'), 'export const A = 1;\n' + '// AAAA\n'.repeat(600), 'utf-8');
+    writeFileSync(join(dir, 'b.ts'), 'export const B = 2;\n' + '// BBBB\n'.repeat(600), 'utf-8');
+    const evs = await collect(kernel.prompt('分别读 a 和 b', { ...base, permission: 'execute' }));
+    const last = mock.requests[2]!.messages.filter((m) => m.role === 'tool');
+    assert.match(last[0]!.content, /已降详/, '压力下较早的读结果应让位');
+    assert.ok(!/AAAA/.test(last[0]!.content));
+    assert.match(last[1]!.content, /BBBB/, '最近一条读结果必须保住，否则模型只能幻觉');
+    assert.ok(
+      evs.some((e) => e.type === 'system' && /已折叠/.test(e.text ?? '')),
+      '降详必须对用户可见，否则就是悄悄对模型隐瞒事实',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
