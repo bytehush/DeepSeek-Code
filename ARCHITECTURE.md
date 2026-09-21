@@ -50,6 +50,10 @@
   → 每步现场重建 system prompt            (纯稳定文本：准则/环境/模式三段，
   │                                        不含工具清单——工具唯一来源是 tools 字段)
   → 拼装 messages：历史 + 本次临时 system  (内核一次性反馈消费即弃，不入历史)
+  → fitContext()：只产出「模型视图」副本    (core/loop/context-budget.ts)
+  │     折叠判据是「已被同路径成功写入否证」而非长短；估算输入 > 窗口 60% 时
+  │     连仍成立的读结果也让位，但最近一条保原文。failed/denied/error/notice
+  │     一律豁免。this.messages 不动——trace / session / Ctrl+O 永远是原文
   → ModelHub.stream('actor', req)         (core/provider/hub.ts)
   → adapter.serialize(req)  ——签名拿不到 apiKey
   → OutboundLedger.append() ——先记账（字节数/SHA-256/消息构成/目的地）
@@ -74,7 +78,7 @@
 | 提示词与实际工具不符 | 不可能结构性发生——工具描述只有 `registry.wireSpecs()` 一份 + e2e 断言 |
 | 出站数据核对 | `~/.dsa/outbound/*.jsonl` 或 CLI 内 `/outbound` |
 | 模型跑偏 / 重复 | `src/core/loop/system-prompt.ts` + kernel 防空转（REPEAT_LIMIT） |
-| 上下文过大 / 步数失控 | `npm run context:audit`（逐桶字节 + 增长曲线） |
+| 上下文过大 / 读到的内容像消失了 | `src/core/loop/context-budget.ts`（模型视图降详，原文在 trace）+ `npm run context:audit` |
 | 多轮上下文丢失 | `AgentKernel.messages`（跨轮持久化）+ `/clear` 语义 |
 | TUI 渲染错位 / 气泡异常 | `src/app/timeline.ts`（fold）+ `src/app/markdown-lines.ts`；复现法：拿 trace 事件重放 |
 | 重启后历史丢失 | `~/.dsa/sessions/<sha1(workspace)>.json` + `core/session/store.ts`（load 永不抛，损坏=新会话） |
@@ -116,6 +120,9 @@ P2 引入异厂商 critic（交叉评审）与低价 cheap（压缩）。
    不存在「换个参数就能扫到」的路径。
 4. **写操作可回滚**：所有落盘前 snapshot；写路径先过 protectedRoots 校验。
 5. **失败不静默**：工具 throw → 错误文本作为 tool result 回灌模型。
+6. **降详只改模型视图**：`fitContext()` 产出仅供本次请求的消息副本，
+   `this.messages`/trace/session/TUI Ctrl+O 永远是原文；failed / denied /
+   error / notice 四种结果结构性豁免（错误正文是「为什么失败」的唯一载体）。
 
 ## 设计原则
 

@@ -132,8 +132,10 @@ CLI 内 `/model` 切换，经 ModelHub 惰性绑定下一轮即时生效。
 
 ## 10. 后续演进（P0 已交付，按设计稿分期推进）
 
-- **P1 上下文管理**：`core/context`（预算 + LLM 摘要 + snip 降级），
-  压缩走 cheap 角色且成本入 ledger；200+ 轮压测不触 token_limit。
+- **P1 上下文管理**：预算闸门 + 降详已落地（`core/loop/context-budget.ts`，
+  判据=「被同路径成功写入否证」，引用化而非 LLM 摘要——摘要一旦写错比截断更糟）。
+  仍未做：跨会话的历史摘要、`/context` 视图（看模型当时到底看到什么）。
+  压缩若引入 LLM 调用必须走 cheap 角色且成本入 ledger。
 - **P2 上限层**：actor/critic/cheap 异厂商路由、`/review` 交叉评审闭环、
   不可信仓库默认禁网、bash 沙箱化。
 - 持续：每阶段跑全量 eval 进 `RESULTS.md`——「数据说话」。
