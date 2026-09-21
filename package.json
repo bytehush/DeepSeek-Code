@@ -11,7 +11,8 @@
     "dev": "tsx watch src/cli/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --import tsx test/*.test.ts",
-    "context:audit": "tsx scripts/context-audit.ts"
+    "context:audit": "tsx scripts/context-audit.ts",
+    "context:check": "python3 scripts/check-ctx-doc.py"
   },
   "dependencies": {
     "chalk": "^5.3.0",
