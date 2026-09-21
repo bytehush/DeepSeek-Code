@@ -19,6 +19,7 @@ import type { PermissionMode, Risk } from '../permission/engine.ts';
 import { decide3, matrixFromMode } from '../permission/engine.ts';
 import type { ToolRegistry, ToolSpec } from '../tools/registry.ts';
 import { buildSystemPrompt } from './system-prompt.ts';
+import { fitContext, type CollapsePlan } from './context-budget.ts';
 import type { CoreEvent } from './events.ts';
 import {
   assistantMsg,
@@ -26,6 +27,7 @@ import {
   userMsg,
   type Msg,
   type StopReason,
+  type ToolOutcome,
   type Usage,
 } from '../types.ts';
 
@@ -197,7 +199,18 @@ export class AgentKernel {
         planMode: opts.planMode,
         modelName: this.deps.modelName(),
       });
-      const messages = this.messagesForModel(opts);
+      const wireTools = forceNoTools ? undefined : this.deps.registry.wireSpecs();
+      const plan = this.messagesForModel(opts, system, wireTools ? JSON.stringify(wireTools) : undefined);
+      const messages = plan.messages;
+      if (plan.collapsed > 0) {
+        // 让用户看得见「模型这次没看到全部原文」以及为什么 —— 降详若不可见，
+        // 它就退化成「悄悄对模型隐瞒事实」，那是调试黑洞。
+        yield this.emit({
+          type: 'system',
+          text: `已折叠 ${plan.collapsed} 条历史工具结果（省 ${(plan.savedBytes / 1024).toFixed(1)}K 字节${plan.pressured ? '，窗口压力' : '，状态已过时'}）；原文仍在 trace / Ctrl+O 里`,
+          step,
+        });
+      }
 
       // —— 调模型（唯一出口：hub）——
       let text = '';
@@ -208,7 +221,7 @@ export class AgentKernel {
         for await (const ev of this.deps.hub.stream('actor', {
           system,
           messages,
-          tools: forceNoTools ? undefined : this.deps.registry.wireSpecs(),
+          tools: wireTools,
           signal,
         })) {
           if (this.aborted && ev.type !== 'message_end') continue;
@@ -312,7 +325,7 @@ export class AgentKernel {
 
       for (const tc of toolCalls) {
         if (this.aborted) {
-          this.messages.push(toolMsg(tc.id, tc.name, '（用户中断，未执行）'));
+          this.messages.push(toolMsg(tc.id, tc.name, '（用户中断，未执行）', 'notice'));
           yield* this.finish(opts, 'user_abort', usage);
           return;
         }
@@ -323,7 +336,7 @@ export class AgentKernel {
         recentCalls.push(sig);
         if (detectCycle(recentCalls)) {
           yield this.emit({ type: 'system', text: `检测到周期性重复调用（${tc.name} 等，已重复 ≥${REPEAT_LIMIT} 轮），提前结束`, step });
-          this.messages.push(toolMsg(tc.id, tc.name, '（系统干预：重复调用已中止，请换思路）'));
+          this.messages.push(toolMsg(tc.id, tc.name, '（系统干预：重复调用已中止，请换思路）', 'notice'));
           yield* this.finish(opts, 'repeat_loop', usage);
           return;
         }
@@ -333,7 +346,7 @@ export class AgentKernel {
           yield* this.finish(opts, 'user_abort', usage);
           return;
         }
-        this.messages.push(toolMsg(tc.id, tc.name, outcome.text));
+        this.messages.push(toolMsg(tc.id, tc.name, outcome.text, outcome.outcome));
         if (outcome.denied) {
           yield this.emit({ type: 'permission', toolName: tc.name, granted: false, text: outcome.text, reactPhase: 'observation', step });
         }
@@ -358,21 +371,27 @@ export class AgentKernel {
     }
   }
 
-  /** 工具执行（权限闸门 + diff 预览确认 + 失败回灌文本化） */
+  /**
+   * 工具执行（权限闸门 + diff 预览确认 + 失败回灌文本化）。
+   *
+   * 返回值带 outcome：降详据此判断「这条正文能不能折」，无进展计数据此判断
+   * 「算不算失败」。两者都不比对文本前缀——文案一改就让判定失效，是
+   * 自信的错误结论的典型来源。
+   */
   private async runTool(
     spec: ToolSpec | undefined,
     tc: { id: string; name: string; args: unknown },
     matrix: ReturnType<typeof matrixFromMode>,
     opts: KernelRunOptions,
-  ): Promise<{ text: string; denied?: boolean; aborted?: boolean; failed?: boolean }> {
+  ): Promise<{ text: string; outcome: ToolOutcome; denied?: boolean; aborted?: boolean; failed?: boolean }> {
     if (!spec) {
       // 结构性防御：provider 幻觉出未注册工具时，回灌而不是崩溃
-      return { text: `错误：工具 ${tc.name} 不存在于注册表。可用工具见系统提示。` };
+      return { text: `错误：工具 ${tc.name} 不存在于注册表。可用工具见本次请求的 tools 字段。`, outcome: 'error' };
     }
     const parsed = spec.parameters.safeParse(tc.args ?? {});
     if (!parsed.success) {
       const issues = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-      return { text: `参数校验失败：${issues}` };
+      return { text: `参数校验失败：${issues}`, outcome: 'error' };
     }
     const args = parsed.data as Record<string, unknown>;
 
@@ -386,7 +405,7 @@ export class AgentKernel {
       destructive,
     });
 
-    if (verdict.action === 'deny') return { text: `权限拦截：${verdict.reason}`, denied: true };
+    if (verdict.action === 'deny') return { text: `权限拦截：${verdict.reason}`, outcome: 'denied', denied: true };
     if (verdict.action === 'require_confirm') {
       const preview = spec.preview?.(args, this.toolCtx(opts));
       const prompt = [
@@ -395,19 +414,22 @@ export class AgentKernel {
         verdict.channel === 'risk_prompt' ? `（风险等级：${verdict.risk}${destructive ? '，疑似破坏性操作' : ''}）` : '',
       ].filter(Boolean).join('\n');
       const ok = opts.ask ? await opts.ask(prompt) : false;
-      if (!ok) return { text: '用户拒绝了本次操作', denied: true };
+      if (!ok) return { text: '用户拒绝了本次操作', outcome: 'denied', denied: true };
     }
 
     try {
       const res = await spec.execute(args, this.toolCtx(opts));
-      return { text: res.content + (res.details ? `\n[details] ${JSON.stringify(res.details)}` : '') };
+      return {
+        text: res.content + (res.details ? `\n[details] ${JSON.stringify(res.details)}` : ''),
+        outcome: 'ok',
+      };
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (/abort/i.test(msg) && this.aborted) return { text: '（已中断）', aborted: true };
+      if (/abort/i.test(msg) && this.aborted) return { text: '（已中断）', outcome: 'notice', aborted: true };
       // 失败即回灌：错误文本作为工具结果给模型自我纠正
       // failed 标记供无进展计数——只有真正执行报错才算失败，
       // 权限拦截/用户拒绝是闸门在正常工作，不计入（模型换思路即有进展）
-      return { text: `工具执行失败：${msg}`, failed: true };
+      return { text: `工具执行失败：${msg}`, outcome: 'failed', failed: true };
     }
   }
 
@@ -421,19 +443,27 @@ export class AgentKernel {
   }
 
   /**
-   * 发给模型的消息序列。
+   * 发给模型的消息序列（= 「模型视图」，与用户可审计的历史是两份东西）。
    *
    * 末段依次拼上两类「不入历史」的临时 system：
    *   - pendingSystem：上一步攒下的内核一次性反馈（取出即清空 = 消费即弃）
    *   - styleInstruction：本轮的输出风格指令
    * 两者都只活在这次请求里，返回后不留在 this.messages。
+   *
+   * 之后再过一道降详：把「已被同路径成功写入取代」的旧读结果、以及窗口压力下的
+   * 大块读结果，换成引用化占位（见 context-budget.ts 的三条安全约束）。
+   * 注意这只作用于发出去的副本 —— this.messages / trace / session / TUI 仍是原文。
    */
-  private messagesForModel(opts: KernelRunOptions): Msg[] {
+  private messagesForModel(opts: KernelRunOptions, system: string, toolsJson?: string): CollapsePlan {
     const transient = this.pendingSystem.map((content) => ({ role: 'system' as const, content }));
     this.pendingSystem = [];
     if (opts.styleInstruction) transient.push({ role: 'system', content: String(opts.styleInstruction) });
-    if (transient.length === 0) return this.messages;
-    return [...this.messages, ...transient];
+    const base = transient.length === 0 ? this.messages : [...this.messages, ...transient];
+    return fitContext(base, this.deps.registry, {
+      system,
+      toolsJson,
+      contextWindow: this.deps.hub.actorContextWindow(),
+    });
   }
 
   private emit(ev: CoreEvent): CoreEvent {

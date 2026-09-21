@@ -17,6 +17,21 @@ export interface ToolCallBlock {
 }
 
 /**
+ * 工具结果的结构性质标记（不是靠读文本猜出来的）。
+ *
+ * 为什么需要它：降详要判断「这条正文能不能被折成引用」，而失败结果里的错误
+ * 正文是「为什么失败」的唯一载体——折掉就把事实变成缺席。若靠比对文本前缀
+ * （「工具执行失败：」）判定，文案一改就给出自信的错误结论。
+ *
+ * - ok：正常结果，读类可重跑
+ * - failed：执行抛错（计入无进展计数）
+ * - denied：权限拦截 / 用户拒绝（闸门在正常工作，不计入失败）
+ * - error：结构性回灌（工具不存在 / 参数校验失败），不是执行失败
+ * - notice：内核注入的交代（中断、周期干预）
+ */
+export type ToolOutcome = 'ok' | 'failed' | 'denied' | 'error' | 'notice';
+
+/**
  * 内核统一消息形状。
  * 采用「扁平 content + 可选 toolCalls」而非 Anthropic 式 block 数组：
  * 与 OpenAI-compatible 协议零转换成本，多模型路由时不必为每家做消息归一化。
@@ -30,6 +45,8 @@ export interface Msg {
   toolCallId?: string;
   /** role==='tool'：工具名（展示与 trace 用） */
   name?: string;
+  /** role==='tool'：结果性质（降详据此判定可否折叠，不比对文本） */
+  outcome?: ToolOutcome;
   /** 该消息产生时间（ISO），trace / 审计用 */
   ts?: string;
 }
@@ -56,8 +73,8 @@ export function userMsg(content: string): Msg {
   return { role: 'user', content, ts: new Date().toISOString() };
 }
 
-export function toolMsg(toolCallId: string, name: string, content: string): Msg {
-  return { role: 'tool', content, toolCallId, name, ts: new Date().toISOString() };
+export function toolMsg(toolCallId: string, name: string, content: string, outcome: ToolOutcome = 'ok'): Msg {
+  return { role: 'tool', content, toolCallId, name, outcome, ts: new Date().toISOString() };
 }
 
 export function assistantMsg(content: string, toolCalls?: ToolCallBlock[]): Msg {
