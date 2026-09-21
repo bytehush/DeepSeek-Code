@@ -123,6 +123,16 @@ export class AgentKernel {
   }
 
   /**
+   * 装载既有上下文（会话恢复用）。
+   *
+   * 唯一入口而非开放 setter：恢复路径必须经过内核，才能守住
+   * 「system 不入列」这条不变式（system 每轮现场生成，持久化或注入它都是错的）。
+   */
+  loadHistory(msgs: readonly Msg[]): void {
+    this.messages = msgs.filter((m) => m.role !== 'system');
+  }
+
+  /**
    * 跑一轮用户输入，产出 CoreEvent 流。
    * 生成器被消费完（或 return）前不落终态——UI 按 done 收尾。
    */

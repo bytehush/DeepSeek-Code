@@ -139,8 +139,9 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
   }
   if (text === '/clear') {
     ctx.props.kernel.clear();
+    ctx.props.session.clear();
     ctx.setMessages([]);
-    ctx.push('system', '已清空对话上下文（内核消息列同步清空）');
+    ctx.push('system', '已清空对话上下文与持久化会话（下次启动不再恢复）');
     return true;
   }
   if (text.startsWith('/mode')) {
@@ -300,6 +301,10 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
   } catch (e: unknown) {
     ctx.appendError(msgOf(e));
   } finally {
+    // 回合结束即快照内核消息列（含中断/报错收尾——那些也是有价值的上下文）。
+    // 在 finally 而非 done 事件里：生成器被提前 return 时也要落盘，
+    // 保存的正是"此刻内核真实记得的东西"，与 UI 显示无涉。
+    ctx.props.session.save(ctx.props.kernel.history);
     ctx.setBusy(false);
     ctx.setActiveAbort(null);
   }

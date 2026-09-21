@@ -16,6 +16,7 @@ import { ToolRegistry } from './tools/registry.ts';
 import { createCoreTools } from './tools/atomic.ts';
 import { AgentKernel } from './loop/kernel.ts';
 import { TraceSink } from './trace/sink.ts';
+import { SessionStore } from './session/store.ts';
 import { getMode } from '../config/model-mode.ts';
 import type { Credentials } from '../auth/credentials.ts';
 
@@ -30,8 +31,11 @@ export interface AssembledApp {
   registry: ToolRegistry;
   ledger: OutboundLedger;
   trace: TraceSink;
+  session: SessionStore;
   version: string;
   workspace: string;
+  /** 启动时从会话文件恢复的内核消息条数（供 UI 提示"已恢复上次会话"） */
+  restoredCount: number;
   modelName: string;
 }
 
@@ -70,16 +74,24 @@ export async function assembleKernel(
     modelName: currentActorLabel,
   });
 
+  // 会话恢复：内核消息列是上下文唯一事实源，装载后模型即"记得"上次会话。
+  // load() 永不抛——历史文件损坏/版本不符一律按新会话启动，不阻塞任何人。
+  const session = new SessionStore(workspace);
+  const restored = session.load();
+  if (restored && restored.length > 0) kernel.loadHistory(restored);
+
   return {
     kernel,
     hub,
     registry,
     ledger,
     trace,
+    session,
     version: pkgVersion(),
     workspace,
+    restoredCount: restored?.length ?? 0,
     modelName: currentActorLabel(),
-  };
+  } as AssembledApp;
 }
 
 /** 当前模式 → actor 模型身份（flash/pro 沿用旧 /model 语义） */

@@ -22,8 +22,9 @@ import { OutboundLedger } from '../src/core/provider/ledger.ts';
 import { ToolRegistry } from '../src/core/tools/registry.ts';
 import { createCoreTools } from '../src/core/tools/atomic.ts';
 import { AgentKernel, type KernelRunOptions } from '../src/core/loop/kernel.ts';
+import { SessionStore } from '../src/core/session/store.ts';
 import type { CoreEvent } from '../src/core/loop/events.ts';
-import type { Msg } from '../src/core/types.ts';
+import { userMsg, type Msg } from '../src/core/types.ts';
 
 /** 一次脚本化响应：文本 + 工具调用 */
 interface Scripted {
@@ -513,6 +514,68 @@ test('步数上限生效：maxIterations 传入内核后真正拦截无限循环
     const evs = await collect(kernel.prompt('一直读', { ...base, permission: 'execute', maxIterations: 3 }));
     assert.equal(evs.at(-1)!.reason, 'max_iterations');
     assert.equal(mock.requests.length, 3, 'maxIterations=3 → 恰好外发 3 次，第 4 步在调用前被拦');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── 会话持久化（step 2）：存 → 重启 → 装回内核 → 模型仍记得上次做到哪 ──
+
+test('重启续谈：loadHistory 后新请求携带完整历史（含工具结果）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsa-ws-'));
+  const sessDir = mkdtempSync(join(tmpdir(), 'dsa-sess-'));
+  try {
+    // ── 第一次会话：走一轮真实的 工具调用 → 结果 → 答复 ──
+    const a = makeKernel([
+      { text: '先建文件', toolCalls: [{ id: 'k1', name: 'write_file', args: { path: 'x.txt', content: 'hello' } }] },
+      { text: 'x.txt 已建好' },
+    ]);
+    try {
+      await collect(a.kernel.prompt('建个文件', { ...base, permission: 'execute' }));
+      const store = new SessionStore(dir, { dir: sessDir });
+      assert.ok(store.save(a.kernel.history), '回合末快照应写盘成功');
+
+      // ── "重启"：全新内核 + 装载历史 → 问一个只有靠历史才答得出的问题 ──
+      const { hub, mock } = makeHub([{ text: '刚才建的是 x.txt，内容是 hello' }]);
+      const registry = new ToolRegistry();
+      for (const t of createCoreTools()) registry.register(t);
+      const b = new AgentKernel({
+        hub,
+        registry,
+        cwd: dir,
+        protectedRoots: [],
+        modelName: () => 'mock-actor',
+      });
+      b.loadHistory(store.load()!);
+      await collect(b.prompt('刚才建的是什么文件？', { ...base, permission: 'execute' }));
+
+      const sent = mock.requests[0]!.messages;
+      assert.ok(sent.some((m) => m.role === 'user' && m.content === '建个文件'), '上次的用户输入要带回去');
+      assert.ok(sent.some((m) => m.role === 'tool' && m.content.includes('x.txt')), '工具结果也要带回去——模型记得的依据');
+      assert.ok(sent.some((m) => m.role === 'assistant' && m.content === 'x.txt 已建好'), '上次的答复要带回去');
+      // 注意：MockAdapter 存的是 messages 引用，回合结束后内核还会往里追加
+      // assistant——所以按"发出时刻的前缀"断言，而非按末位断言。
+      assert.equal(sent[4]!.role, 'user');
+      assert.equal(sent[4]!.content, '刚才建的是什么文件？', '本次提问应紧跟在恢复的历史之后');
+      assert.ok(!sent.slice(0, 4).some((m) => m.role === 'system'), 'system 提示不进历史');
+    } finally {
+      rmSync(a.dir, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(sessDir, { recursive: true, force: true });
+  }
+});
+
+test('loadHistory 拒绝 system 注入：旧系统提示不得混进恢复的历史', () => {
+  const { kernel, dir } = makeKernel([{ text: 'ok' }]);
+  try {
+    kernel.loadHistory([
+      { role: 'system', content: '（旧的持久化 system，必须被丢弃）' },
+      userMsg('还在吗'),
+    ]);
+    assert.equal(kernel.history.length, 1);
+    assert.equal(kernel.history[0]!.role, 'user');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

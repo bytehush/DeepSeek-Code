@@ -10,6 +10,7 @@ import type { ModelHub } from '../core/provider/hub.ts';
 import type { ToolRegistry } from '../core/tools/registry.ts';
 import type { OutboundLedger } from '../core/provider/ledger.ts';
 import type { TraceSink } from '../core/trace/sink.ts';
+import type { SessionStore } from '../core/session/store.ts';
 
 /** 消息角色（UI 与内核共用） */
 export type MsgRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
@@ -43,6 +44,10 @@ export interface AppProps {
   ledger: OutboundLedger;
   /** 事件流落盘 */
   trace: TraceSink;
+  /** 会话持久化（回合末快照内核消息列；启动时恢复） */
+  session: SessionStore;
+  /** 启动时从会话文件恢复的内核消息条数（0 = 新会话） */
+  restoredCount: number;
   /** 应用版本号（来自 package.json） */
   version: string;
   /**

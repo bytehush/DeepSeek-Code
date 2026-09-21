@@ -14,6 +14,7 @@ import type { PermissionMode } from '../core/permission/engine.ts';
 import type { OutputStyle } from '../core/loop/output-style.ts';
 import { loadStyle } from '../core/loop/output-style.ts';
 import { runChatTurn, type ChatContext } from './chat.ts';
+import { transcriptReplay } from './transcript.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
 
 export interface UseAgentControllerOptions {
@@ -51,7 +52,9 @@ export interface AgentController {
 }
 
 export function useAgentController(props: AppProps, opts?: UseAgentControllerOptions): AgentController {
-  const [messages, setMessages] = useState<UiMessage[]>([]);
+  // 初始转录 = 内核消息列的派生（assemble 时已装载上次会话）——
+  // 不单独持久化 UI 消息，两份存储必然漂移，一份不会。
+  const [messages, setMessages] = useState<UiMessage[]>(() => transcriptReplay(props.kernel.history));
   const [busy, setBusyState] = useState(false);
   const busyRef = useRef(false);
   const [mode, setMode] = useState<PermissionMode>('execute');
@@ -66,7 +69,9 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   const scrollOffsetRef = useRef(0);
   scrollOffsetRef.current = scrollOffset;
 
-  const msgId = useRef(0);
+  // 计数器必须越过恢复出来的转录，否则新消息 id 与旧消息重号，
+  // appendTo/按 id 更新会写花历史气泡。
+  const msgId = useRef(props.kernel.history.length);
   const streamingId = useRef<number | null>(null);
   const toolMsgId = useRef<number | null>(null);
   const activeAbort = useRef<AbortController | null>(null);

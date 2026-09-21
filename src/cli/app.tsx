@@ -14,7 +14,7 @@ import { useAgentController } from '../app/useAgentController.ts';
 import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow, BANNER_ROWS } from '../app/viewport.ts';
 
 /** Abyssal Pixel 风格 Banner */
-function Banner(props: { version: string; model: string; cwd: string }) {
+function Banner(props: { version: string; model: string; cwd: string; restored?: number }) {
   const cwdShow =
     props.cwd.length > 40 ? '.../' + props.cwd.split(/[\\/]/).slice(-2).join('/') : props.cwd;
   return (
@@ -24,7 +24,12 @@ function Banner(props: { version: string; model: string; cwd: string }) {
     <Box borderStyle="classic" borderColor="#2f6fb0" paddingX={1} flexDirection="row">
       <Box flexDirection="column" flexGrow={1} flexBasis={0} paddingRight={2}>
         <Text color="#2f6fb0" bold>{`DeepSeek Agent ${props.version}`}</Text>
-        <Text color="#7ec8e3">欢迎回来！</Text>
+        {/* 恢复提示替换欢迎行而非新增行：Banner 高度算进 BANNER_ROWS，多一行会挤爆视口 */}
+        {props.restored ? (
+          <Text color="#7ec699">{`已恢复上次会话（${props.restored} 条消息），/clear 清空`}</Text>
+        ) : (
+          <Text color="#7ec8e3">欢迎回来！</Text>
+        )}
         <WhaleMascot compact />
         <Text color="#7ec699">{props.model}</Text>
         <Text>
@@ -554,7 +559,7 @@ export function App(props: AppProps) {
 
   return (
     <Box flexDirection="column" height="100%">
-      <Banner version={props.version} model={modelShort} cwd={props.workspace} />
+      <Banner version={props.version} model={modelShort} cwd={props.workspace} restored={props.restoredCount} />
       <Box
         flexGrow={1}
         flexDirection="column"
