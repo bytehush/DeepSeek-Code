@@ -59,6 +59,47 @@ export interface KernelDeps {
 }
 
 const REPEAT_LIMIT = 3;
+/** 周期检测：允许的最大周期长度（A/B、A/B/C… 形式的交替地转） */
+const CYCLE_MAX_PERIOD = 4;
+/** 连续多少次「失败类」结果就判定无进展并停手（对齐 chat.ts 的 no_progress 文案） */
+const NO_PROGRESS_LIMIT = 3;
+/** 输出被 max_tokens 截断后，最多给几次「分块续写」的改策略机会 */
+const TRUNCATION_RECOVERIES = 2;
+
+/**
+ * 调用签名归一化：对象键排序后序列化。
+ * 不做归一化的话，`{"a":1,"b":2}` 与 `{"b":2,"a":1}` 会被当成两次不同调用，
+ * 模型只要调整参数书写顺序就能逃出周期检测——这是真实出现过的规避形态。
+ */
+function stableArgs(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v ?? null);
+  if (Array.isArray(v)) return `[${v.map(stableArgs).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  const keys = Object.keys(o).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableArgs(o[k])}`).join(',')}}`;
+}
+
+/**
+ * 地转检测：最近 tail 是否由同一长度 p 的块重复构成（p ≤ CYCLE_MAX_PERIOD，重复 ≥3 轮）。
+ *
+ * 为什么不用「连续 3 次字节相同」——那只抓得住最僵硬的重复。真实地转通常是
+ * A/B/A/B 交替（读一下、改一下、再读一下），模型每次都在「有点进展」的错觉里
+ * 烧 token。同时签名含完整 args，故对同一文件的合法连续编辑不会误判（old/new 不同）。
+ */
+function detectCycle(sigs: string[]): boolean {
+  for (let p = 1; p <= CYCLE_MAX_PERIOD; p++) {
+    const need = p * REPEAT_LIMIT;
+    if (sigs.length < need) continue;
+    const tail = sigs.slice(-need);
+    let same = true;
+    for (let i = p; i < need; i++) {
+      if (tail[i] !== tail[i - p]) { same = false; break; }
+    }
+    if (same) return true;
+  }
+  return false;
+}
+
 
 export class AgentKernel {
   /** 持久化对话（跨轮累积）；system 不入列，每轮现场生成 */
@@ -98,9 +139,15 @@ export class AgentKernel {
 
     let step = 0;
     let lastFinalText = '';
-    /** 重复检测窗口：`name|JSON(args)` */
+    /** 调用签名窗口（周期检测用）：`name|{有序 args}` */
     const recentCalls: string[] = [];
     let usage: Usage = { inputTokens: 0, outputTokens: 0 };
+    /** 连续「失败类」结果计数（工具报错 / 被拒），达阈值判 no_progress */
+    let failStreak = 0;
+    /** 截断改策略已给机会次数 */
+    let truncationRetry = 0;
+    /** 无进展触发：本轮起不再提供工具，强制模型产出总结 */
+    let forceNoTools = false;
 
     const matrix = matrixFromMode(opts.permission);
 
@@ -128,11 +175,12 @@ export class AgentKernel {
       let text = '';
       let toolCalls: Array<{ id: string; name: string; args: unknown }> = [];
       let streamError: { message: string; category: string } | null = null;
+      let truncated = false;
       try {
         for await (const ev of this.deps.hub.stream('actor', {
           system,
           messages,
-          tools: this.deps.registry.wireSpecs(),
+          tools: forceNoTools ? undefined : this.deps.registry.wireSpecs(),
           signal,
         })) {
           if (this.aborted && ev.type !== 'message_end') continue;
@@ -158,9 +206,7 @@ export class AgentKernel {
                 outputTokens: usage.outputTokens + ev.usage.outputTokens,
               };
             }
-            if (ev.finishReason === 'length') {
-              streamError = { message: '响应过长被截断（max_tokens）', category: 'token_limit' };
-            }
+            if (ev.finishReason === 'length') truncated = true;
           }
         }
       } catch (e: unknown) {
@@ -184,10 +230,29 @@ export class AgentKernel {
         yield* this.finish(opts, 'user_abort', usage);
         return;
       }
-      if (streamError) {
-        yield this.emit({ type: 'error', error: streamError.message, errorCategory: streamError.category, step });
-        yield* this.finish(opts, 'token_limit', usage);
-        return;
+
+      // —— 输出被 max_tokens 截断：回灌而非暴停 ——
+      //
+      // 截断时 tool_call 的参数是被掐断的半截 JSON，执行它必然失败；而失败原因
+      // （「内容太长」）与表象（「参数校验失败」）不一致，模型看不出该改策略，
+      // 于是原样重试 → 再被掐断 → 确定性死循环。这是 P0 唯一一处违背
+      // 「失败即回灌」不变式的路径，此处补正：明确告诉模型「你被掐断了、
+      // 该怎么改」，并且**不执行这些残缺调用**（不入列带 toolCalls 的 assistant
+      // 消息，避免对话结构里出现无结果的悬空调用）。
+      if (truncated) {
+        if (text) this.messages.push(assistantMsg(text));
+        if (truncationRetry >= TRUNCATION_RECOVERIES) {
+          yield this.emit({ type: 'system', text: `连续 ${TRUNCATION_RECOVERIES + 1} 次输出被长度上限截断，停止以免空耗`, step });
+          yield* this.finish(opts, 'token_limit', usage, text);
+          return;
+        }
+        truncationRetry++;
+        const advice = toolCalls.length > 0
+          ? '你刚才要调用的工具因输出过长被截断了，参数不完整，**本次未执行**。请改策略：把大改动拆成多次小输出——先 write_file 写入骨架/最小可运行版本，再用 edit_file 分若干次补全；每次输出只包含一个文件的一部分，切勿一次性写完整个文件。'
+          : '你的回复因长度上限被截断了。请把它拆成若干次较短的输出继续讲，或先给结论再给细节。';
+        this.messages.push({ role: 'system', content: `（系统提示：${advice}）` });
+        yield this.emit({ type: 'system', text: `✂ 输出被截断，已要求分块续写（第 ${truncationRetry}/${TRUNCATION_RECOVERIES} 次）`, step });
+        continue;
       }
 
       // —— 无工具调用 = 最终答复 ——
@@ -195,11 +260,21 @@ export class AgentKernel {
         lastFinalText = text;
         this.messages.push(assistantMsg(text));
         if (text) yield this.emit({ type: 'assistant_phase', phase: 'final', step });
-        yield* this.finish(opts, 'model_stop', usage, lastFinalText);
+        // forceNoTools 收尾的这轮总结，退出原因如实标 no_progress 而非 model_stop
+        yield* this.finish(opts, forceNoTools ? 'no_progress' : 'model_stop', usage, lastFinalText);
         return;
       }
 
       // —— 有工具调用：先入列 assistant(toolCalls)，再逐个执行 ——
+      // forceNoTools 的收尾轮本不该再有工具；若模型仍幻觉出调用，不再执行，
+      // 直接以 no_progress 收尾，保证「交代现状」这一轮能真正交付给用户。
+      if (forceNoTools) {
+        lastFinalText = text;
+        this.messages.push(assistantMsg(text));
+        if (text) yield this.emit({ type: 'assistant_phase', phase: 'final', step });
+        yield* this.finish(opts, 'no_progress', usage, lastFinalText);
+        return;
+      }
       this.messages.push(
         assistantMsg(
           text,
@@ -216,13 +291,10 @@ export class AgentKernel {
         const spec = this.deps.registry.get(tc.name);
         yield this.emit({ type: 'tool_call', toolName: tc.name, args: tc.args, reactPhase: 'action', step });
 
-        const sig = `${tc.name}|${JSON.stringify(tc.args ?? {})}`;
+        const sig = `${tc.name}|${stableArgs(tc.args)}`;
         recentCalls.push(sig);
-        if (
-          recentCalls.length >= REPEAT_LIMIT &&
-          recentCalls.slice(-REPEAT_LIMIT).every((s) => s === sig)
-        ) {
-          yield this.emit({ type: 'system', text: `检测到重复调用 ${tc.name} ≥${REPEAT_LIMIT} 次，提前结束`, step });
+        if (detectCycle(recentCalls)) {
+          yield this.emit({ type: 'system', text: `检测到周期性重复调用（${tc.name} 等，已重复 ≥${REPEAT_LIMIT} 轮），提前结束`, step });
           this.messages.push(toolMsg(tc.id, tc.name, '（系统干预：重复调用已中止，请换思路）'));
           yield* this.finish(opts, 'repeat_loop', usage);
           return;
@@ -238,6 +310,23 @@ export class AgentKernel {
           yield this.emit({ type: 'permission', toolName: tc.name, granted: false, text: outcome.text, reactPhase: 'observation', step });
         }
         yield this.emit({ type: 'tool_result', toolName: tc.name, result: outcome.text.slice(0, 2000), reactPhase: 'observation', step });
+
+        // 无进展检测：连续 N 次「失败类」结果（工具报错 / 参数非法 / 被拒）即停手。
+        // 这是过去那条「一直失败一直到用户手动 Ctrl+C」路径的兜底闸门。
+        //
+        // 停手不等于闭嘴：置 forceNoTools 让下一轮**不再提供工具**，模型只能产出
+        // 中文现状总结，循环从「交代清楚」这条路径正常退出（reason 仍标
+        // no_progress，标签不失真）。既不额外多烧一次调用，也不静默消失。
+        failStreak = outcome.failed ? failStreak + 1 : 0;
+        if (failStreak >= NO_PROGRESS_LIMIT) {
+          yield this.emit({ type: 'system', text: `连续 ${failStreak} 次工具执行失败，停止调用工具并汇总现状`, step });
+          this.messages.push({
+            role: 'system',
+            content: `（系统提示：已连续 ${failStreak} 次工具调用失败，本轮不再提供工具。请向用户如实说明：已经完成了什么、卡在哪一步、最后一次失败的具体错误，以及需要用户补充什么信息。用简体中文，不要再尝试任何操作。）`,
+          });
+          forceNoTools = true;
+          failStreak = 0;
+        }
       }
     }
   }
@@ -248,7 +337,7 @@ export class AgentKernel {
     tc: { id: string; name: string; args: unknown },
     matrix: ReturnType<typeof matrixFromMode>,
     opts: KernelRunOptions,
-  ): Promise<{ text: string; denied?: boolean; aborted?: boolean }> {
+  ): Promise<{ text: string; denied?: boolean; aborted?: boolean; failed?: boolean }> {
     if (!spec) {
       // 结构性防御：provider 幻觉出未注册工具时，回灌而不是崩溃
       return { text: `错误：工具 ${tc.name} 不存在于注册表。可用工具见系统提示。` };
@@ -289,7 +378,9 @@ export class AgentKernel {
       const msg = e instanceof Error ? e.message : String(e);
       if (/abort/i.test(msg) && this.aborted) return { text: '（已中断）', aborted: true };
       // 失败即回灌：错误文本作为工具结果给模型自我纠正
-      return { text: `工具执行失败：${msg}` };
+      // failed 标记供无进展计数——只有真正执行报错才算失败，
+      // 权限拦截/用户拒绝是闸门在正常工作，不计入（模型换思路即有进展）
+      return { text: `工具执行失败：${msg}`, failed: true };
     }
   }
 

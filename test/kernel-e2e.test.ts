@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -381,6 +381,138 @@ test('clear()：内核消息列清空，下一轮不再带历史', async () => {
     await collect(kernel.prompt('第二问', { ...base, permission: 'execute' }));
     const userMsgs = mock.requests[1]!.messages.filter((m) => (m as Msg).role === 'user');
     assert.equal(userMsgs.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── P0.1 反地转修复：截断回灌 / 无进展 / 周期检测 / 步数上限 ──
+
+test('截断回灌：finish_reason=length 时不执行残缺调用，改为回灌分块建议', async () => {
+  const big = 'x'.repeat(200);
+  const { kernel, mock, dir } = makeKernel([
+    { text: '我来写整个五子棋', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'gobang.ts', content: big } }], finishReason: 'length' },
+    { text: '明白，我先写骨架再分块补全' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('设计一个五子棋', { ...base, permission: 'execute' }));
+    // 第二次请求里必须有"被截断/分块"的明示，而不是含糊的"参数校验失败"
+    const sys = mock.requests[1]!.messages.filter((m) => m.role === 'system').map((m) => String(m.content)).join('\n');
+    assert.match(sys, /截断/);
+    assert.match(sys, /未执行/);
+    assert.match(sys, /edit_file/);
+    // 残缺调用不得进入工具层（不产生 tool 消息，也不落盘）
+    assert.equal(mock.requests[1]!.messages.find((m) => m.role === 'tool'), undefined, '截断调用不应被执行并产生 tool 结果');
+    const { existsSync } = await import('node:fs');
+    assert.ok(!existsSync(join(dir, 'gobang.ts')), '被截断的 write_file 不得落盘');
+    assert.equal(evs.at(-1)!.reason, 'model_stop', '改策略后正常收尾');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('截断有上限：连续截断达次数后以 token_limit 收尾，不无限重试', async () => {
+  const call = (id: string) => ({ id, name: 'write_file', args: { path: 'a.ts', content: 'y'.repeat(100) } });
+  const { kernel, mock, dir } = makeKernel([
+    { text: '一', toolCalls: [call('t1')], finishReason: 'length' },
+    { text: '二', toolCalls: [call('t2')], finishReason: 'length' },
+    { text: '三', toolCalls: [call('t3')], finishReason: 'length' },
+    { text: '四', toolCalls: [call('t4')], finishReason: 'length' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('写文件', { ...base, permission: 'execute' }));
+    assert.equal(evs.at(-1)!.reason, 'token_limit');
+    // TRUNCATION_RECOVERIES=2 → 前两次给改策略机会，第三次即停：共 3 次外发
+    assert.equal(mock.requests.length, 3, '截断改策略机会应受限，不得无限重试');
+    assert.ok(evs.some((e) => e.type === 'system' && /分块续写/.test(e.text ?? '')), '用户应看到截断处置提示');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('无进展：连续 3 次工具执行失败 → 停止供工具并交付现状总结（no_progress）', async () => {
+  // 参数各不相同 → 绕开周期检测，专门考察 no_progress 这条路径
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'f1', name: 'read_file', args: { path: 'miss1.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f2', name: 'read_file', args: { path: 'miss2.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f3', name: 'read_file', args: { path: 'miss3.ts' } }] },
+    { text: '我卡在读取文件上，三次都失败，需要你确认路径' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('读这些文件', { ...base, permission: 'execute' }));
+    assert.equal(mock.requests.length, 4, '失败 3 次后应再走一轮产出总结');
+    assert.equal(mock.requests[3]!.tools, undefined, '收尾轮不得再提供工具');
+    const done = evs.at(-1)!;
+    assert.equal(done.reason, 'no_progress');
+    assert.match(done.text ?? '', /失败/, '用户必须拿到现状总结而非静默消失');
+    assert.ok(evs.some((e) => e.type === 'system' && /连续 3 次工具执行失败/.test(e.text ?? '')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('权限拒绝不算失败：用户说 no 是闸门正常工作，不得误判 no_progress', async () => {
+  const { kernel, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'd1', name: 'write_file', args: { path: 'p1.txt', content: 'a' } }] },
+    { text: '', toolCalls: [{ id: 'd2', name: 'write_file', args: { path: 'p2.txt', content: 'b' } }] },
+    { text: '', toolCalls: [{ id: 'd3', name: 'write_file', args: { path: 'p3.txt', content: 'c' } }] },
+    { text: '你拒绝了这几次写入，那我们换个方案' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('写三个文件', { ...base, permission: 'ask', ask: async () => false } as KernelRunOptions));
+    const done = evs.at(-1)!;
+    assert.equal(done.reason, 'model_stop', '连续被拒只是用户意愿，不是无进展');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('周期检测：A/B 交替调用 ≥3 轮 → repeat_loop（旧判据抓不到的形态）', async () => {
+  // 两次调用都读**真实存在且内容不同**的文件 → 均成功 → failStreak 恒为 0，
+  // 从而隔离出周期检测：证明它抓的是"调用模式在转圈"，而非"工具在报错"。
+  const { kernel, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: '1', name: 'read_file', args: { path: 'a.ts' } }] },
+    { text: '', toolCalls: [{ id: '2', name: 'read_file', args: { path: 'b.ts' } }] },
+    { text: '', toolCalls: [{ id: '3', name: 'read_file', args: { path: 'a.ts' } }] },
+    { text: '', toolCalls: [{ id: '4', name: 'read_file', args: { path: 'b.ts' } }] },
+    { text: '', toolCalls: [{ id: '5', name: 'read_file', args: { path: 'a.ts' } }] },
+    { text: '', toolCalls: [{ id: '6', name: 'read_file', args: { path: 'b.ts' } }] },
+  ]);
+  writeFileSync(join(dir, 'a.ts'), 'A\n', 'utf-8');
+  writeFileSync(join(dir, 'b.ts'), 'B\n', 'utf-8');
+  try {
+    const evs = await collect(kernel.prompt('看看这两个文件', { ...base, permission: 'execute' }));
+    assert.equal(evs.at(-1)!.reason, 'repeat_loop', '交替地转必须被抓住');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('参数键序归一化：同义调用（键顺序不同）也判定为重复', async () => {
+  const { kernel, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'k1', name: 'search_files', args: { query: 'foo', dir: 'src' } }] },
+    { text: '', toolCalls: [{ id: 'k2', name: 'search_files', args: { dir: 'src', query: 'foo' } }] },
+    { text: '', toolCalls: [{ id: 'k3', name: 'search_files', args: { query: 'foo', dir: 'src' } }] },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('搜 foo', { ...base, permission: 'execute' }));
+    assert.equal(evs.at(-1)!.reason, 'repeat_loop', '换键序不得逃出重复检测');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('步数上限生效：maxIterations 传入内核后真正拦截无限循环', async () => {
+  const { kernel, mock, dir } = makeKernel(
+    Array.from({ length: 10 }, (_, i) => ({
+      text: '',
+      toolCalls: [{ id: `s${i}`, name: 'read_file', args: { path: `f${i}.ts` } }],
+    })),
+  );
+  try {
+    const evs = await collect(kernel.prompt('一直读', { ...base, permission: 'execute', maxIterations: 3 }));
+    assert.equal(evs.at(-1)!.reason, 'max_iterations');
+    assert.equal(mock.requests.length, 3, 'maxIterations=3 → 恰好外发 3 次，第 4 步在调用前被拦');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

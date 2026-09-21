@@ -68,6 +68,9 @@ export interface ChatContext {
 /** 本轮任务起点（毫秒），用于结束后回显耗时 */
 let taskStart = 0;
 
+/** 单轮用户输入的默认步数上限（一步 = 一次模型调用 + 其工具执行） */
+export const DEFAULT_MAX_ITERATIONS = 30;
+
 const SHORTCUTS = [
   '命令：',
   '  /mode explore|ask|execute   切换权限模式',
@@ -245,11 +248,10 @@ function applyCoreEvent(ev: CoreEvent, ctx: ChatContext): void {
     if (ev.reason && ev.reason !== 'model_stop') {
       const stopLabels: Record<string, string> = {
         user_abort: '⏹ 已因用户中断而停止',
-        no_progress: '⚠️ 工具连续失败，已提前结束',
-        no_observable_progress: '⚠️ 连续多轮无实质进展，疑似空转，已提前结束',
-        repeat_loop: '⚠️ 检测到重复/周期工具调用，疑似死循环，已提前结束',
-        max_iterations: '⏱ 已达最大迭代轮数上限，已结束',
-        token_limit: '📏 token 超限或被截断（上下文压缩能力 P1 上线前的临时终态）',
+        no_progress: '⚠️ 工具连续失败，已停止尝试并向你说明现状',
+        repeat_loop: '⚠️ 检测到周期性重复调用，疑似空转，已提前结束',
+        max_iterations: '⏱ 已达单轮步数上限（默认 30 步）并结束；若任务未完成，请把大目标拆成几步分别下达',
+        token_limit: '📏 输出被长度上限截断且分块续写仍未成功（上下文压缩能力 P1 上线前的临时终态）',
       };
       ctx.push('system', stopLabels[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`);
     }
@@ -284,6 +286,9 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
       permission: ctx.getState().mode,
       planMode: ctx.getState().planMode,
       styleInstruction: styleInstruction(ctx.getState().outputStyle),
+      // 真实步数上限：此前该字段声明了却从未传入内核，等于无上限——
+      // 任何未被 repeat/no_progress 抓住的失败模式都会无限烧 token。
+      maxIterations: ctx.maxIterations > 0 ? ctx.maxIterations : DEFAULT_MAX_ITERATIONS,
       signal: abortController.signal,
       ask: ctx.requestConfirm,
       onToolProgress: (_toolName: string, out: string) => {

@@ -241,7 +241,7 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
       setBusy,
       setCost: setCostCny,
       getState: () => stateRef.current,
-      maxIterations: 0, // CLI 默认无上限
+      maxIterations: 0, // 0 → chat.ts 回退 DEFAULT_MAX_ITERATIONS(30)，不再是"无上限"
       setMaxIterations: (n: number) => { /* CLI 无 GUI 设置入口，stub */ },
       getIterations: () => 0, // CLI 无迭代跟踪，stub
       setBrowserWatch: (_b: boolean) => { /* CLI 无浏览器，stub */ },
