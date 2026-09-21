@@ -1,113 +1,144 @@
 # AGENTS.md — DeepSeek CLI 编程 Agent 操作手册 & 项目 Spec
 
 > 本文件既是给 Agent 自身的「操作手册」，也是本项目的 **Spec**。
-> **当前形态：极简 CLI**（`6ed6596 refactor(core): 极简模式` 之后的实际状态）。
+> **当前形态：自研内核 P0**（`7b626bd` 全量替换 Pi SDK 之后的实际状态）。
+> 产品定位与分期路线的决策依据：`docs/重设计方案-编程Agent基座.md`（ADR D1-D5）。
 
 ## 1. 项目定位
 
 直接接入 **DeepSeek 原生 API** 的命令行编程 Agent。面向中文开发者，在终端完成
 「读代码 → 理解结构 → 改 / 建代码 → 跑命令验证」的闭环。
 
-**不做万能助手**，只做编程垂直场景，且保持最小形态。
+定位一句话：**一句话入口 + 强编排内核 + 全程可控 + 数据边界可见**。
+不做万能助手，只做编程垂直场景；内核自研，不依赖外部 Agent 运行时。
 
 ## 2. 目标用户 & 高频任务
 
 - **目标用户**：无法 / 不愿使用 Claude 海外账户的开发者；中文母语；习惯终端工作流。
 - **高频任务**：
-  1. 理解陌生代码库（读文件、看目录结构）
+  1. 理解陌生代码库（读文件、列目录、正则检索）
   2. 实现新功能 / 修复 bug（编辑、新建文件）
   3. 重构（多文件协同修改）
   4. 跑命令验证（构建、测试、lint、git 状态）
-  5. 多轮对话保持上下文记忆（由持久化 Agent 承担）
+  5. 多轮对话保持上下文记忆（AgentKernel 跨轮持久化 + 重启会话恢复）
 
-## 3. Agent 工具列表（共 4 个）
+## 3. Agent 工具列表（共 6 个，注册表 = 单一事实源）
 
 > **设计原则**：工具越少，模型选型越准、行为越可控。
-> 极简模式下只保留 4 个原子工具，复杂能力由模型用这 4 个组合完成，
-> 不再提供自研领域工具（曾经的 `review_code` / `audit_dependencies` / `terminology` /
-> `project_discover` / `delegate` 等已在 `6ed6596` 中删除）。
+> 工具描述的**唯一来源是请求的 `tools` 字段**（`registry.wireSpecs()`），
+> system prompt 里不再复制第二份清单——两份文本会各自漂移，而 provider 只认
+> `tools` 里的名字，自然语言清单是软约束。**提示词里出现但注册表没有的工具
+> 在结构上不可能存在**（幽灵工具是旧版最大教训，见设计稿 §1）。
+> 新增工具必须：注册进 registry + 自带 capability/risk 维度 + 有真实消费者，
+> 三者缺一不可。每步上下文体积构成见 `npm run context:audit`。
 
-| 工具 | 参数 | 说明 | 风险级 |
+| 工具 | 参数 | 能力 | 风险级 |
 |------|------|------|--------|
-| `read_file` | `path`, `offset?`, `limit?` | 读取文件内容 | 低 |
-| `write_file` | `path`, `content` | 写入 / 覆盖文件 | 中（覆写） |
-| `edit_file` | `path`, `old_string`, `new_string` | 字符串替换（需唯一匹配） | 中（覆写） |
-| `bash` | `command`, `cwd?` | 执行 shell 命令，流式返回 stdout / stderr | 高（需确认） |
+| `read_file` | `path`, `offset?`, `limit?` | read | 低 |
+| `write_file` | `path`, `content` | write | 中（覆盖前自动快照） |
+| `edit_file` | `path`, `old`, `new`（需唯一匹配） | write | 中 |
+| `list_files` | `dir?`, `pattern?`, `max?` | read | 低 |
+| `search_files` | `query`(正则), `pattern?`, `dir?` | read | 低 |
+| `bash` | `command`, `timeoutSec?` | exec | 高（破坏性命令无条件升级确认） |
 
-**路径解析**：相对路径基于 workspace（agent 的工作目录）解析。
+**路径解析**：相对路径基于 workspace 解析；绝对路径、`..` 逃逸一律过
+`safePath` + protectedRoots 校验，落在受保护目录（源码根）内直接拒绝并回灌。
 
-**写路径保护**：写操作若落在受保护目录（源码根）内，直接拒绝并把错误回灌模型。
-覆盖相对路径、绝对路径、`..` 逃逸三种形态。
+**结构性排除**：`list_files` / `search_files` 硬编码跳过 `.git`、`node_modules`、
+`dist` 等目录（SKIP_DIRS），不存在「换个参数就能扫到敏感目录」的路径。
 
-**失败处理**：工具直接 throw，Pi Agent 会把错误作为 tool error 回灌给模型，
-模型据此自我纠正，不静默跳过。
+**失败处理**：工具 throw → 错误文本作为 tool result 回灌模型，模型据此自我
+纠正，不静默跳过（内核不变式 1）。
 
 ## 4. 拒答边界
 
 - **绝不执行**：`rm -rf /`、格式化磁盘、修改系统关键文件、读取并回显 `.env` 等密钥文件内容。
 - **绝不替代人类做不可逆决策**：`git push --force`、`DROP DATABASE`、批量删除需用户显式确认。
-- **绝不写入源码根**：避免 agent 修改自身代码。
+- **绝不写入源码根**：避免 agent 修改自身代码（protectedRoots 强制）。
+- **幻觉工具**：模型调用未注册工具时，回灌「不存在于注册表」而非崩溃（kernel.runTool）。
 
-## 5. 确认点（权限层）
+## 5. 确认点（权限层：三模式 × 能力矩阵）
 
-- 危险命令 / 覆写重要文件 → 默认 **Ask** 模式，需用户确认。
-- 读 / 普通命令 → 默认 **Execute** 模式，自动放行。
-- 支持三档切换：`Explore`（只读安全）/ `Ask`（需确认）/ `Execute`（自动放行）。
+`src/core/permission/engine.ts` 是**唯一权限真相**，纯函数，无旁路：
+
+- `decide()`：旧单轴三模式 `explore`（只读）/ `ask`（需确认）/ `execute`（自动）。
+- `decide3()`：能力矩阵 `read/write/exec/net` × `auto/confirm/block`，
+  经 `matrixFromMode()` 与三模式对齐；裁决优先级：
+  destructive → block 层 → 不可信仓库 net → confirm 层 → auto（高风险仍可升级）。
+- P0 现状：net 能力尚无工具使用（沙箱与不可信仓库门控在 P2）；
+  破坏性命令由 `isDestructive()` 的 POSIX 模式集判定。
 
 ## 6. 架构边界
 
-- **应用交互层**（`src/cli`、`src/app`）：TUI 渲染、登录、Markdown 展示、
-  workspace 解析、React 状态控制器。
-- **Agent 运行时层**（`src/agent`）：Pi Agent 适配、原子工具、系统提示、输出风格。
-- **配置层**（`src/config`）：工作区解析与源码目录保护、模型档位（flash / pro）。
-- **权限层**（`src/permission`）：三模式闸门决策。
-- **凭证层**（`src/auth`）：API Key 读写（scrypt 哈希）。
-- **通用层**（`src/utils`）：日志、Markdown 处理、文件回滚栈。
+- **应用交互层**（`src/cli`、`src/app`）：trace-first TUI、登录、Markdown、workspace 解析。
+  渲染是事件流的纯折叠（`app/timeline.ts`：UiMessage[] = fold(UiEvent[])），
+  恢复会话 = 重放内核消息列；编排层（`app/chat.ts`）只发事件不拼气泡。
+  只消费 `CoreEvent`，不触模型与工具。
+- **内核层**（`src/core/`）：`loop/`（AgentKernel+事件契约+系统提示+输出风格）、
+  `provider/`（ModelHub+OpenAI-compatible 适配器+SSE+OutboundLedger）、
+  `tools/`（注册表+原子工具）、`permission/`、`trace/`、`session/`（回合末快照，
+  按工作区归集，load 永不抛）、`assemble.ts`。
+- **配置层**（`src/config`）：工作区解析与保护、模型档位。
+- **凭证层**（`src/auth`）：API Key 读写（0o600）。密钥**显式传参**进 ModelHub，
+  绝不写 `process.env`；`serialize(req)` 签名里没有 apiKey。
+- **通用层**（`src/utils`）：日志、Markdown、回滚栈。
 
-**已删除的层**（`6ed6596`，不再存在于代码中）：
-`gui/`、`gui/web/`、`memory/`（RAG 记忆）、`skills/`（技能加载）、`mcp/`（MCP 客户端）、
-`review/`（审查编排）、`context/`（历史 + trace）、`history/`（会话面板）、
-`llm/`（自研 API 封装，现由 `@earendil-works/pi-ai` 承担）、`tools/`（自研工具集，
-现仅保留 `agent/pi-tools.ts` 的 4 个原子工具）。
+**已删除的层**（不再存在于代码中）：
+`src/agent/`（Pi 适配层，P0 重写为 `src/core/loop` + `core/tools`）、
+`src/permission/`（并入 `core/permission`）、`src/app/assemble.ts`、`keyContext.ts`；
+更早删除的 GUI/RAG/skills/MCP 层不复活（设计稿 §7 明确排除）。
+依赖侧移除：`@earendil-works/*`、`openai`、`ws`、`react-dom`、`typebox`、`vite` 系。
 
 ## 7. 运行方式
 
 ```bash
 npm start          # 启动 TUI
 npm run typecheck  # 类型检查（覆盖 src/test/eval/scripts）
-npm test           # 单元测试（node:test，无需 API Key）
+npm test           # 单元 + e2e 测试（node:test，无需 API Key、无网络）
+npx tsx eval/run-eval.ts --tier code   # 无密钥评测基线
 ```
 
-**模型**：`deepseek-v4-flash`（默认，快）/ `deepseek-v4-pro`（深度推理），
-CLI 内用 `/model` 切换。
+**模型**：`deepseek-v4-flash`（默认）/ `deepseek-v4-pro`（深度推理），
+CLI 内 `/model` 切换，经 ModelHub 惰性绑定下一轮即时生效。
 
 **工作区**：`--workspace` flag > `DSA_WORKSPACE` env > 自动判定。
 自动判定时若 cwd 在源码根内，切到 `~/.dsa/workspace`。
 
-## 8. 评测
+## 8. 评测（三层体系的地基）
 
-`eval/` 保留了 23 个黄金用例的**定义**（`cases.ts`、`golden-cases.md`）。
+`eval/` 现在是**可运行的**：
 
-> ⚠️ 原评测执行脚本 `eval/run-eval.ts` 依赖已删除的 `src/llm/`、`src/context/`、
-> `src/tools/`，已在极简模式收尾时移除。当前评测套件**不可直接运行**，
-> `cases.ts` 作为未来重写评测时的素材保留。
+- `cases.ts`：22 个黄金 case（code 15 / llm 5 / human 2），工具名与注册表
+  严格一致；`test/eval-cases.test.ts` 会静态扫描 check() 源码，**断言了不存在
+  的工具直接让 CI 红**。
+- `run-eval.ts`：被测对象即产品本体——mock 理想轨迹注入 ProviderAdapter 边界，
+  kernel / 权限 / 工具 / 记账全部真实运行；`--real` 换真模型；`--tier llm`
+  走 hub 裁判打分；`--k` 出 pass@k。
+- 评测的出站记账写入临时 HOME，不污染用户真实账本。
+- 结果落 `eval/results.json` + `RESULTS.md`，形成版本序列（P1/P2 的对比基线）。
 
 ## 9. 开发纪律
 
 - **受控改动**：不重构、不过度优化、不动无关代码。
 - **改前先列清单**：改动文件 + 原因 + 影响范围，确认后才动手。
-- **typecheck 是底线**：`npx tsc --noEmit` 零错误才能提交。
-  （tsconfig 的 `include` 已覆盖 `src` / `test` / `eval` / `scripts`，
-  避免出现「检查不到坏引用」的盲区。）
-- **单元测试**：不依赖外部服务的用例必须通过（`npm test`）。
-- **发现无用代码走 git 历史**：删除前确认目标确实无引用，删除后 commit message
-  说明原因。
+- **typecheck 是底线**：`npx tsc --noEmit` 零错误才能提交
+  （tsconfig `include` 覆盖 `src`/`test`/`eval`/`scripts`，无坏引用盲区）。
+- **单元测试**：`npm test` 必须全绿；核心不变式改动须同步改
+  `test/kernel-e2e.test.ts` / `test/sse-parser.test.ts` 的对应断言。
+- **事件契约冻结**：`CoreEvent` 是 UI/trace/eval 三方消费者的共享契约，
+  改字段形状须三处同步，禁止为单一消费者私造事件。
+- **发现无用代码走 git 历史**：删除前确认无引用，commit message 说明原因。
+- **D5 纪律**：没有真实消费者的接口 / 配置 / 抽象不允许合入。
 
-## 10. 后续演进
+## 10. 后续演进（P0 已交付，按设计稿分期推进）
 
-当前阶段目标：**把 CLI 做扎实**。这是进入后续发展的前提。
+- **P1 上下文管理**：预算闸门 + 降详已落地（`core/loop/context-budget.ts`，
+  判据=「被同路径成功写入否证」，引用化而非 LLM 摘要——摘要一旦写错比截断更糟）。
+  仍未做：跨会话的历史摘要、`/context` 视图（看模型当时到底看到什么）。
+  压缩若引入 LLM 调用必须走 cheap 角色且成本入 ledger。
+- **P2 上限层**：actor/critic/cheap 异厂商路由、`/review` 交叉评审闭环、
+  不可信仓库默认禁网、bash 沙箱化。
+- 持续：每阶段跑全量 eval 进 `RESULTS.md`——「数据说话」。
 
-不在当前范围（如需引入，应新建结构化设计文档后再实施）：
-- 自研差异化工具（代码审查、依赖审计、术语对照等）
-- 记忆层 / 技能系统 / MCP 接入
-- Web GUI
+不在当前范围（引入须先有消费者 + 设计文档）：Web GUI、记忆层/RAG、技能系统、
+MCP、多会话 fork、发布 npm。

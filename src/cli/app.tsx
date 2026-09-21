@@ -7,14 +7,14 @@ import { MarkdownMessage } from './Markdown.tsx';
 import { sanitizeBoxDrawing } from './sanitize.ts';
 import { saveCredentials } from './auth.ts';
 import { KeyCapture } from './login.tsx';
-import { styleLabel } from '../agent/output-style.ts';
+import { styleLabel } from '../core/loop/output-style.ts';
 import { getMode, modeLabel } from '../config/model-mode.ts';
 import type { AppProps, UiMessage } from '../app/types.ts';
 import { useAgentController } from '../app/useAgentController.ts';
 import { computeAreaHeight, estimateLines, prefixWidthOf, selectRowWindow, BANNER_ROWS } from '../app/viewport.ts';
 
 /** Abyssal Pixel 风格 Banner */
-function Banner(props: { version: string; model: string; cwd: string }) {
+function Banner(props: { version: string; model: string; cwd: string; restored?: number }) {
   const cwdShow =
     props.cwd.length > 40 ? '.../' + props.cwd.split(/[\\/]/).slice(-2).join('/') : props.cwd;
   return (
@@ -24,7 +24,12 @@ function Banner(props: { version: string; model: string; cwd: string }) {
     <Box borderStyle="classic" borderColor="#2f6fb0" paddingX={1} flexDirection="row">
       <Box flexDirection="column" flexGrow={1} flexBasis={0} paddingRight={2}>
         <Text color="#2f6fb0" bold>{`DeepSeek Agent ${props.version}`}</Text>
-        <Text color="#7ec8e3">欢迎回来！</Text>
+        {/* 恢复提示替换欢迎行而非新增行：Banner 高度算进 BANNER_ROWS，多一行会挤爆视口 */}
+        {props.restored ? (
+          <Text color="#7ec699">{`已恢复上次会话（${props.restored} 条消息），/clear 清空`}</Text>
+        ) : (
+          <Text color="#7ec8e3">欢迎回来！</Text>
+        )}
         <WhaleMascot compact />
         <Text color="#7ec699">{props.model}</Text>
         <Text>
@@ -109,16 +114,19 @@ const PlainTextMessage = memo(
             : m.role === 'system'
               ? '#9aa0a6'
               : '#e8e8e8';
+    // trace-first 视觉层级：步骤行/系统提示是「过程」，暗显；
+    // 用户输入与答复才是留在视网膜上的东西。
+    const dim = m.kind === 'step' || m.kind === 'notice';
     const prefix = m.role === 'user' ? '你> ' : m.role === 'assistant' ? 'Agent> ' : '';
     return (
-      <Text wrap="wrap">
+      <Text wrap="wrap" dimColor={dim || undefined}>
         <Text color={color}>{prefix}</Text>
         {/* tool/error/system 原始内容先过 box-drawing → ASCII（方案 3 全局覆盖） */}
         <Text>{sanitizeBoxDrawing(text)}</Text>
       </Text>
     );
   },
-  (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role,
+  (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role && a.m.kind === b.m.kind,
 );
 
 /** 底部滚动指示：贴底显示「* 已贴底」；有历史/新消息时显示两侧行数
@@ -400,16 +408,20 @@ export function App(props: AppProps) {
     { isActive: (!c.busyRef.current || c.confirm !== null || c.askTextPrompt !== null) && !c.showKeyModal },
   );
 
-  // 专用 Ctrl+C 中断处理器
+  // 专用 Ctrl+C 中断处理器（顺带 Ctrl+O：展开/收起过程细节）
   useInput(
     (input, key) => {
       if (c.showKeyModal) return;
+      if (key.ctrl && input === '\u000f') {
+        c.toggleDetail();
+        return;
+      }
       if (key.ctrl && input === '\u0003') {
         if (c.busyRef.current) {
           c.abort();
-          c.push('system', '⏹ 已发送中断信号，正在停止当前请求...');
+          c.systemText('⏹ 已发送中断信号，正在停止当前请求...');
         } else {
-          c.push('system', '💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
+          c.systemText('💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
         }
       }
     },
@@ -540,11 +552,11 @@ export function App(props: AppProps) {
             onSubmit={async (apiKey) => {
               await saveCredentials({ apiKey });
               c.setShowKeyModal(false);
-              c.push('system', '已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
+              c.systemText('已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
             }}
             onCancel={() => {
               c.setShowKeyModal(false);
-              c.push('system', '已取消更换');
+              c.systemText('已取消更换');
             }}
           />
         </Box>
@@ -554,7 +566,7 @@ export function App(props: AppProps) {
 
   return (
     <Box flexDirection="column" height="100%">
-      <Banner version={props.version} model={modelShort} cwd={props.workspace} />
+      <Banner version={props.version} model={modelShort} cwd={props.workspace} restored={props.restoredCount} />
       <Box
         flexGrow={1}
         flexDirection="column"
@@ -603,7 +615,7 @@ export function App(props: AppProps) {
         cursor={cursor}
         mode={c.mode}
         model={modelShort}
-        rightHint={`风格:${styleLabel(c.outputStyle)} | /style 切换`}
+        rightHint={`风格:${styleLabel(c.outputStyle)} | Ctrl+O ${c.detail ? '收起' : '展开'}细节`}
       />
     </Box>
   );

@@ -1,20 +1,23 @@
 /**
- * useAgentController —— CLI（ink）端对 ChatContext 的实现。
+ * useAgentController —— CLI（ink）端对 ChatContext 的实现（trace-first 版）。
  *
- * 把原 app.tsx 里「与渲染无关」的全部状态与逻辑（消息、busy、模式、runAgent 循环、
- * 权限确认、awaitUser…）抽成这个 React hook。ink 版的 app.tsx 只保留「终端专属」的东西
- * （光标、面板视图、useInput 按键映射、Banner），并通过本 hook 的返回值驱动渲染。
+ * 状态模型（step 3 TUI 重做的落点）：唯一可变事实源是一条 **事件日志**
+ * （UiEvent[]，与内核 CoreEvent / trace 落盘 / eval 记录同一契约），
+ * 屏幕消息列 = foldTranscript(事件日志) 的纯函数派生。
  *
- * 网页端不复用这个 hook（它跑在浏览器，没有 fs/process），而是用 Node 端的 AgentHost
- * 实现同一份 ChatContext —— 业务逻辑在 chat.ts，两边零重复。
+ * 旧版是命令式的（push/appendTo/beginTool/endStreaming 手工改数组元素）——
+ * 消息丢失、id 重号、半截气泡、"第二次进入什么都没了"全源于那套可变气泡树。
+ * 播放器模型下：渲染 = 消费事件，恢复 = 重放事件（与 eval 共用数据面），
+ * 任何画面 bug 都能用当时的事件流复现。
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
-import type { PermissionMode } from '../agent/loop.ts';
-import type { OutputStyle } from '../agent/output-style.ts';
-import { loadStyle } from '../agent/output-style.ts';
+import type { PermissionMode } from '../core/permission/engine.ts';
+import type { OutputStyle } from '../core/loop/output-style.ts';
+import { loadStyle } from '../core/loop/output-style.ts';
 import { runChatTurn, type ChatContext } from './chat.ts';
-import type { AppProps, MsgRole, UiMessage } from './types.ts';
+import { eventsFromHistory, foldTranscript, type UiEvent } from './timeline.ts';
+import type { AppProps, UiMessage } from './types.ts';
 
 export interface UseAgentControllerOptions {
   /** /exit 退出行为（CLI 传 process.exit，网页后端用不到） */
@@ -28,11 +31,13 @@ export interface AgentController {
   mode: PermissionMode;
   planMode: boolean;
   outputStyle: OutputStyle;
-  costCny: number;
   confirm: { prompt: string } | null;
   askTextPrompt: string | null;
   showKeyModal: boolean;
   setShowKeyModal: (v: boolean) => void;
+  /** 过程细节展开态（Ctrl+O）：折叠=结论优先，展开=逐工具明细 */
+  detail: boolean;
+  toggleDetail: () => void;
   /** 滚动：距顶部隐藏的行数（0=贴底显示最新，行级滚动模型）；由 TUI 视图层驱动 */
   scrollOffset: number;
   setScrollOffset: (n: number) => void;
@@ -44,20 +49,20 @@ export interface AgentController {
   setMode: (m: PermissionMode) => void;
   setPlanMode: (b: boolean) => void;
   setOutputStyle: (s: OutputStyle) => void;
-  /** 供终端专属逻辑（KeyCapture 反馈、首屏提示）直接写消息 */
-  push: (role: MsgRole, text: string) => number;
-  /** 供历史面板加载上下文时整体替换消息 */
-  setMessages: (ms: UiMessage[]) => void;
+  /** 终端专属逻辑（中断提示、Key 保存反馈）直接追加一行系统事件 */
+  systemText: (text: string) => void;
 }
 
 export function useAgentController(props: AppProps, opts?: UseAgentControllerOptions): AgentController {
-  const [messages, setMessages] = useState<UiMessage[]>([]);
+  // 事件日志：启动时用内核历史重放填充——恢复与实时渲染走同一个 fold，
+  // 不存在第二份会漂移的"转录存储"。
+  const [events, setEvents] = useState<UiEvent[]>(() => eventsFromHistory(props.kernel.history));
   const [busy, setBusyState] = useState(false);
   const busyRef = useRef(false);
+  const [detail, setDetail] = useState(false);
   const [mode, setMode] = useState<PermissionMode>('execute');
   const [planMode, setPlanMode] = useState(false);
   const [outputStyle, setOutputStyle] = useState<OutputStyle>(() => loadStyle(process.cwd()));
-  const [costCny, setCostCny] = useState(0);
   const [confirm, setConfirm] = useState<{ prompt: string } | null>(null);
   const [askTextPrompt, setAskTextPrompt] = useState<string | null>(null);
   const [showKeyModal, setShowKeyModal] = useState(false);
@@ -66,117 +71,23 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
   const scrollOffsetRef = useRef(0);
   scrollOffsetRef.current = scrollOffset;
 
-  const msgId = useRef(0);
-  const streamingId = useRef<number | null>(null);
-  const toolMsgId = useRef<number | null>(null);
   const activeAbort = useRef<AbortController | null>(null);
   const confirmRef = useRef<{ prompt: string; resolve: (b: boolean) => void } | null>(null);
   const askTextRef = useRef<{ prompt: string; resolve: (t: string) => void } | null>(null);
 
-  // ── 流式批处理：同一 microtask tick 内的多次 setMessages 合并为一次 React 渲染 ──
-  // 流式输出时每个 token 触发一次状态更新，若不合并，高频 setState 会让事件循环被
-  // React reconcile + ink stdout 写出占满，键盘/鼠标输入排队，产生"流式期间卡死"观感。
-  const pendingProducers = useRef<((prev: UiMessage[]) => UiMessage[])[]>([]);
-  const batchScheduled = useRef(false);
-  const batchedSetMessages = useCallback((producer: (prev: UiMessage[]) => UiMessage[]) => {
-    pendingProducers.current.push(producer);
-    if (batchScheduled.current) return;
-    batchScheduled.current = true;
-    queueMicrotask(() => {
-      const list = pendingProducers.current.splice(0, pendingProducers.current.length);
-      batchScheduled.current = false;
-      setMessages((prev) => list.reduce((acc, p) => p(acc), prev));
-    });
+  const appendEvent = useCallback((ev: UiEvent) => {
+    setEvents((prev) => [...prev, ev]);
   }, []);
 
-  // 让 getState 始终读到最新 state（避免 runChatTurn 闭包过期）
-  const stateRef = useRef({ mode, planMode, outputStyle });
-  stateRef.current = { mode, planMode, outputStyle };
-  const messagesRef = useRef<UiMessage[]>(messages);
-  messagesRef.current = messages;
-
-  const push = useCallback(
-    (role: MsgRole, text: string): number => {
-      const id = msgId.current++;
-      batchedSetMessages((m) => [...m, { id, role, text }]);
-      return id;
-    },
-    [batchedSetMessages],
+  // 消息列 = 事件流的纯折叠。live=busy：流式尾部过程文本/未完成步骤要可见。
+  const messages: UiMessage[] = useMemo(
+    () => foldTranscript(events, { detail, live: busy }),
+    [events, detail, busy],
   );
 
-  const appendTo = useCallback(
-    (id: number, chunk: string) => {
-      batchedSetMessages((m) => m.map((x) => (x.id === id ? { ...x, text: x.text + chunk } : x)));
-    },
-    [batchedSetMessages],
-  );
-
-  const appendStreaming = useCallback(
-    (chunk: string, _reactPhase?: 'thought' | 'action' | 'observation' | 'final' | 'progress') => {
-      if (streamingId.current === null) {
-        const id = msgId.current++;
-        streamingId.current = id;
-        batchedSetMessages((m) => [...m, { id, role: 'assistant', text: chunk }]);
-      } else {
-        appendTo(streamingId.current, chunk);
-      }
-    },
-    [appendTo, batchedSetMessages],
-  );
-
-  const endStreaming = useCallback(
-    (phase?: 'progress' | 'final', interrupted?: boolean) => {
-      const id = streamingId.current;
-      if (id !== null && (phase || interrupted)) {
-        batchedSetMessages((m) =>
-          m.map((x) => (x.id === id ? { ...x, ...(phase ? { phase } : {}), ...(interrupted ? { interrupted: true } : {}) } : x)),
-        );
-      }
-      streamingId.current = null;
-    },
-    [batchedSetMessages],
-  );
-
-  // 网页路径的思考盒晋升由 agent-host（Node）处理；CLI/TUI 此处无对应概念，置空操作。
-  const prometeThinkingToFinal = useCallback((): void => {}, []);
-
-  const beginTool = useCallback(
-    (toolName: string) => {
-      endStreaming();
-      const id = msgId.current++;
-      toolMsgId.current = id;
-      batchedSetMessages((m) => [...m, { id, role: 'tool', text: `🔧 执行工具 ${toolName}` }]);
-    },
-    [endStreaming, batchedSetMessages],
-  );
-
-  const appendTool = useCallback(
-    (out: string) => {
-      if (toolMsgId.current !== null) appendTo(toolMsgId.current, `  › ${out}`);
-      else push('tool', `  › ${out}`);
-    },
-    [appendTo, push],
-  );
-
-  const endTool = useCallback(() => {
-    toolMsgId.current = null;
-  }, []);
-
-  /**
-   * 把本轮错误附加到思考盒——不创建新气泡、不清除已记录的思考。
-   * 推为 tool 角色（前端会归入思考盒作为观察条目）而不是 error 角色（独立气泡会覆盖上下文）。
-   */
-  const appendError = useCallback(
-    (msg: string) => {
-      const text = msg.length > 480 ? msg.slice(0, 480) + '…' : msg;
-      if (toolMsgId.current !== null) {
-        appendTo(toolMsgId.current, `\n⚠ [错误] ${text}`);
-        toolMsgId.current = null;
-      } else {
-        push('tool', `⚠ [错误] ${text}`);
-      }
-    },
-    [appendTo, push],
+  const systemText = useCallback(
+    (text: string) => appendEvent({ type: 'system', text }),
+    [appendEvent],
   );
 
   const setBusy = useCallback((b: boolean) => {
@@ -221,6 +132,8 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
     activeAbort.current = ac;
   }, []);
 
+  const toggleDetail = useCallback(() => setDetail((d) => !d), []);
+
   // 组装稳定的 ChatContext（构造一次，所有方法均为稳定引用）
   const ctxRef = useRef<ChatContext | null>(null);
   if (!ctxRef.current) {
@@ -229,23 +142,12 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
       // 配置读写根（/style、/model、/rollback）跟随工作空间，而非启动目录——
       // 避免在源码目录启动时把配置写进源码（docs/UX优化-工作空间路径规划与源码目录保护.md）
       cwd: props.workspace,
-      push,
-      appendTo,
-      appendStreaming,
-      endStreaming,
-      prometeThinkingToFinal,
-      beginTool,
-      appendTool,
-      endTool,
-      appendError,
+      uiEv: appendEvent,
+      systemText,
+      resetEvents: () => setEvents([]),
       setBusy,
-      setCost: setCostCny,
       getState: () => stateRef.current,
-      maxIterations: 0, // CLI 默认无上限
-      setMaxIterations: (n: number) => { /* CLI 无 GUI 设置入口，stub */ },
-      getIterations: () => 0, // CLI 无迭代跟踪，stub
-      setBrowserWatch: (_b: boolean) => { /* CLI 无浏览器，stub */ },
-      getBrowserWatch: () => false, // CLI 无浏览器观察，stub
+      maxIterations: 0, // 0 → chat.ts 回退 DEFAULT_MAX_ITERATIONS(30)，不再是"无上限"
       setMode,
       setPlanMode,
       setOutputStyle,
@@ -253,12 +155,14 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
       abort,
       requestConfirm,
       requestAskText,
-      getMessages: () => messagesRef.current,
-      setMessages,
       requestKeyChange: () => setShowKeyModal(true),
       onExit: opts?.onExit,
     };
   }
+
+  // 让 getState 始终读到最新 state（避免 runChatTurn 闭包过期）
+  const stateRef = useRef({ mode, planMode, outputStyle });
+  stateRef.current = { mode, planMode, outputStyle };
 
   const submit = useCallback((text: string) => {
     void runChatTurn(text, ctxRef.current!);
@@ -271,11 +175,12 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
     mode,
     planMode,
     outputStyle,
-    costCny,
     confirm,
     askTextPrompt,
     showKeyModal,
     setShowKeyModal,
+    detail,
+    toggleDetail,
     scrollOffset,
     setScrollOffset,
     scrollOffsetRef,
@@ -286,7 +191,6 @@ export function useAgentController(props: AppProps, opts?: UseAgentControllerOpt
     setMode,
     setPlanMode,
     setOutputStyle,
-    push,
-    setMessages,
+    systemText,
   };
 }

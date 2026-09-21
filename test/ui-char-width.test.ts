@@ -29,6 +29,7 @@ const FILES = [
   'src/cli/thinkingIndicator.tsx',
   'src/cli/sanitize.ts',
   'src/app/markdown-lines.ts',
+  'src/app/timeline.ts',
 ];
 
 // EAW=Ambiguous 的 UI 常用字符（覆盖 UI 装饰/符号范围；非完整 EAW=A 表）

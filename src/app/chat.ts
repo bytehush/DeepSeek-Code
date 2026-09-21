@@ -1,50 +1,40 @@
 /**
- * 框架无关的编排核心（极简模式）。
+ * 框架无关的编排核心（trace-first TUI 重做后的形态）。
  *
- * 把「单次事实来源」的对话循环收敛为最小集：命令优先 / 调用 runAgent / 流式事件映射到 ctx。
- * 不再包含记忆、技能、Trace、多 Agent 会话、用量统计等附加层——那些在减法阶段已移除。
+ * 对话循环收敛为最小集：命令优先 / 调用 kernel.prompt / 事件进 UI 事件日志。
+ * 事件契约 CoreEvent 与旧 AgentEvent 逐字段一致 → UI fold、trace 落盘、
+ * eval 记录共用同一条流（三个消费者，一份形状）。
+ *
+ * 与旧版的关键差别：这里不再做「事件 → 气泡操作」的命令式映射
+ * （beginTool/appendStreaming 那套）——事件原样交给 ctx.uiEv，
+ * 由 app/timeline.ts 的 fold 决定如何呈现。编排层管"发生什么"，
+ * 呈现层管"怎么说"，两层各改各的。
  */
-import { runAgent, type AgentEvent, type PermissionMode } from '../agent/loop.ts';
-import type { OutputStyle } from '../agent/output-style.ts';
-import { styleLabel, parseStyle, saveStyle } from '../agent/output-style.ts';
+import type { PermissionMode } from '../core/permission/engine.ts';
+import type { OutputStyle } from '../core/loop/output-style.ts';
+import { styleLabel, parseStyle, saveStyle, styleInstruction } from '../core/loop/output-style.ts';
 import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
-import { getApiKeyTail } from './keyContext.ts';
 import { msgOf } from '../utils/logger.ts';
 import { rollbackManager } from '../utils/rollback.ts';
-import type { AppProps, MsgRole, UiMessage } from './types.ts';
+import type { UiEvent } from './timeline.ts';
+import type { AppProps } from './types.ts';
 
 /**
  * UI 抽象契约：编排核心只通过它产生副作用，具体渲染由实现方决定（CLI/TUI 用 ink）。
+ * 事件驱动——实现方的全部呈现状态由 uiEv 追加的事件日志派生。
  */
 export interface ChatContext {
   props: AppProps;
   cwd: string;
-  /** 新增一条消息，返回其 id */
-  push(role: MsgRole, text: string): number;
-  /** 向指定 id 的消息追加文本 */
-  appendTo(id: number, chunk: string): void;
-  /** 流式 assistant 文本：首段建消息，后续追加 */
-  appendStreaming(chunk: string, reactPhase?: 'thought' | 'action' | 'observation' | 'final' | 'progress'): void;
-  /** 本轮流式文本收尾 */
-  endStreaming(phase?: 'progress' | 'final', interrupted?: boolean): void;
-  /** 把当前思考轮次已实时流到的文本晋升为最终答案气泡（清空思考盒） */
-  prometeThinkingToFinal(): void;
-  /** 开始一次工具调用：收束流 + 新建工具消息，返回 id 并记为 current tool */
-  beginTool(toolName: string): void;
-  /** 实时工具输出（实现方自行加 `  › ` 前缀） */
-  appendTool(out: string): void;
-  /** 工具调用结束 */
-  endTool(): void;
-  /** 把本轮错误附加到思考盒——不创建新气泡、不清除已记录的思考 */
-  appendError(msg: string): void;
+  /** 追加一条 UI 事件（CoreEvent 或 UI 侧合成事件），渲染由 fold 决定 */
+  uiEv(ev: UiEvent): void;
+  /** 直接写一行系统提示（/help、模式切换等命令反馈） */
+  systemText(text: string): void;
+  /** 清空事件日志（/clear；呈现层归零，内核列由调用方同步清空） */
+  resetEvents(): void;
   setBusy(b: boolean): void;
-  setCost(cny: number): void;
   getState(): { mode: PermissionMode; planMode: boolean; outputStyle: OutputStyle };
   maxIterations: number;
-  setMaxIterations(n: number): void;
-  getIterations(): number;
-  setBrowserWatch(b: boolean): void;
-  getBrowserWatch(): boolean;
   setMode(m: PermissionMode): void;
   setPlanMode(b: boolean): void;
   setOutputStyle(s: OutputStyle): void;
@@ -56,8 +46,6 @@ export interface ChatContext {
   requestConfirm(prompt: string): Promise<boolean>;
   /** 模型主动 awaitUser：agent 挂起等待用户自由文本 */
   requestAskText(prompt: string): Promise<string>;
-  getMessages(): UiMessage[];
-  setMessages(ms: UiMessage[]): void;
   /** 更换 API Key（UI 专属；未实现则给提示） */
   requestKeyChange?(): void;
   /** 退出（/exit）：实现方决定如何结束（CLI=process.exit，后端=关连接） */
@@ -68,61 +56,33 @@ export interface ChatContext {
 /** 本轮任务起点（毫秒），用于结束后回显耗时 */
 let taskStart = 0;
 
+/** 单轮用户输入的默认步数上限（一步 = 一次模型调用 + 其工具执行） */
+export const DEFAULT_MAX_ITERATIONS = 30;
+
 const SHORTCUTS = [
   '命令：',
   '  /mode explore|ask|execute   切换权限模式',
   '  /plan                       开/关规划模式（只输出计划不执行）',
   '  /style human|professional|raw   切换最终答复风格（人话/专业语言/原始）',
   '  /model flash|pro            切换主推理模型：Flash（日常/轻量）| PRO（开发/严肃工程）',
-  '  /clear                      清空对话上下文',
+  '  /clear                      清空对话上下文与持久化会话',
   '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
   '  /rollback [n]               回退最近 n 次文件变更（默认 1；仅当前工作目录）',
+  '  /outbound                   查看出站数据留档摘要（外传了什么、体积、目的地）',
+  '  Ctrl+O                      展开/收起过程细节（工具参数与结果）',
   '  Ctrl+C                      中断当前思考 / 工具执行（退出请用 /exit）',
   '  /help 或 ?                  显示本面板',
   '  /exit 或 /quit              退出',
 ].join('\n');
 
-/** 时长 → 中文单位（内联，避免从 ink 组件文件导出带来渲染层依赖） */
-function formatDuration(sec: number): string {
-  if (sec < 60) return sec.toFixed(1) + '秒';
-  if (sec < 3600) return `${Math.floor(sec / 60)}分${Math.floor(sec % 60)}秒`;
-  return `${Math.floor(sec / 3600)}时${Math.floor((sec % 3600) / 60)}分${Math.floor(sec % 60)}秒`;
-}
-
-/** 服务端错误分类 → 面向用户的友好提示 */
-function friendlyErrorMessage(category: string | undefined, raw: string): string {
-  switch (category) {
-    case 'moderation':
-      return '🚫 内容审核未通过：服务端拒绝生成该内容（可能涉及敏感/违规话题）。请调整提问方式或措辞后重试。';
-    case 'token_limit':
-      return '📏 上下文 / token 超出上限：当前对话历史过长，已无法继续生成。建议新开一个会话再试。';
-    case 'server_unavailable':
-      return '🔌 服务端暂时不可用（限流或服务过载）：请稍候片刻后重试；若持续出现，请检查 API Key 配额或网络连通性。';
-    case 'auth': {
-      // 优先用启动时就捕获的 Key 末 4 位（assemble 在 Agent 构造前存入 keyContext），
-      // 避免：① pi-ai 把 process.env 改写成脱敏串（如 "****ined"）；② 服务商报文中被二次变形的尾号。
-      // 末 4 位不含完整 Key，安全可展示。
-      const captured = getApiKeyTail();
-      let tailText = '';
-      if (captured) {
-        tailText = `   当前使用的 Key 末尾 4 位：${captured}（来自本地配置，非完整 Key）`;
-      } else {
-        const tail = /api key:\s*\*+([0-9a-zA-Z]{4})/i.exec(raw);
-        if (tail) tailText = `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）`;
-      }
-      return (
-        '🔑 API Key 无效或未授权（DeepSeek 返回 401 鉴权失败）\n' +
-        '   修复方式（任选其一）：\n' +
-        '     · 修改项目根 .env 的 DEEPSEEK_API_KEY，或编辑 ~/.dsa/credentials.json\n' +
-        '     · 输入 /set-key 按提示填新 Key（下次启动生效）\n' +
-        '     · 确认该 Key 在 DeepSeek 后台处于「启用」状态且有可用额度\n' +
-        tailText
-      );
-    }
-    default:
-      return `⚠️ 生成出错：${raw || '未知错误'}`;
-  }
-}
+/** 退出原因 → 面向用户的交代（每条退出路径都要说清为什么停） */
+const STOP_LABELS: Record<string, string> = {
+  user_abort: '⏹ 已因用户中断而停止',
+  no_progress: '⚠️ 工具连续失败，已停止尝试并向你说明现状',
+  repeat_loop: '⚠️ 检测到周期性重复调用，疑似空转，已提前结束',
+  max_iterations: '⏱ 已达单轮步数上限（默认 30 步）并结束；若任务未完成，请把大目标拆成几步分别下达',
+  token_limit: '📏 输出被长度上限截断且分块续写仍未成功（上下文压缩能力 P1 上线前的临时终态）',
+};
 
 /**
  * 斜杠命令处理；返回 true 表示已处理（不跑 agent）。
@@ -134,12 +94,14 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     return true;
   }
   if (text === '/help' || text === '?' || text === '？') {
-    ctx.push('system', SHORTCUTS);
+    ctx.systemText(SHORTCUTS);
     return true;
   }
   if (text === '/clear') {
-    ctx.setMessages([]);
-    ctx.push('system', '已清空对话上下文');
+    ctx.props.kernel.clear();
+    ctx.props.session.clear();
+    ctx.resetEvents();
+    ctx.systemText('已清空对话上下文与持久化会话（下次启动不再恢复）');
     return true;
   }
   if (text.startsWith('/mode')) {
@@ -151,31 +113,31 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
         explore: '研究模式（只读探索，不会改动任何文件）',
         execute: '自动执行（Agent 直接干活，无需逐步确认）',
       };
-      ctx.push('system', `🔐 权限模式已切换为：${label[m] ?? m}`);
+      ctx.systemText(`🔐 权限模式已切换为：${label[m] ?? m}`);
     } else {
-      ctx.push('system', '用法: /mode explore|ask|execute');
+      ctx.systemText('用法: /mode explore|ask|execute');
     }
     return true;
   }
   if (text === '/plan') {
     const next = !ctx.getState().planMode;
     ctx.setPlanMode(next);
-    ctx.push('system', `规划模式已${next ? '开启（Agent 将先输出计划）' : '关闭（正常执行）'}`);
+    ctx.systemText(`规划模式已${next ? '开启（Agent 将先输出计划）' : '关闭（正常执行）'}`);
     return true;
   }
   if (text === '/style' || text.startsWith('/style ')) {
     const arg = text.slice('/style'.length).trim();
     const cur = ctx.getState().outputStyle;
     if (!arg) {
-      ctx.push('system', `当前输出风格：${styleLabel(cur)}  （可选：human 人话 / professional 专业语言 / raw 原始）`);
+      ctx.systemText(`当前输出风格：${styleLabel(cur)}  （可选：human 人话 / professional 专业语言 / raw 原始）`);
     } else {
       const s = parseStyle(arg);
       if (!s) {
-        ctx.push('system', '用法：/style human | professional | raw');
+        ctx.systemText('用法：/style human | professional | raw');
       } else {
         ctx.setOutputStyle(s);
         saveStyle(ctx.cwd, s);
-        ctx.push('system', `输出风格已切换为：${styleLabel(s)}`);
+        ctx.systemText(`输出风格已切换为：${styleLabel(s)}`);
       }
     }
     return true;
@@ -184,8 +146,7 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     const arg = text.slice('/model'.length).trim();
     const cur = getMode();
     if (!arg) {
-      ctx.push(
-        'system',
+      ctx.systemText(
         `当前模型模式：${modeLabel(cur)}\n` +
           `  /model flash   日常/轻量：快速问答、解释代码、简单改错、跑命令看输出、成本敏感多轮（不触发强推理）\n` +
           `  /model pro     开发/严肃工程：架构设计、跨文件重构、深度审查、依赖审计、多步规划、需深度推理的生成（触发强推理）\n` +
@@ -194,77 +155,47 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     } else {
       const m = parseMode(arg);
       if (!m) {
-        ctx.push('system', '用法：/model flash | pro');
+        ctx.systemText('用法：/model flash | pro');
       } else {
         setMode(ctx.cwd, m);
-        ctx.push('system', `模型模式已切换为：${modeLabel(m)}`);
+        ctx.systemText(`模型模式已切换为：${modeLabel(m)}`);
       }
     }
     return true;
   }
   if (text === '/set-key' || text === '/login') {
     if (ctx.requestKeyChange) ctx.requestKeyChange();
-    else ctx.push('system', '更换 API Key 需在终端版执行 /set-key，或编辑 ~/.dsa/credentials.json');
+    else ctx.systemText('更换 API Key 需在终端版执行 /set-key，或编辑 ~/.dsa/credentials.json');
+    return true;
+  }
+  if (text === '/outbound') {
+    ctx.systemText(ctx.props.ledger.summarize());
     return true;
   }
   if (text === '/rollback' || text.startsWith('/rollback ')) {
     const arg = text.split(/\s+/)[1];
     const steps = arg ? parseInt(arg, 10) : 1;
     const report = await rollbackManager.rollback(Number.isFinite(steps) ? steps : 1, ctx.cwd);
-    ctx.push('system', report);
+    ctx.systemText(report);
     return true;
   }
   return false;
 }
 
-/** 把 runAgent 的一个事件映射到 ctx 的 UI 副作用（TUI 实现方共用） */
-function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
-  if (ev.type === 'assistant_text' && ev.text) {
-    ctx.appendStreaming(ev.text, ev.reactPhase);
-  } else if (ev.type === 'assistant_phase') {
-    ctx.endStreaming(ev.phase);
-  } else if (ev.type === 'assistant_promote') {
-    ctx.prometeThinkingToFinal();
-  } else if (ev.type === 'tool_call') {
-    ctx.beginTool(ev.toolName ?? 'tool');
-    if ((ev.toolName ?? '') === 'use_skill') {
-      const argName = String((ev.args as { name?: unknown } | undefined)?.name ?? '').trim();
-      ctx.push(
-        'system',
-        argName
-          ? `📚 AI 已调用技能：${argName}（完整使用指引已加载，下一步将按其执行）`
-          : '📚 AI 已调用技能加载工具。',
-      );
-    }
-  } else if (ev.type === 'tool_result') {
-    ctx.push('tool', `[工具结果] ${String(ev.result ?? '')}`);
-  } else if (ev.type === 'error') {
-    const isAuth = ev.errorCategory === 'auth';
-    // auth 类错误：思考盒只放一句短提示（避免把原始 401 报文塞进折叠盒），完整修复指引走 system 消息
-    ctx.appendError(isAuth ? '[鉴权失败] API Key 无效，请运行 /set-key 更换' : (ev.error ?? '未知错误'));
-    ctx.push('system', friendlyErrorMessage(ev.errorCategory, ev.error ?? '未知错误'));
-  } else if (ev.type === 'system') {
-    ctx.push('system', ev.text ?? '');
-  } else if (ev.type === 'done') {
-    ctx.endStreaming(undefined, ev.reason === 'user_abort');
-    const dur = (Date.now() - taskStart) / 1000;
-    ctx.push('system', `⏱ 本次任务耗时 ${formatDuration(dur)}`);
-    if (ev.reason && ev.reason !== 'model_stop') {
-      const stopLabels: Record<string, string> = {
-        user_abort: '⏹ 已因用户中断而停止',
-        no_progress: '⚠️ 工具连续失败，已提前结束',
-        no_observable_progress: '⚠️ 连续多轮无实质进展，疑似空转，已提前结束',
-        repeat_loop: '⚠️ 检测到重复/周期工具调用，疑似死循环，已提前结束',
-        max_iterations: '⏱ 已达最大迭代轮数上限，已结束',
-      };
-      ctx.push('system', stopLabels[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`);
-    }
-  }
+/**
+ * 回合收尾交代（仅 CLI 消费的事件扩展，不入内核契约）：
+ * 耗时 + 非正常退出原因——trace/eval 各自按 CoreEvent 语义处理，互不影响。
+ */
+export interface TurnSummaryEvent {
+  type: 'turn_summary';
+  durationSec: number;
+  /** 非 model_stop 退出时的交代文案；正常收尾为 undefined */
+  label?: string;
 }
 
 /**
  * 跑一轮对话（CLI 与后续 UI 实现共用）。
- * 负责：命令优先 / 调用 runAgent 循环 / 流式事件映射到 ctx。
+ * 负责：命令优先 / 调用内核循环 / 事件进 UI 事件日志。
  */
 export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> {
   const text = raw.trim();
@@ -272,7 +203,7 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
 
   const isCommand = text.startsWith('/');
   if (!isCommand) {
-    ctx.push('user', text);
+    ctx.uiEv({ type: 'user_input', text });
   }
 
   if (isCommand) {
@@ -286,24 +217,38 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
   taskStart = Date.now();
 
   try {
-    for await (const ev of runAgent(text, {
-      agent: ctx.props.agent,
-      models: ctx.props.models,
+    for await (const ev of ctx.props.kernel.prompt(text, {
       permission: ctx.getState().mode,
+      planMode: ctx.getState().planMode,
+      styleInstruction: styleInstruction(ctx.getState().outputStyle),
+      // 真实步数上限：此前该字段声明了却从未传入内核，等于无上限——
+      // 任何未被 repeat/no_progress 抓住的失败模式都会无限烧 token。
+      maxIterations: ctx.maxIterations > 0 ? ctx.maxIterations : DEFAULT_MAX_ITERATIONS,
       signal: abortController.signal,
       ask: ctx.requestConfirm,
-      askText: ctx.requestAskText,
-      planMode: ctx.getState().planMode,
-      outputStyle: ctx.getState().outputStyle,
-      onToolProgress: (toolName: string, out: string) => {
-        if (toolName) ctx.appendTool(out);
+      onToolProgress: (_toolName: string, out: string) => {
+        ctx.uiEv({ type: 'tool_progress', text: out });
       },
     })) {
-      applyRunAgentEvent(ev, ctx);
+      ctx.uiEv(ev);
+      if (ev.type === 'done') {
+        const summary: TurnSummaryEvent = {
+          type: 'turn_summary',
+          durationSec: (Date.now() - taskStart) / 1000,
+        };
+        if (ev.reason && ev.reason !== 'model_stop') {
+          summary.label = STOP_LABELS[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`;
+        }
+        ctx.uiEv(summary);
+      }
     }
   } catch (e: unknown) {
-    ctx.appendError(msgOf(e));
+    ctx.uiEv({ type: 'error', error: msgOf(e), errorCategory: 'local' });
   } finally {
+    // 回合结束即快照内核消息列（含中断/报错收尾——那些也是有价值的上下文）。
+    // 在 finally 而非 done 事件里：生成器被提前 return 时也要落盘，
+    // 保存的正是"此刻内核真实记得的东西"，与 UI 显示无涉。
+    ctx.props.session.save(ctx.props.kernel.history);
     ctx.setBusy(false);
     ctx.setActiveAbort(null);
   }
