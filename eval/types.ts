@@ -13,6 +13,8 @@ export interface CaseContext {
   finalText: string; // 最后一轮 Agent 文本
   permissionDenied: string[]; // 被权限闸门拒绝的工具名
   transcript: string; // 完整交互记录
+  /** 本 case 触发的出站记账条数（来自 OutboundLedger；验证「记账不可绕过」） */
+  outboundRequests?: number;
 }
 
 export interface GoldenCase {
