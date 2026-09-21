@@ -10,7 +10,7 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │ 应用交互层  src/cli  +  src/app                            │
-│  TUI 渲染 · 流式输出 · 登录 · Markdown · workspace 解析     │
+│  trace-first TUI（事件流 fold）· 登录 · Markdown · 会话恢复 │
 │  职责：消费 CoreEvent 事件流；把用户输入变成 kernel.prompt() │
 │  不该：直接调模型、直接执行工具                             │
 └───────────────┬──────────────────────────────────────────┘
@@ -25,6 +25,7 @@
 │               6 个原子工具（read/write/edit/list/search/bash）│
 │  permission/  decide()（三模式）+ decide3()（能力矩阵）     │
 │  trace/       TraceSink：事件流 JSONL 落盘                  │
+│  session/     SessionStore：回合末快照内核消息列，重启恢复  │
 │  assemble.ts  组装入口（cli/main.ts 调用）                  │
 └───────┬──────────────────────────┬───────────────────────┘
         │ 唯一外发路径              │ 唯一执行路径
@@ -70,7 +71,8 @@
 | 出站数据核对 | `~/.dsa/outbound/*.jsonl` 或 CLI 内 `/outbound` |
 | 模型跑偏 / 重复 | `src/core/loop/system-prompt.ts` + kernel 防空转（REPEAT_LIMIT） |
 | 多轮上下文丢失 | `AgentKernel.messages`（跨轮持久化）+ `/clear` 语义 |
-| TUI 渲染错位 | `src/cli/app.tsx` + `src/app/markdown-lines.ts` |
+| TUI 渲染错位 / 气泡异常 | `src/app/timeline.ts`（fold）+ `src/app/markdown-lines.ts`；复现法：拿 trace 事件重放 |
+| 重启后历史丢失 | `~/.dsa/sessions/<sha1(workspace)>.json` + `core/session/store.ts`（load 永不抛，损坏=新会话） |
 | 启动即退出 | `src/cli/main.ts` 的 TTY 检测 |
 | 回滚不生效 | `src/utils/rollback.ts` 的 cwd 作用域 |
 
@@ -116,6 +118,8 @@ P2 引入异厂商 critic（交叉评审）与低价 cheap（压缩）。
   生成——幽灵工具（提示词承诺但实现不存在）在结构上不可能出现。
 - **无消费者不造接口**（ADR D5）：任何抽象必须有第二处真实引用才允许存在。
 - **一条事件流三个消费者**：UI、trace、eval 共用 CoreEvent，不另造观测机制。
+  UI 是事件的播放器（`app/timeline.ts` fold），会话恢复 = 重放内核消息列，
+  画面 bug 可用事件流复现；呈现状态从不独立存储。
 - **工具少而原子**：6 个原子工具，复杂能力由模型组合完成。
 - **Harness > 换模型**：同一模型在不同编排/权限/反馈设施下差距巨大，
   内核质量是上限的主要来源。

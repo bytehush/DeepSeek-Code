@@ -13,7 +13,7 @@ import { join } from 'node:path';
 
 import { SessionStore, SESSION_SCHEMA_VERSION, type SessionSnapshot } from '../src/core/session/store.ts';
 import { assistantMsg, toolMsg, userMsg, type Msg } from '../src/core/types.ts';
-import { transcriptReplay } from '../src/app/transcript.ts';
+import { eventsFromHistory, foldTranscript } from '../src/app/timeline.ts';
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), 'dsa-session-'));
@@ -126,22 +126,21 @@ test('save 剔除 system 消息：截断建议等内核提示不进会话文件'
   }
 });
 
-test('转录派生：内核列 → UI 消息（system 隐藏、工具只留首行、空文本带工具名）', () => {
+test('转录重放（timeline fold）：system 隐藏、步骤一行、最终答复保留', () => {
   const msgs: Msg[] = [
     ...sample,
     { role: 'system', content: '（系统提示：…）' },
     assistantMsg('', [{ type: 'tool_call', id: 'c9', name: 'bash', args: { command: 'ls' } }]),
     toolMsg('c9', 'bash', 'line1\nline2\nline3'),
   ];
-  const ui = transcriptReplay(msgs);
-  assert.ok(!ui.some((m) => m.role === 'system'), '内核 system 提示不展示给用户');
-  assert.equal(ui[1]!.text, '我先建骨架');
-  const called = ui.find((m) => m.text.includes('调用了'));
-  assert.ok(called && /bash/.test(called.text), '空文本的调用轮次要显示调了什么');
-  const tool = ui.find((m) => m.role === 'tool' && m.text.includes('bash'))!;
-  assert.ok(!tool.text.includes('line2'), '工具结果恢复为首行，不塞满首屏');
-  // id 必须连续可用（React key + 按 id 更新依赖它）
-  assert.deepEqual(ui.map((m) => m.id), [...ui.keys()]);
+  const ui = foldTranscript(eventsFromHistory(msgs));
+  assert.ok(!ui.some((m) => m.text.includes('系统提示')), '内核 system 提示不展示给用户');
+  const step = ui.find((m) => m.kind === 'step' && m.text.includes('write_file'))!;
+  assert.ok(step.text.includes('✅'), '成功调用应带状态标记');
+  assert.ok(!step.text.includes('a.ts\n'), '折叠态一行，不塞满首屏');
+  assert.ok(ui.some((m) => m.kind === 'answer' && m.text === '骨架完成，可运行'), '最终答复全文保留');
+  // id 必须互不重复（React key 依赖）
+  assert.equal(new Set(ui.map((m) => m.id)).size, ui.length);
 });
 
 test('恢复全链路：存 → 装载进内核 → 派生转录，等价于"第二次进入还在"', () => {
@@ -150,7 +149,7 @@ test('恢复全链路：存 → 装载进内核 → 派生转录，等价于"第
     const store = new SessionStore('/tmp/ws-e2e', { dir });
     store.save(sample);
     const restored = store.load()!;
-    const ui = transcriptReplay(restored);
+    const ui = foldTranscript(eventsFromHistory(restored));
     assert.ok(ui.some((m) => m.role === 'user' && m.text === '做一个五子棋'), '用户原始需求必须可见');
     assert.ok(ui.some((m) => m.role === 'assistant' && m.text === '骨架完成，可运行'), '最终答复必须可见');
     // 装载方向不能丢 tool 消息——那是模型"记得做过什么"的依据

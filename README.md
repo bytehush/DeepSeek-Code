@@ -17,8 +17,10 @@
 - **直连官方 API，密钥用户持有**：无中转、无代理；密钥只进请求头，
   不进请求体、不进子进程环境变量、不写 `process.env`。
 - **全中文交互**：对话、代码注释均为中文。
-- **自研 ReAct 内核**：跨轮持久化上下文；失败即回灌、每步可中断、
-  防空转检测、所有退出路径打标签。
+- **自研 ReAct 内核**：失败即回灌、每步可中断、防空转检测（截断回灌 /
+  周期调用识别 / 连续失败停手交代）、所有退出路径打标签。
+- **会话跨重启恢复**：回合末自动快照内核上下文到 `~/.dsa/sessions/`
+  （按工作区归集、结构无密钥），重启后模型记得、屏幕也记得；`/clear` 清空。
 - **6 个原子工具**：`read_file` / `write_file` / `edit_file` /
   `list_files` / `search_files` / `bash`。系统提示里的工具清单**由注册表生成**，
   结构上不存在「提示词有、实际没有」的幽灵工具。
@@ -98,11 +100,11 @@ agent 的文件工具与 bash 的工作根目录（workspace）优先级：
 | `/rollback [n]` | 回退最近 n 次文件变更（默认 1，仅当前工作目录） |
 | `/outbound` | 查看出站数据留档摘要（内容摘要、体积、目的地） |
 | `/set-key` 或 `/login` | 更换 API Key |
-| `/clear` | 清空对话上下文 |
+| `/clear` | 清空对话上下文与持久化会话 |
 | `/exit` 或 `/quit` | 退出 |
 
-**键盘快捷键**：`←` 打开会话 / 历史面板；`Ctrl+C` 中断当前思考 / 工具执行；
-`PageUp` / `PageDown` 翻页；`Ctrl+End` 跳回最新消息。
+**键盘快捷键**：`Ctrl+O` 展开/收起过程细节（默认只看结论与一行进度）；
+`Ctrl+C` 中断当前思考 / 工具执行；`PageUp` / `PageDown` 与滚轮翻页。
 
 ### 输出风格（`/style`）
 
@@ -137,7 +139,8 @@ src/
     permission/  权限引擎（decide 三模式 + decide3 能力矩阵，纯函数）
     trace/       事件流 JSONL 落盘（UI / trace / eval 共用一条流）
   cli/         CLI 交互层（TUI 入口、登录、Markdown 渲染、字符净化）
-  app/         聊天主逻辑、viewport 计算、React 控制器（消费 CoreEvent）
+  app/         聊天编排（chat.ts）+ trace-first 渲染内核（timeline.ts：事件流→转录折叠）
+               + viewport 计算、React 控制器（消息列 = 事件日志的纯派生）
   config/      工作区解析与保护、模型档位配置
   auth/        凭证读写（0o600，密钥不入代码不入库）
   utils/       通用工具（日志、Markdown、文件回滚栈）

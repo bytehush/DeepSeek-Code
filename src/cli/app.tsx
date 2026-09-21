@@ -114,16 +114,19 @@ const PlainTextMessage = memo(
             : m.role === 'system'
               ? '#9aa0a6'
               : '#e8e8e8';
+    // trace-first 视觉层级：步骤行/系统提示是「过程」，暗显；
+    // 用户输入与答复才是留在视网膜上的东西。
+    const dim = m.kind === 'step' || m.kind === 'notice';
     const prefix = m.role === 'user' ? '你> ' : m.role === 'assistant' ? 'Agent> ' : '';
     return (
-      <Text wrap="wrap">
+      <Text wrap="wrap" dimColor={dim || undefined}>
         <Text color={color}>{prefix}</Text>
         {/* tool/error/system 原始内容先过 box-drawing → ASCII（方案 3 全局覆盖） */}
         <Text>{sanitizeBoxDrawing(text)}</Text>
       </Text>
     );
   },
-  (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role,
+  (a, b) => a.text === b.text && a.m.id === b.m.id && a.m.role === b.m.role && a.m.kind === b.m.kind,
 );
 
 /** 底部滚动指示：贴底显示「* 已贴底」；有历史/新消息时显示两侧行数
@@ -405,16 +408,20 @@ export function App(props: AppProps) {
     { isActive: (!c.busyRef.current || c.confirm !== null || c.askTextPrompt !== null) && !c.showKeyModal },
   );
 
-  // 专用 Ctrl+C 中断处理器
+  // 专用 Ctrl+C 中断处理器（顺带 Ctrl+O：展开/收起过程细节）
   useInput(
     (input, key) => {
       if (c.showKeyModal) return;
+      if (key.ctrl && input === '\u000f') {
+        c.toggleDetail();
+        return;
+      }
       if (key.ctrl && input === '\u0003') {
         if (c.busyRef.current) {
           c.abort();
-          c.push('system', '⏹ 已发送中断信号，正在停止当前请求...');
+          c.systemText('⏹ 已发送中断信号，正在停止当前请求...');
         } else {
-          c.push('system', '💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
+          c.systemText('💡 输入 /exit 可退出程序（Ctrl+C 不绑定退出）');
         }
       }
     },
@@ -545,11 +552,11 @@ export function App(props: AppProps) {
             onSubmit={async (apiKey) => {
               await saveCredentials({ apiKey });
               c.setShowKeyModal(false);
-              c.push('system', '已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
+              c.systemText('已保存新 API Key ✅ 下次启动自动使用（当前会话仍用旧 Key）');
             }}
             onCancel={() => {
               c.setShowKeyModal(false);
-              c.push('system', '已取消更换');
+              c.systemText('已取消更换');
             }}
           />
         </Box>
@@ -608,7 +615,7 @@ export function App(props: AppProps) {
         cursor={cursor}
         mode={c.mode}
         model={modelShort}
-        rightHint={`风格:${styleLabel(c.outputStyle)} | /style 切换`}
+        rightHint={`风格:${styleLabel(c.outputStyle)} | Ctrl+O ${c.detail ? '收起' : '展开'}细节`}
       />
     </Box>
   );

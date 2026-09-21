@@ -20,7 +20,7 @@
   2. 实现新功能 / 修复 bug（编辑、新建文件）
   3. 重构（多文件协同修改）
   4. 跑命令验证（构建、测试、lint、git 状态）
-  5. 多轮对话保持上下文记忆（AgentKernel 跨轮持久化）
+  5. 多轮对话保持上下文记忆（AgentKernel 跨轮持久化 + 重启会话恢复）
 
 ## 3. Agent 工具列表（共 6 个，注册表 = 单一事实源）
 
@@ -68,11 +68,14 @@
 
 ## 6. 架构边界
 
-- **应用交互层**（`src/cli`、`src/app`）：TUI、登录、Markdown、workspace 解析、
-  React 控制器。只消费 `CoreEvent`，不触模型与工具。
+- **应用交互层**（`src/cli`、`src/app`）：trace-first TUI、登录、Markdown、workspace 解析。
+  渲染是事件流的纯折叠（`app/timeline.ts`：UiMessage[] = fold(UiEvent[])），
+  恢复会话 = 重放内核消息列；编排层（`app/chat.ts`）只发事件不拼气泡。
+  只消费 `CoreEvent`，不触模型与工具。
 - **内核层**（`src/core/`）：`loop/`（AgentKernel+事件契约+系统提示+输出风格）、
   `provider/`（ModelHub+OpenAI-compatible 适配器+SSE+OutboundLedger）、
-  `tools/`（注册表+原子工具）、`permission/`、`trace/`、`assemble.ts`。
+  `tools/`（注册表+原子工具）、`permission/`、`trace/`、`session/`（回合末快照，
+  按工作区归集，load 永不抛）、`assemble.ts`。
 - **配置层**（`src/config`）：工作区解析与保护、模型档位。
 - **凭证层**（`src/auth`）：API Key 读写（0o600）。密钥**显式传参**进 ModelHub，
   绝不写 `process.env`；`serialize(req)` 签名里没有 apiKey。

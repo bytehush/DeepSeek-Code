@@ -15,21 +15,22 @@ import type { SessionStore } from '../core/session/store.ts';
 /** 消息角色（UI 与内核共用） */
 export type MsgRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
 
+/** 时间线节点类别（app/timeline.ts fold 的产物；渲染层按此选呈现方式） */
+export type NodeKind = 'user' | 'answer' | 'progress' | 'step' | 'notice' | 'error';
+
 /** UI 层展示的一条消息 */
 export interface UiMessage {
   id: number;
   role: MsgRole;
+  /** 折叠后的节点类别；旧式 ctx.push 产物可缺省（渲染层按 role 兜底） */
+  kind?: NodeKind;
   text: string;
   /** 任务级标记：progress=过程叙述（暗显），final=最终答复（正常） */
   phase?: 'progress' | 'final';
-  /** 该答案气泡对应的「思考盒」轮次 id */
-  thinkingId?: number;
   /** 该气泡因用户中断而只生成了部分内容 */
   interrupted?: boolean;
   /** 消息发生时间（ISO 字符串），用于时间线展示 */
   ts?: string;
-  /** 前端唯一序号（服务端 id 跨 boot 会重复） */
-  localId?: number;
 }
 
 /** 内核注入 UI 的 props 契约（core/assemble.ts 负责装配） */
