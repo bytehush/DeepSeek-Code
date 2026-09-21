@@ -354,8 +354,12 @@ function print(scenario: Scenario, probe: ProbeAdapter, stopReason: string, pret
   }
 
   const sent = recs.reduce((a, r) => a + r.totalBytes, 0);
-  const uniq = last.totalBytes;
-  console.log(`\n累计送出 ${kb(sent)}，末步内容 ${kb(uniq)} —— 同一内容平均被重复投递 ${(sent / uniq).toFixed(1)} 次`);
+  // 分母必须用「峰值步」而不是「末步」：末步最小/最大都可能，③ 生效后末步会因为
+  // 降详而明显小于峰值步，用末步当分母会算出「重复投递 8.5 次」这种看上去变差、
+  // 其实只是分母缩了的假指标。峰值步 = 这份历史最多的一次，比值才有「平均送了几遍」的含义。
+  const peak = Math.max(...recs.map((r) => r.totalBytes));
+  console.log(`\n累计送出 ${kb(sent)}，峰值步 ${kb(peak)} —— 平均每份内容被重复投递 ${(sent / peak).toFixed(1)} 次`);
+  console.log(`（分母是峰值步，不是末步：③ 降详后末步会主动变小，用末步当分母会造出假指标）`);
   const reb = bytesOf(last, '历史:工具结果(可重跑)');
   const one = bytesOf(last, '历史:工具结果(一次性)');
   console.log(`末步工具结果：可重跑再生 ${kb(reb)}（${pct(reb, reb + one)}）/ 一次性事实不可再生 ${kb(one)}`);
