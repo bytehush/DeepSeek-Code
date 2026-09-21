@@ -183,12 +183,12 @@ export interface ContextManager {
 `core/tools`（read/write/edit/bash + **新增 search_files/glob** ——幽灵工具的正解是把提示词里
 真实需要的检索能力做出来）+ 权限移植 + trace 落盘 + **eval runner 重建**。
 
-验收（全部机器可判）：
-- [ ] `npm start` 全链路走自研内核，仓库无 `@earendil-works/*` import；
-- [ ] `npx tsc --noEmit` 零错误；`npm test` 通过（含 decide/isWithin/rollback/SSE 解析单测）;
-- [ ] `npx tsx eval/run-eval.ts --tier code` 可无密钥跑 code 档，产出 pass@k 基线；
-- [ ] `~/.dsa/outbound/` 出现逐调用记账，`/outbound` 可导出；
-- [ ] system prompt 中出现的工具名 ⊆ registry 注册名（自动化断言进 test/）。
+验收（全部机器可判）：**2026-09-21 全部达成**。
+- [x] `npm start` 全链路走自研内核，仓库无 `@earendil-works/*` import；
+- [x] `npx tsc --noEmit` 零错误；`npm test` 通过（94/94，含 decide/isWithin/rollback/SSE 解析/kernel e2e 单测）；
+- [x] `npx tsx eval/run-eval.ts --tier code` 可无密钥跑 code 档（15 case，pass@1 15/15 mock 轨迹基线）；
+- [x] 出站逐调用记账（`~/.dsa/outbound/`，先记账后发送）+ `/outbound` 导出——e2e 断言覆盖记账与 summarize 代码路径；
+- [x] system prompt 工具名 ⊆ registry（`test/kernel-e2e.test.ts`）+ eval 断言工具名 ⊆ registry（`test/eval-cases.test.ts` 静态扫描）。
 
 ### P1 — 上下文管理兑现承诺
 

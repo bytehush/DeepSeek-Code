@@ -3,23 +3,32 @@
 一个直连 DeepSeek 官方 API 的**终端编程 Agent**。用中文交互，在终端里完成
 「读代码 → 理解结构 → 改 / 建代码 → 跑命令验证」的闭环。
 
-适合：想在本地用 DeepSeek 模型做编程辅助、且希望交互与产出都是中文的开发者。
+定位：**一句话入口 + 强编排内核 + 全程可控 + 数据边界可见**。
+不要求你懂模型、选工作流——把复杂度留在内核里，把控制权留在你手里。
 
-> **当前形态：极简 CLI**。
-> 2026-08-26 的 `6ed6596` 做过一次「极简模式」重构，砍掉了 Web GUI、RAG 记忆层、
-> 技能系统、MCP、审查编排、Trace 等附加层，只保留 coding agent 本质。
-> 本文档描述的是重构后的实际状态。
+> **当前形态：自研内核（P0）**。
+> 2026-09 起内核全量重写（`7b626bd`），移除 `@earendil-works/pi-agent-core` / `pi-ai`
+> 等外部 Agent 运行时，ReAct 循环、SSE 流解析、工具注册表、权限矩阵、
+> 出站记账全部自研。设计决策与分期路线见
+> [`docs/重设计方案-编程Agent基座.md`](./docs/重设计方案-编程Agent基座.md)。
 
 ## 功能
 
-- **直连官方 API**：无中转、无代理，密钥只保存在本地。
+- **直连官方 API，密钥用户持有**：无中转、无代理；密钥只进请求头，
+  不进请求体、不进子进程环境变量、不写 `process.env`。
 - **全中文交互**：对话、代码注释均为中文。
-- **持久化 Agent**：基于 `@earendil-works/pi-agent-core`，跨轮累积上下文。
-- **4 个原子工具**：`read_file` / `write_file` / `edit_file` / `bash`，复杂能力由模型组合完成。
-- **权限三模式**：`explore`（只读）/ `ask`（需确认）/ `execute`（自动执行）。
+- **自研 ReAct 内核**：跨轮持久化上下文；失败即回灌、每步可中断、
+  防空转检测、所有退出路径打标签。
+- **6 个原子工具**：`read_file` / `write_file` / `edit_file` /
+  `list_files` / `search_files` / `bash`。系统提示里的工具清单**由注册表生成**，
+  结构上不存在「提示词有、实际没有」的幽灵工具。
+- **权限三模式 × 能力矩阵**：`explore`（只读）/ `ask`（需确认）/ `execute`，
+  叠加 read/write/exec/net × auto/confirm/block 四维裁决；破坏性命令无条件升级确认。
+- **出站可审计（差异化核心）**：每次模型调用**先记账后发送**——字节数、
+  请求体 SHA-256、每条消息的角色与体积、目的地，落盘 `~/.dsa/outbound/`，
+  `/outbound` 随时查看导出。记账在架构上不可绕过。
 - **Plan Mode**：先输出执行步骤，确认后再动手。
-- **源码目录保护**：agent 的工作区与自身源码目录分离，写操作禁止落到源码根。
-- **文件回滚**：`/rollback` 撤销最近的文件变更，按工作目录作用域隔离。
+- **源码目录保护 + 文件回滚**：写操作禁止落到源码根；`/rollback` 撤销最近变更。
 - **双模型档位**：`/model` 在 `flash`（快、省）与 `pro`（深度推理）间切换。
 
 ## 安装
@@ -48,6 +57,8 @@ DEEPSEEK_API_KEY=sk-你的密钥
 之后想更换，在 CLI 里用 `/set-key`。
 
 > `.env` 已被 `.gitignore` 排除，不会误提交。
+> 密钥仅显式传入模型中枢用于请求头；`bash` 工具启动的子进程环境会剥离
+> 一切 `*_API_KEY` / `*_TOKEN` / `*_SECRET` 类变量。
 
 在 [platform.deepseek.com](https://platform.deepseek.com) 获取 API Key。
 
@@ -85,6 +96,7 @@ agent 的文件工具与 bash 的工作根目录（workspace）优先级：
 | `/style human\|professional\|raw` | 切换答复风格 |
 | `/model flash\|pro` | 切换模型档位 |
 | `/rollback [n]` | 回退最近 n 次文件变更（默认 1，仅当前工作目录） |
+| `/outbound` | 查看出站数据留档摘要（内容摘要、体积、目的地） |
 | `/set-key` 或 `/login` | 更换 API Key |
 | `/clear` | 清空对话上下文 |
 | `/exit` 或 `/quit` | 退出 |
@@ -100,14 +112,17 @@ agent 的文件工具与 bash 的工作根目录（workspace）优先级：
 
 ## 工具
 
-只有 4 个原子工具。复杂能力（代码审查、依赖审计、项目结构分析等）由模型组合这 4 个工具完成。
+6 个原子工具，全部注册在 `src/core/tools/`。复杂能力（代码审查、依赖分析、
+项目结构理解等）由模型组合这 6 个工具完成，**不做未实现能力的承诺**。
 
-| 工具 | 说明 |
-|------|------|
-| `read_file` | 读取文件（支持 `offset` / `limit`） |
-| `write_file` | 写入 / 覆盖文件 |
-| `edit_file` | 字符串替换修改 |
-| `bash` | 执行 shell 命令，流式返回输出 |
+| 工具 | 说明 | 能力维度 | 风险级 |
+|------|------|----------|--------|
+| `read_file` | 读取文件（`offset`/`limit` 分段，二进制拒读） | read | 低 |
+| `write_file` | 创建 / 覆盖文件（写前自动快照，可 `/rollback`） | write | 中 |
+| `edit_file` | 字符串替换（要求唯一匹配；改前快照） | write | 中 |
+| `list_files` | 递归列目录（`.git`/`node_modules` 等结构性排除） | read | 低 |
+| `search_files` | 正则全文搜索（同上排除，命中上限 200） | read | 低 |
+| `bash` | 执行 shell 命令（流式输出、可中断、超时强杀、env 凭证剥离） | exec | 高 |
 
 路径相对工作区解析。写操作受源码目录保护约束（详见「工作区」一节）。
 
@@ -115,35 +130,44 @@ agent 的文件工具与 bash 的工作根目录（workspace）优先级：
 
 ```
 src/
+  core/        自研内核（本项目的心脏）
+    loop/        ReAct 循环（AgentKernel）、CoreEvent 事件契约、系统提示、输出风格
+    provider/    ModelHub 角色路由、OpenAI-compatible 适配器、SSE 解析、出站账本
+    tools/       工具注册表（单一事实源）+ 6 个原子工具
+    permission/  权限引擎（decide 三模式 + decide3 能力矩阵，纯函数）
+    trace/       事件流 JSONL 落盘（UI / trace / eval 共用一条流）
   cli/         CLI 交互层（TUI 入口、登录、Markdown 渲染、字符净化）
-  app/         内核装配、聊天主逻辑、viewport 计算、React 控制器
-  agent/       Agent 运行时（Pi 适配、原子工具、系统提示、输出风格）
+  app/         聊天主逻辑、viewport 计算、React 控制器（消费 CoreEvent）
   config/      工作区解析与保护、模型档位配置
-  auth/        凭证读写（scrypt 哈希）
-  permission/  三模式权限闸门
-  utils/       通用工具（日志、Markdown、文件回滚）
-test/          单元测试（node:test，零额外依赖，无需 API Key）
-eval/          评测用例定义与历史结果
-scripts/       排查 / 验证脚本（非构建产物）
-docs/          设计文档与 Bug 修复记录
+  auth/        凭证读写（0o600，密钥不入代码不入库）
+  utils/       通用工具（日志、Markdown、文件回滚栈）
+test/          单元与端到端测试（node:test，零额外依赖，无需 API Key）
+eval/          黄金用例 22 个 + 可运行的评测 runner（--tier code 无密钥）
+docs/          设计文档（重设计方案 ADR）与修复记录
 ```
 
 ## 开发
 
 ```bash
 npm run typecheck   # TypeScript strict 类型检查（覆盖 src/test/eval/scripts）
-npm test            # 单元测试（node:test，无需 API Key）
+npm test            # 单元 + e2e 测试（node:test，无需 API Key、无网络）
+npx tsx eval/run-eval.ts --tier code   # 无密钥评测基线（mock 理想轨迹驱动真实内核）
 ```
 
 - 类型检查开启 `strict`，无显式 `any`。
 - `npm test` 只跑不依赖外部服务的用例，可在无网络、无密钥环境下执行。
+- 内核端到端测试（`test/kernel-e2e.test.ts`）锁定核心不变式：事件契约、
+  失败回灌、权限拦截、出站记账不可绕过、密钥不从 env 读取。
 
 ## 安全说明
 
-- 密钥只保存在本地 `.env` 或 `~/.dsa/credentials.json`，均不入库。
-- 文件工具的写操作限制在工作区内，路径遍历会被拒绝。
-- 源码根作为受保护目录，agent 无法写入自身代码。
-- 凭证用 scrypt 加盐哈希存储，无明文。
+- 密钥只保存在本地 `.env` 或 `~/.dsa/credentials.json`（0o600），均不入库。
+- 密钥显式传参进模型中枢，**不写 `process.env`**；`bash` 子进程环境剥离凭证类变量。
+- 序列化函数签名拿不到密钥——密钥在结构上进不了请求体与账本。
+- 每次外发的字节数、SHA-256、消息构成、目的地逐条留档（`~/.dsa/outbound/`），
+  先记账后发送，不可绕过；`DSA_OUTBOUND_DEBUG=1` 可落完整明文请求体自查。
+- `.git`、密钥文件、构建产物被列举 / 搜索工具**结构性排除**，不存在可绕过的读取路径。
+- 文件工具写操作限制在工作区内，路径遍历与受保护目录写入会被拒绝。
 
 ## License
 
