@@ -1,16 +1,18 @@
 /**
- * System Prompt 生成器 —— 消灭「幽灵工具表」的机制所在。
+ * System Prompt 生成器 —— 只装「稳定文本」。
  *
- * 与重构前的本质区别：
- *   1. 工具段由 ToolRegistry 实时生成（registry.promptSection()），
- *      提示词中出现的工具名 ⊆ 注册名由构造保证；
+ * 三条不变式：
+ *   1. **不含工具清单**：工具描述的唯一来源是请求的 tools 字段（wireSpecs）。
+ *      旧版在此再列一份，代价是每步 1.0K 重复投递 + 两份文本各自漂移；
+ *      防幽灵工具靠的是 provider 只认 tools 字段里的名字，不是自然语言清单。
  *   2. 环境段运行时探测（旧版写死 win32，模型拿 dir 列 Linux 目录）；
  *   3. 不承诺任何未实现的能力（旧版承诺了不存在的压缩与 13 个不存在工具）。
+ *
+ * 逐桶字节与增长曲线：npm run context:audit
  *
  * 保留旧版验证过的准则：中文交流、工具优先、先规划后行动、
  * 必须验证、失败回灌、prompt injection 防御、诚实。
  */
-import type { ToolRegistry } from '../tools/registry.ts';
 
 export interface PromptEnv {
   workspace: string;
@@ -31,7 +33,7 @@ function osSection(): string {
   return '- 当前操作系统为 Linux。shell 命令使用 GNU 系 POSIX 写法。';
 }
 
-export function buildSystemPrompt(registry: ToolRegistry, env: PromptEnv): string {
+export function buildSystemPrompt(env: PromptEnv): string {
   const protectedLine =
     env.protectedRoots.length > 0
       ? `以下目录是 Agent 自身代码（只读保护），**禁止向其写入/修改/删除任何文件**，用户要求修改时明确拒绝：\n  ${env.protectedRoots.join('\n  ')}`
@@ -46,8 +48,7 @@ export function buildSystemPrompt(registry: ToolRegistry, env: PromptEnv): strin
 
 # 工作准则
 1. 语言：与用户交流一律使用简体中文。代码注释、提交信息、说明文档优先使用中文（除非用户项目明确使用英文）。
-2. 工具优先：需要了解项目内容或改变文件系统时，必须调用工具，不要凭记忆猜测文件内容或已有代码。
-${registry.promptSection()}
+2. 工具优先：需要了解项目内容或改变文件系统时，必须调用本次请求 tools 字段里列出的工具，不要凭记忆猜测文件内容或已有代码；tools 字段之外不存在任何工具，没有列出的能力一律不要假装拥有。
 3. 先规划后行动：复杂任务先用中文简述步骤计划，再逐步调用工具执行；每完成一步简要汇报进度（如「[步骤 2/5 已完成]」）。当用户明确要求「修改 / 加固 / 优化 / 重构」时，应把改动落地并验证，不要只读完文件就停下。
 4. 必须验证：修改代码后用 bash 运行构建/测试/lint 验证改动确实有效；工具失败时分析错误、自我纠正后重试，不要跳过验证直接声称完成——未验证的代码不是交付物。
 5. 安全边界（底线）：

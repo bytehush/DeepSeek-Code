@@ -163,23 +163,55 @@ test('密钥不从 process.env 读取：adapter 收的是 hub 配置里的显式
   }
 });
 
-test('system prompt 由注册表生成：工具段 ⊆ 注册名，无幽灵工具', async () => {
+test('工具单一事实源：wireSpecs 即全部，提示词不再复制第二份清单', async () => {
   const { kernel, mock, dir } = makeKernel([{ text: 'ok' }]);
   try {
     await collect(kernel.prompt('hi', { ...base, permission: 'execute' }));
-    const sys = mock.requests[0]!.system;
-    const mentioned = [...sys.matchAll(/`([a-z_]+)\(/g)].map((m) => m[1]!);
-    assert.ok(mentioned.length >= 6, '工具段应列出全部注册工具');
-    const registered = new Set(['read_file', 'write_file', 'edit_file', 'list_files', 'search_files', 'bash']);
-    for (const name of mentioned) {
-      assert.ok(registered.has(name), `提示词出现未注册工具: ${name}`);
+    const req = mock.requests[0]!;
+    const registered = ['read_file', 'write_file', 'edit_file', 'list_files', 'search_files', 'bash'];
+    // 硬约束：provider 只认 tools 字段里的名字，它必须与注册表逐项相等
+    assert.deepEqual(
+      (req.tools ?? []).map((t) => t.name).sort(),
+      [...registered].sort(),
+      'wireSpecs 必须与注册表完全一致（不多不少）',
+    );
+    // 每个工具都带 JSON Schema，描述只此一份
+    for (const t of req.tools ?? []) {
+      assert.ok(t.description.length > 0, `${t.name} 缺描述`);
+      assert.equal(typeof t.parameters, 'object', `${t.name} 缺参数 schema`);
     }
+    // 第二份清单已删除：提示词里不得再出现工具签名列表
+    assert.ok(!/可用工具（/.test(req.system), 'system 不得再复制工具清单');
+    // 但必须把「能力边界在 tools 字段」这件事告诉模型，否则删清单就是削弱约束
+    assert.match(req.system, /tools 字段/, 'system 须指向 tools 字段作为唯一工具来源');
     // 环境段跟随真实 OS（旧版写死 win32）
     assert.ok(
-      /当前操作系统为 (Linux|macOS|Windows)/.test(sys),
+      /当前操作系统为 (Linux|macOS|Windows)/.test(req.system),
       '环境段应为运行时探测结果',
     );
-    assert.ok(!/Windows（win32）/.test(sys), '不得再写死 win32');
+    assert.ok(!/Windows（win32）/.test(req.system), '不得再写死 win32');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('收尾轮撤掉工具时，提示词不得仍承诺有工具', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'f1', name: 'read_file', args: { path: 'm1.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f2', name: 'read_file', args: { path: 'm2.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f3', name: 'read_file', args: { path: 'm3.ts' } }] },
+    { text: '三次都失败，需要你确认路径' },
+  ]);
+  try {
+    await collect(kernel.prompt('读这些文件', { ...base, permission: 'execute' }));
+    const wrap = mock.requests[3]!;
+    assert.equal(wrap.tools, undefined, '收尾轮不提供工具');
+    // 一致性：无工具的请求里，模型不该被要求"必须调用 tools 字段里的工具"却看到空字段
+    assert.match(
+      wrap.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n'),
+      /不要再尝试任何操作/,
+      '收尾轮由一次性反馈明确交代「不要再操作」，与撤工具保持一致',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

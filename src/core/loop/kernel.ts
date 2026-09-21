@@ -191,7 +191,7 @@ export class AgentKernel {
       }
 
       // —— 组装本轮请求 ——
-      const system = buildSystemPrompt(this.deps.registry, {
+      const system = buildSystemPrompt({
         workspace: this.deps.cwd,
         protectedRoots: this.deps.protectedRoots,
         planMode: opts.planMode,

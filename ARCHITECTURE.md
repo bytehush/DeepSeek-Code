@@ -21,7 +21,7 @@
 │  provider/    ModelHub：角色路由（actor/critic/cheap）      │
 │               OpenAI-compatible 适配器 + 自研 SSE 解析      │
 │               OutboundLedger：先记账后发送，不可绕过        │
-│  tools/       ToolRegistry：注册表 = 提示词单一事实源       │
+│  tools/       ToolRegistry：wireSpecs = 工具描述唯一事实源  │
 │               6 个原子工具（read/write/edit/list/search/bash）│
 │  permission/  decide()（三模式）+ decide3()（能力矩阵）     │
 │  trace/       TraceSink：事件流 JSONL 落盘                  │
@@ -47,8 +47,9 @@
 ```
 用户输入
   → AgentKernel.prompt()                  (core/loop/kernel.ts)
-  → 每步现场重建 system prompt            (registry.promptSection() —— 提示词工具
-  │                                        清单由注册表生成，非手写)
+  → 每步现场重建 system prompt            (纯稳定文本：准则/环境/模式三段，
+  │                                        不含工具清单——工具唯一来源是 tools 字段)
+  → 拼装 messages：历史 + 本次临时 system  (内核一次性反馈消费即弃，不入历史)
   → ModelHub.stream('actor', req)         (core/provider/hub.ts)
   → adapter.serialize(req)  ——签名拿不到 apiKey
   → OutboundLedger.append() ——先记账（字节数/SHA-256/消息构成/目的地）
@@ -57,6 +58,9 @@
   → 工具调用：safeParse → decide3 权限裁决 → (ask 确认) → execute
   → 结果回灌模型，循环直到无工具调用 / 中断 / 防空转触发
   → 全程以 CoreEvent 流出：UI 渲染、trace 落盘、eval 记录共用这一条流
+
+上下文体积审计（谁占了多少、随步数怎么长）：npm run context:audit
+  探针挂在 adapter.serialize() —— hub 唯一外发路径上结构化还完整的最后一点
 ```
 
 ## 层间关键机制位置（Debug 时先查哪层）
@@ -67,9 +71,10 @@
 | 写入被拒绝 | `safeWritePath`（atomic.ts）+ `src/config/workspace.ts` protectedRoots |
 | 流式输出中断 / 乱码 | `src/core/provider/sse.ts`（有专门边界单测） |
 | 模型没收到某工具 | `src/core/tools/registry.ts`（注册表即事实源） |
-| 提示词与实际工具不符 | 不可能结构性发生——见 `registry.promptSection()` + e2e 断言 |
+| 提示词与实际工具不符 | 不可能结构性发生——工具描述只有 `registry.wireSpecs()` 一份 + e2e 断言 |
 | 出站数据核对 | `~/.dsa/outbound/*.jsonl` 或 CLI 内 `/outbound` |
 | 模型跑偏 / 重复 | `src/core/loop/system-prompt.ts` + kernel 防空转（REPEAT_LIMIT） |
+| 上下文过大 / 步数失控 | `npm run context:audit`（逐桶字节 + 增长曲线） |
 | 多轮上下文丢失 | `AgentKernel.messages`（跨轮持久化）+ `/clear` 语义 |
 | TUI 渲染错位 / 气泡异常 | `src/app/timeline.ts`（fold）+ `src/app/markdown-lines.ts`；复现法：拿 trace 事件重放 |
 | 重启后历史丢失 | `~/.dsa/sessions/<sha1(workspace)>.json` + `core/session/store.ts`（load 永不抛，损坏=新会话） |

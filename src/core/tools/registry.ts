@@ -77,17 +77,14 @@ export class ToolRegistry {
   }
 
   /**
-   * System Prompt 的工具段（唯一来源）。
-   * 参数摘要取 zod shape 的键名，避免在提示词里复制一份会漂移的签名。
+   * 工具的唯一对外描述就是 wireSpecs()：提示词里不再复制第二份清单。
+   *
+   * 曾有 promptSection() 在 system prompt 里再列一遍工具名与描述，代价是
+   * 每步 1.0K 重复投递，且它的描述与 wireSpecs 的 description 已是两份可各自
+   * 漂移的文本。防「幽灵工具」的硬约束本来就由 wireSpecs 承担 —— provider
+   * 只认 tools 字段里的名字，自然语言清单是软约束（模型可无视），删掉它
+   * 保证不降反升。回归断言见 test/kernel-e2e.test.ts。
    */
-  promptSection(): string {
-    const lines = this.list().map((t) => {
-      const shape = t.parameters instanceof z.ZodObject ? Object.keys(t.parameters.shape) : [];
-      const sig = shape.length > 0 ? `(${shape.join(', ')})` : '()';
-      return `- \`${t.name}${sig}\`：${t.description}`;
-    });
-    return ['可用工具（当前会话注册表实时生成，仅以下工具存在）：', ...lines].join('\n');
-  }
 }
 
 /** 从 zod schema 派生 JSON Schema（wire 用；保持窄依赖，不引第三方转换器） */
