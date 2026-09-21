@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decide } from '../src/permission/permission-system.ts';
+import { decide } from '../src/core/permission/engine.ts';
 
 test('decide: explore 仅放行 low 风险，其余拦截', () => {
   assert.equal(

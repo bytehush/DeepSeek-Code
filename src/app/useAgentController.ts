@@ -5,14 +5,14 @@
  * 权限确认、awaitUser…）抽成这个 React hook。ink 版的 app.tsx 只保留「终端专属」的东西
  * （光标、面板视图、useInput 按键映射、Banner），并通过本 hook 的返回值驱动渲染。
  *
- * 网页端不复用这个 hook（它跑在浏览器，没有 fs/process），而是用 Node 端的 AgentHost
- * 实现同一份 ChatContext —— 业务逻辑在 chat.ts，两边零重复。
+ * 自研内核（src/core）重写后，本 hook 是 ChatContext 的唯一 CLI 实现；
+ * 内核事件契约 CoreEvent 由 chat.ts 映射为 UI 副作用，二者解耦。
  */
 import { useCallback, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
-import type { PermissionMode } from '../agent/loop.ts';
-import type { OutputStyle } from '../agent/output-style.ts';
-import { loadStyle } from '../agent/output-style.ts';
+import type { PermissionMode } from '../core/permission/engine.ts';
+import type { OutputStyle } from '../core/loop/output-style.ts';
+import { loadStyle } from '../core/loop/output-style.ts';
 import { runChatTurn, type ChatContext } from './chat.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
 

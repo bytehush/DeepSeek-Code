@@ -1,0 +1,387 @@
+/**
+ * 内核端到端测试（无网络、无密钥）。
+ *
+ * 用 MockAdapter 注入 ModelHub，驱动 AgentKernel 走完
+ * 「模型请求工具 → 权限闸门 → 工具执行 → 结果回灌 → 最终答复」全链路，
+ * 锁定 P0 的核心不变式：
+ *   1. 事件契约：done 收尾、reactPhase 标签、tool_call/tool_result 成对；
+ *   2. 失败即回灌：工具 throw → 错误文本进 tool 消息，模型能自我纠正；
+ *   3. 权限：explore 拦写、ask 确认、destructive 强制确认、拒绝即回灌；
+ *   4. 出站记账：每次模型调用在 ledger 留一条可审计记录（不可绕过）；
+ *   5. 重复调用检测 → repeat_loop 退出；
+ *   6. 中断 → user_abort 退出且工具不执行。
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { ModelHub, type HubConfig, type ProviderAdapter, type ProviderStreamEvent, type StreamRequest } from '../src/core/provider/hub.ts';
+import { OutboundLedger } from '../src/core/provider/ledger.ts';
+import { ToolRegistry } from '../src/core/tools/registry.ts';
+import { createCoreTools } from '../src/core/tools/atomic.ts';
+import { AgentKernel, type KernelRunOptions } from '../src/core/loop/kernel.ts';
+import type { CoreEvent } from '../src/core/loop/events.ts';
+import type { Msg } from '../src/core/types.ts';
+
+/** 一次脚本化响应：文本 + 工具调用 */
+interface Scripted {
+  text?: string;
+  toolCalls?: Array<{ id: string; name: string; args: unknown }>;
+  reasoning?: string;
+  finishReason?: string;
+}
+
+class MockAdapter implements ProviderAdapter {
+  id = 'mock';
+  models = [{ id: 'mock-actor', label: 'Mock', contextWindow: 100_000, supportsThinking: false }];
+  /** 收到的请求（断言 system/messages/tools 用） */
+  readonly requests: Array<StreamRequest & { apiKey: string }> = [];
+  private cursor = 0;
+
+  constructor(private script: Scripted[]) {}
+
+  endpoint(): string {
+    return 'https://mock.local/v1/chat/completions';
+  }
+
+  serialize(req: StreamRequest): string {
+    return JSON.stringify({ model: req.modelId, messages: req.messages, tools: req.tools });
+  }
+
+  async *stream(req: StreamRequest, apiKey: string, _body: string): AsyncGenerator<ProviderStreamEvent> {
+    this.requests.push({ ...req, apiKey });
+    const step = this.script[this.cursor] ?? { text: '(脚本耗尽)' };
+    this.cursor++;
+    if (step.reasoning) yield { type: 'reasoning_delta', text: step.reasoning };
+    if (step.text) yield { type: 'text_delta', text: step.text };
+    yield {
+      type: 'message_end',
+      toolCalls: step.toolCalls ?? [],
+      finishReason: step.finishReason ?? (step.toolCalls ? 'tool_calls' : 'stop'),
+      usage: { inputTokens: 10, outputTokens: 5 },
+    };
+  }
+}
+
+function makeHub(script: Scripted[]): { hub: ModelHub; mock: MockAdapter; ledger: OutboundLedger } {
+  const dir = mkdtempSync(join(tmpdir(), 'dsa-ledger-'));
+  const ledger = new OutboundLedger({ dir });
+  const cfg: HubConfig = {
+    routing: {
+      actor: { provider: 'mock', model: 'mock-actor' },
+      critic: { provider: 'mock', model: 'mock-actor' },
+      cheap: { provider: 'mock', model: 'mock-actor' },
+    },
+    keys: { mock: 'test-key-never-from-env' },
+  };
+  const hub = new ModelHub(cfg, ledger);
+  const mock = new MockAdapter(script);
+  hub.register(mock);
+  return { hub, mock, ledger };
+}
+
+function makeKernel(
+  script: Scripted[],
+  opts?: { protectedRoots?: string[] },
+): { kernel: AgentKernel; mock: MockAdapter; ledger: OutboundLedger; hub: ModelHub; registry: ToolRegistry; dir: string } {
+  const { hub, mock, ledger } = makeHub(script);
+  const registry = new ToolRegistry();
+  for (const t of createCoreTools()) registry.register(t);
+  const dir = mkdtempSync(join(tmpdir(), 'dsa-ws-'));
+  const kernel = new AgentKernel({
+    hub,
+    registry,
+    cwd: dir,
+    protectedRoots: opts?.protectedRoots ?? [],
+    modelName: () => 'mock-actor',
+  });
+  return { kernel, mock, ledger, hub, registry, dir };
+}
+
+const base: Omit<KernelRunOptions, 'permission'> = {
+  planMode: false,
+};
+
+async function collect(
+  gen: AsyncGenerator<CoreEvent>,
+): Promise<CoreEvent[]> {
+  const out: CoreEvent[] = [];
+  for await (const ev of gen) out.push(ev);
+  return out;
+}
+
+test('全链路：工具调用 → 执行 → 回灌 → 最终答复，事件序列与契约一致', async () => {
+  const { kernel, mock, ledger, dir } = makeKernel([
+    { text: '我先看目录', toolCalls: [{ id: 't1', name: 'list_files', args: {} }] },
+    { text: '已完成，一切正常' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('列一下文件', { ...base, permission: 'execute' }));
+
+    // 事件形状
+    assert.equal(evs[0].type, 'assistant_text');
+    assert.equal(evs.find((e) => e.type === 'tool_call')?.toolName, 'list_files');
+    const result = evs.find((e) => e.type === 'tool_result');
+    assert.ok(result?.result, 'tool_result 应带结果文本');
+    assert.equal(evs.find((e) => e.type === 'assistant_text' && e.reactPhase === 'thought'), undefined);
+    const done = evs.at(-1)!;
+    assert.equal(done.type, 'done');
+    assert.equal(done.reason, 'model_stop');
+    assert.deepEqual(done.usage, { inputTokens: 20, outputTokens: 10 }, '两次调用用量累计');
+
+    // 工具真实执行：list_files 读了工作区
+    assert.ok(mock.requests[1], '第二轮带工具结果再问模型');
+    const toolMsg = mock.requests[1]!.messages.find((m) => m.role === 'tool')!;
+    assert.equal(toolMsg.toolCallId, 't1');
+    assert.match(toolMsg.content, /\[details\]|无输出|\.\//, '工具返回内容非空');
+
+    // 出站记账：两次调用两条记录，且含真实网络体字节数与哈希
+    const recs = ledger.read();
+    assert.equal(recs.length, 2);
+    assert.equal(recs[0]!.provider, 'mock');
+    assert.ok(recs[0]!.bytes > 100 && /^[0-9a-f]{64}$/.test(recs[0]!.payloadSha256!));
+    assert.equal(recs[0]!.endpoint, 'https://mock.local/v1/chat/completions');
+    assert.equal(recs[0]!.toolCount, 6, '六工具全量下发');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('密钥不从 process.env 读取：adapter 收的是 hub 配置里的显式 key', async () => {
+  const { kernel, mock, dir } = makeKernel([{ text: 'ok' }]);
+  process.env.DEEPSEEK_API_KEY = 'env-key-should-not-be-used';
+  try {
+    await collect(kernel.prompt('hi', { ...base, permission: 'execute' }));
+    assert.equal(mock.requests[0]!.apiKey, 'test-key-never-from-env');
+    assert.notEqual(mock.requests[0]!.apiKey, 'env-key-should-not-be-used');
+  } finally {
+    delete process.env.DEEPSEEK_API_KEY;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('system prompt 由注册表生成：工具段 ⊆ 注册名，无幽灵工具', async () => {
+  const { kernel, mock, dir } = makeKernel([{ text: 'ok' }]);
+  try {
+    await collect(kernel.prompt('hi', { ...base, permission: 'execute' }));
+    const sys = mock.requests[0]!.system;
+    const mentioned = [...sys.matchAll(/`([a-z_]+)\(/g)].map((m) => m[1]!);
+    assert.ok(mentioned.length >= 6, '工具段应列出全部注册工具');
+    const registered = new Set(['read_file', 'write_file', 'edit_file', 'list_files', 'search_files', 'bash']);
+    for (const name of mentioned) {
+      assert.ok(registered.has(name), `提示词出现未注册工具: ${name}`);
+    }
+    // 环境段跟随真实 OS（旧版写死 win32）
+    assert.ok(
+      /当前操作系统为 (Linux|macOS|Windows)/.test(sys),
+      '环境段应为运行时探测结果',
+    );
+    assert.ok(!/Windows（win32）/.test(sys), '不得再写死 win32');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('权限 explore：写工具被结构性拦截并把拒绝原因回灌模型', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'a.txt', content: 'x' } }] },
+    { text: '改为只说明' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('写个文件', { ...base, permission: 'explore' }));
+    assert.ok(evs.some((e) => e.type === 'permission' && e.granted === false));
+    const toolMsg = mock.requests[1]!.messages.find((m) => m.role === 'tool')!;
+    assert.match(toolMsg.content, /权限拦截|封锁/);
+    assert.equal(evs.at(-1)!.reason, 'model_stop');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('权限 ask：确认通过才执行；用户拒绝则拒绝原因回灌', async () => {
+  const script: Scripted[] = [
+    { text: '', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'a.txt', content: 'hi' } }] },
+    { text: '好' },
+  ];
+  const a = makeKernel(script);
+  try {
+    await collect(a.kernel.prompt('写文件', { ...base, permission: 'ask', ask: async () => true }));
+    const { existsSync } = await import('node:fs');
+    assert.ok(existsSync(join(a.dir, 'a.txt')), '确认后应真实写入');
+  } finally {
+    rmSync(a.dir, { recursive: true, force: true });
+  }
+
+  const script2: Scripted[] = [
+    { text: '', toolCalls: [{ id: 'w2', name: 'write_file', args: { path: 'b.txt', content: 'hi' } }] },
+    { text: '明白' },
+  ];
+  const b = makeKernel(script2);
+  try {
+    await collect(b.kernel.prompt('写文件', { ...base, permission: 'ask', ask: async () => false }));
+    const { existsSync } = await import('node:fs');
+    assert.ok(!existsSync(join(b.dir, 'b.txt')), '拒绝后不得写入');
+    const toolMsg = b.mock.requests[1]!.messages.find((m) => m.role === 'tool')!;
+    assert.match(toolMsg.content, /用户拒绝/);
+  } finally {
+    rmSync(b.dir, { recursive: true, force: true });
+  }
+});
+
+test('安全底线：execute 模式下破坏性命令仍强制确认', async () => {
+  const { kernel, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'b1', name: 'bash', args: { command: 'rm -rf /' } }] },
+    { text: '不执行' },
+  ]);
+  let asked = '';
+  try {
+    await collect(
+      kernel.prompt('删库', {
+        ...base,
+        permission: 'execute',
+        ask: async (p) => {
+          asked = p;
+          return false;
+        },
+      }),
+    );
+    assert.match(asked, /疑似破坏性操作/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('受保护目录：写自身源码根被拒（错误回灌，不崩溃）', async () => {
+  const srcRoot = mkdtempSync(join(tmpdir(), 'dsa-src-'));
+  const evilPath = join(srcRoot, 'evil.ts');
+  const { kernel, mock, dir } = makeKernel(
+    [
+      { text: '', toolCalls: [{ id: 'p1', name: 'write_file', args: { path: evilPath, content: 'x' } }] },
+      { text: '已改用工作区路径' },
+    ],
+    { protectedRoots: [srcRoot] },
+  );
+  try {
+    const evs = await collect(kernel.prompt('改一下你自己的代码', { ...base, permission: 'execute' }));
+    const toolMsg = mock.requests[1]!.messages.find((m) => m.role === 'tool')!;
+    assert.match(toolMsg.content, /受保护目录/);
+    assert.equal(evs.at(-1)!.reason, 'model_stop');
+    const { existsSync } = await import('node:fs');
+    assert.ok(!existsSync(evilPath), '受保护目录不得落盘');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(srcRoot, { recursive: true, force: true });
+  }
+});
+
+test('失败即回灌：工具抛错时错误文本作为 tool 结果给模型，循环继续', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'r1', name: 'read_file', args: { path: 'nope.ts' } }] },
+    { text: '文件不存在，我换个路径' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('读不存在的文件', { ...base, permission: 'execute' }));
+    const toolMsg = mock.requests[1]!.messages.find((m) => m.role === 'tool')!;
+    assert.match(toolMsg.content, /文件不存在/);
+    assert.equal(evs.at(-1)!.reason, 'model_stop');
+    assert.ok(!evs.some((e) => e.type === 'error'), '工具失败不是内核错误，是回灌内容');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('幻觉工具名：未注册工具不崩溃，回灌提示', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'x1', name: 'review_code', args: {} }] },
+    { text: '我没有这个工具' },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('审查代码', { ...base, permission: 'execute' }));
+    assert.match(mock.requests[1]!.messages.find((m) => m.role === 'tool')!.content, /不存在于注册表/);
+    assert.equal(evs.at(-1)!.type, 'done');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('参数校验：非法参数回灌校验错误，不执行工具', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'v1', name: 'read_file', args: { offset: -3 } }] },
+    { text: '改正' },
+  ]);
+  try {
+    await collect(kernel.prompt('读文件', { ...base, permission: 'execute' }));
+    assert.match(mock.requests[1]!.messages.find((m) => m.role === 'tool')!.content, /参数校验失败/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('空转防护：同工具同参数连续 3 次 → repeat_loop 退出', async () => {
+  const call = { id: 'l1', name: 'read_file', args: { path: 'loop.ts' } };
+  const { kernel, dir } = makeKernel([
+    { text: '', toolCalls: [call] },
+    { text: '', toolCalls: [{ ...call, id: 'l2' }] },
+    { text: '', toolCalls: [{ ...call, id: 'l3' }] },
+    { text: '', toolCalls: [{ ...call, id: 'l4' }] },
+  ]);
+  try {
+    const evs = await collect(kernel.prompt('读', { ...base, permission: 'execute' }));
+    assert.equal(evs.at(-1)!.reason, 'repeat_loop');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('中断：运行中 abort → user_abort 收尾；预算已 abort 则零外发', async () => {
+  // 场景 1：ask 挂起期间用户中断（write_file 在 ask 模式必过确认），返回 true 但信号已断
+  const ac = new AbortController();
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'i1', name: 'write_file', args: { path: 'x.txt', content: 'x' } }] },
+  ]);
+  try {
+    const evs = await collect(
+      kernel.prompt('写', {
+        ...base,
+        permission: 'ask',
+        signal: ac.signal,
+        ask: async () => {
+          ac.abort();
+          return true;
+        },
+      }),
+    );
+    assert.equal(evs.at(-1)!.reason, 'user_abort');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 场景 2：进入前信号已断 → 一次模型调用都不发出（每步可暂停的极端形态）
+  const ac2 = new AbortController();
+  ac2.abort();
+  const b = makeKernel([{ text: '不该被调用' }]);
+  try {
+    const evs = await collect(b.kernel.prompt('hi', { ...base, permission: 'execute', signal: ac2.signal }));
+    assert.equal(evs.at(-1)!.reason, 'user_abort');
+    assert.equal(b.mock.requests.length, 0, '已中断则零外发');
+  } finally {
+    rmSync(b.dir, { recursive: true, force: true });
+  }
+});
+
+test('clear()：内核消息列清空，下一轮不再带历史', async () => {
+  const { kernel, mock, dir } = makeKernel([{ text: '一' }, { text: '二' }]);
+  try {
+    await collect(kernel.prompt('第一问', { ...base, permission: 'execute' }));
+    assert.equal(kernel.history.length, 2);
+    kernel.clear();
+    assert.equal(kernel.history.length, 0);
+    await collect(kernel.prompt('第二问', { ...base, permission: 'execute' }));
+    const userMsgs = mock.requests[1]!.messages.filter((m) => (m as Msg).role === 'user');
+    assert.equal(userMsgs.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

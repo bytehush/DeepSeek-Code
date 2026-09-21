@@ -1,14 +1,14 @@
 /**
- * 框架无关的编排核心（极简模式）。
+ * 框架无关的编排核心（自研内核接线版，docs/重设计方案 D1）。
  *
- * 把「单次事实来源」的对话循环收敛为最小集：命令优先 / 调用 runAgent / 流式事件映射到 ctx。
- * 不再包含记忆、技能、Trace、多 Agent 会话、用量统计等附加层——那些在减法阶段已移除。
+ * 对话循环收敛为最小集：命令优先 / 调用 kernel.prompt / 流事件映射到 ctx。
+ * 事件契约 CoreEvent 与旧 AgentEvent 逐字段一致 → 映射逻辑零改动。
  */
-import { runAgent, type AgentEvent, type PermissionMode } from '../agent/loop.ts';
-import type { OutputStyle } from '../agent/output-style.ts';
-import { styleLabel, parseStyle, saveStyle } from '../agent/output-style.ts';
+import type { CoreEvent } from '../core/loop/events.ts';
+import type { PermissionMode } from '../core/permission/engine.ts';
+import type { OutputStyle } from '../core/loop/output-style.ts';
+import { styleLabel, parseStyle, saveStyle, styleInstruction } from '../core/loop/output-style.ts';
 import { getMode, setMode, parseMode, modeLabel } from '../config/model-mode.ts';
-import { getApiKeyTail } from './keyContext.ts';
 import { msgOf } from '../utils/logger.ts';
 import { rollbackManager } from '../utils/rollback.ts';
 import type { AppProps, MsgRole, UiMessage } from './types.ts';
@@ -77,6 +77,7 @@ const SHORTCUTS = [
   '  /clear                      清空对话上下文',
   '  /set-key 或 /login          更换 API Key（保存后下次启动生效）',
   '  /rollback [n]               回退最近 n 次文件变更（默认 1；仅当前工作目录）',
+  '  /outbound                     查看出站数据留档摘要（外传了什么、体积、目的地）',
   '  Ctrl+C                      中断当前思考 / 工具执行（退出请用 /exit）',
   '  /help 或 ?                  显示本面板',
   '  /exit 或 /quit              退出',
@@ -99,26 +100,22 @@ function friendlyErrorMessage(category: string | undefined, raw: string): string
     case 'server_unavailable':
       return '🔌 服务端暂时不可用（限流或服务过载）：请稍候片刻后重试；若持续出现，请检查 API Key 配额或网络连通性。';
     case 'auth': {
-      // 优先用启动时就捕获的 Key 末 4 位（assemble 在 Agent 构造前存入 keyContext），
-      // 避免：① pi-ai 把 process.env 改写成脱敏串（如 "****ined"）；② 服务商报文中被二次变形的尾号。
-      // 末 4 位不含完整 Key，安全可展示。
-      const captured = getApiKeyTail();
-      let tailText = '';
-      if (captured) {
-        tailText = `   当前使用的 Key 末尾 4 位：${captured}（来自本地配置，非完整 Key）`;
-      } else {
-        const tail = /api key:\s*\*+([0-9a-zA-Z]{4})/i.exec(raw);
-        if (tail) tailText = `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）`;
-      }
+      // 自研 provider 层不改写用户 env，报文里的尾号即服务商脱敏值，可信。
+      const tail = /api key:?\s*\*?([0-9a-zA-Z]{4})/i.exec(raw);
+      const tailText = tail
+        ? `   当前使用的 Key 末尾 4 位：${tail[1]}（已由服务商脱敏，非完整 Key）`
+        : '';
       return (
-        '🔑 API Key 无效或未授权（DeepSeek 返回 401 鉴权失败）\n' +
+        '🔑 API Key 无效或未授权（服务商返回 401 鉴权失败）\n' +
         '   修复方式（任选其一）：\n' +
         '     · 修改项目根 .env 的 DEEPSEEK_API_KEY，或编辑 ~/.dsa/credentials.json\n' +
         '     · 输入 /set-key 按提示填新 Key（下次启动生效）\n' +
-        '     · 确认该 Key 在 DeepSeek 后台处于「启用」状态且有可用额度\n' +
+        '     · 确认该 Key 在服务商后台处于「启用」状态且有可用额度\n' +
         tailText
       );
     }
+    case 'quota':
+      return '💰 账户余额/配额不足：请到服务商后台充值或检查配额后重试。';
     default:
       return `⚠️ 生成出错：${raw || '未知错误'}`;
   }
@@ -138,8 +135,9 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     return true;
   }
   if (text === '/clear') {
+    ctx.props.kernel.clear();
     ctx.setMessages([]);
-    ctx.push('system', '已清空对话上下文');
+    ctx.push('system', '已清空对话上下文（内核消息列同步清空）');
     return true;
   }
   if (text.startsWith('/mode')) {
@@ -207,6 +205,10 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
     else ctx.push('system', '更换 API Key 需在终端版执行 /set-key，或编辑 ~/.dsa/credentials.json');
     return true;
   }
+  if (text === '/outbound') {
+    ctx.push('system', ctx.props.ledger.summarize());
+    return true;
+  }
   if (text === '/rollback' || text.startsWith('/rollback ')) {
     const arg = text.split(/\s+/)[1];
     const steps = arg ? parseInt(arg, 10) : 1;
@@ -217,8 +219,8 @@ export async function handleSlashCommand(text: string, ctx: ChatContext): Promis
   return false;
 }
 
-/** 把 runAgent 的一个事件映射到 ctx 的 UI 副作用（TUI 实现方共用） */
-function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
+/** 把一个 CoreEvent 映射到 ctx 的 UI 副作用（TUI 实现方共用） */
+function applyCoreEvent(ev: CoreEvent, ctx: ChatContext): void {
   if (ev.type === 'assistant_text' && ev.text) {
     ctx.appendStreaming(ev.text, ev.reactPhase);
   } else if (ev.type === 'assistant_phase') {
@@ -227,15 +229,6 @@ function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
     ctx.prometeThinkingToFinal();
   } else if (ev.type === 'tool_call') {
     ctx.beginTool(ev.toolName ?? 'tool');
-    if ((ev.toolName ?? '') === 'use_skill') {
-      const argName = String((ev.args as { name?: unknown } | undefined)?.name ?? '').trim();
-      ctx.push(
-        'system',
-        argName
-          ? `📚 AI 已调用技能：${argName}（完整使用指引已加载，下一步将按其执行）`
-          : '📚 AI 已调用技能加载工具。',
-      );
-    }
   } else if (ev.type === 'tool_result') {
     ctx.push('tool', `[工具结果] ${String(ev.result ?? '')}`);
   } else if (ev.type === 'error') {
@@ -256,6 +249,7 @@ function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
         no_observable_progress: '⚠️ 连续多轮无实质进展，疑似空转，已提前结束',
         repeat_loop: '⚠️ 检测到重复/周期工具调用，疑似死循环，已提前结束',
         max_iterations: '⏱ 已达最大迭代轮数上限，已结束',
+        token_limit: '📏 token 超限或被截断（上下文压缩能力 P1 上线前的临时终态）',
       };
       ctx.push('system', stopLabels[ev.reason] ?? `⚠️ 停止原因: ${ev.reason}`);
     }
@@ -264,7 +258,7 @@ function applyRunAgentEvent(ev: AgentEvent, ctx: ChatContext): void {
 
 /**
  * 跑一轮对话（CLI 与后续 UI 实现共用）。
- * 负责：命令优先 / 调用 runAgent 循环 / 流式事件映射到 ctx。
+ * 负责：命令优先 / 调用内核循环 / 流式事件映射到 ctx。
  */
 export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> {
   const text = raw.trim();
@@ -286,20 +280,17 @@ export async function runChatTurn(raw: string, ctx: ChatContext): Promise<void> 
   taskStart = Date.now();
 
   try {
-    for await (const ev of runAgent(text, {
-      agent: ctx.props.agent,
-      models: ctx.props.models,
+    for await (const ev of ctx.props.kernel.prompt(text, {
       permission: ctx.getState().mode,
+      planMode: ctx.getState().planMode,
+      styleInstruction: styleInstruction(ctx.getState().outputStyle),
       signal: abortController.signal,
       ask: ctx.requestConfirm,
-      askText: ctx.requestAskText,
-      planMode: ctx.getState().planMode,
-      outputStyle: ctx.getState().outputStyle,
-      onToolProgress: (toolName: string, out: string) => {
-        if (toolName) ctx.appendTool(out);
+      onToolProgress: (_toolName: string, out: string) => {
+        ctx.appendTool(out);
       },
     })) {
-      applyRunAgentEvent(ev, ctx);
+      applyCoreEvent(ev, ctx);
     }
   } catch (e: unknown) {
     ctx.appendError(msgOf(e));

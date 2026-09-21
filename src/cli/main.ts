@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { startApp } from './app.tsx';
-import { assembleAppProps } from '../app/assemble.ts';
+import { assembleKernel } from '../core/assemble.ts';
 import { resolveCredentials, saveCredentials, loadStoredCredentials, maskKey, type Credentials } from './auth.ts';
 import { runLogin } from './login.tsx';
 import { resolveWorkspace, parseWorkspaceFlag } from '../config/workspace.ts';
@@ -67,8 +67,9 @@ async function main(): Promise<void> {
     console.log(`[auth] 使用已保存的 API Key（${maskKey(creds.apiKey)}）`);
   }
 
-  // 内核装配（与网页后端共用同一份 assembleAppProps）
-  const props = await assembleAppProps(creds as Credentials, {
+  // 内核装配（自研基座：ModelHub + ToolRegistry + AgentKernel + Ledger + Trace）
+  // 注意：API Key 显式传入内核，不再写 process.env（bash 子进程 env 亦做凭证剥离）
+  const props = await assembleKernel(creds as Credentials, {
     workspace: ws.workspace,
     protectedRoots: [ws.sourceRoot],
   });
