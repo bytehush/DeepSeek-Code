@@ -104,6 +104,18 @@ function detectCycle(sigs: string[]): boolean {
 export class AgentKernel {
   /** 持久化对话（跨轮累积）；system 不入列，每轮现场生成 */
   private messages: Msg[] = [];
+  /**
+   * 内核一次性反馈（截断改策略建议、无进展交代要求）。
+   *
+   * 它们只对被打断的那一步有效，却曾被 push 进 this.messages —— 于是第十轮、
+   * 甚至用户换话题之后，模型仍在每步读到「不要再尝试任何操作」这类指令。
+   * 那是正确性缺陷，不是容量问题：过期指令留在历史里会继续约束模型。
+   *
+   * 因此改住这里：装配下一步请求时取出并立即清空（消费即弃），
+   * 永不进入 this.messages —— 顺带也就结构性满足了「system 不入列」不变式，
+   * SessionStore 那侧的剥离逻辑从此只是防御性冗余。
+   */
+  private pendingSystem: string[] = [];
   private totalUsage: Usage = { inputTokens: 0, outputTokens: 0 };
   private aborted = false;
 
@@ -120,6 +132,7 @@ export class AgentKernel {
   /** 清空上下文（/clear） */
   clear(): void {
     this.messages = [];
+    this.pendingSystem = [];
   }
 
   /**
@@ -130,6 +143,8 @@ export class AgentKernel {
    */
   loadHistory(msgs: readonly Msg[]): void {
     this.messages = msgs.filter((m) => m.role !== 'system');
+    // 恢复的是历史，不是上一进程里未被消费的内核指令
+    this.pendingSystem = [];
   }
 
   /**
@@ -138,6 +153,9 @@ export class AgentKernel {
    */
   async *prompt(input: string, opts: KernelRunOptions): AsyncGenerator<CoreEvent> {
     this.aborted = false;
+    // 新回合开始：上一步攒下却未被消费的内核指令已过期（例如回合被中断），
+    // 让它随回合一起作废，而不是漏进下一次对话。
+    this.pendingSystem = [];
     this.deps.trace?.beginTurn(input);
     this.messages.push(userMsg(input));
 
@@ -260,7 +278,7 @@ export class AgentKernel {
         const advice = toolCalls.length > 0
           ? '你刚才要调用的工具因输出过长被截断了，参数不完整，**本次未执行**。请改策略：把大改动拆成多次小输出——先 write_file 写入骨架/最小可运行版本，再用 edit_file 分若干次补全；每次输出只包含一个文件的一部分，切勿一次性写完整个文件。'
           : '你的回复因长度上限被截断了。请把它拆成若干次较短的输出继续讲，或先给结论再给细节。';
-        this.messages.push({ role: 'system', content: `（系统提示：${advice}）` });
+        this.pendingSystem.push(`（系统提示：${advice}）`);
         yield this.emit({ type: 'system', text: `✂ 输出被截断，已要求分块续写（第 ${truncationRetry}/${TRUNCATION_RECOVERIES} 次）`, step });
         continue;
       }
@@ -330,10 +348,9 @@ export class AgentKernel {
         failStreak = outcome.failed ? failStreak + 1 : 0;
         if (failStreak >= NO_PROGRESS_LIMIT) {
           yield this.emit({ type: 'system', text: `连续 ${failStreak} 次工具执行失败，停止调用工具并汇总现状`, step });
-          this.messages.push({
-            role: 'system',
-            content: `（系统提示：已连续 ${failStreak} 次工具调用失败，本轮不再提供工具。请向用户如实说明：已经完成了什么、卡在哪一步、最后一次失败的具体错误，以及需要用户补充什么信息。用简体中文，不要再尝试任何操作。）`,
-          });
+          this.pendingSystem.push(
+            `（系统提示：已连续 ${failStreak} 次工具调用失败，本轮不再提供工具。请向用户如实说明：已经完成了什么、卡在哪一步、最后一次失败的具体错误，以及需要用户补充什么信息。用简体中文，不要再尝试任何操作。）`,
+          );
           forceNoTools = true;
           failStreak = 0;
         }
@@ -403,10 +420,20 @@ export class AgentKernel {
     };
   }
 
-  /** 发给模型的消息序列（追加风格指令为临时末条，不入持久列） */
+  /**
+   * 发给模型的消息序列。
+   *
+   * 末段依次拼上两类「不入历史」的临时 system：
+   *   - pendingSystem：上一步攒下的内核一次性反馈（取出即清空 = 消费即弃）
+   *   - styleInstruction：本轮的输出风格指令
+   * 两者都只活在这次请求里，返回后不留在 this.messages。
+   */
   private messagesForModel(opts: KernelRunOptions): Msg[] {
-    if (!opts.styleInstruction) return this.messages;
-    return [...this.messages, { role: 'system' as const, content: String(opts.styleInstruction) }];
+    const transient = this.pendingSystem.map((content) => ({ role: 'system' as const, content }));
+    this.pendingSystem = [];
+    if (opts.styleInstruction) transient.push({ role: 'system', content: String(opts.styleInstruction) });
+    if (transient.length === 0) return this.messages;
+    return [...this.messages, ...transient];
   }
 
   private emit(ev: CoreEvent): CoreEvent {

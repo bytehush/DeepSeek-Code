@@ -452,6 +452,74 @@ test('无进展：连续 3 次工具执行失败 → 停止供工具并交付现
   }
 });
 
+/**
+ * 内核一次性反馈：消费即弃，绝不进历史。
+ *
+ * 修复前的缺陷：截断建议 / 无进展交代被 push 进 this.messages，于是
+ * 后续每一步、甚至用户换话题后的下一个回合，模型仍在读「不要再尝试任何操作」。
+ * 那是正确性缺陷（过期指令持续约束模型），省那 0.3K 是次要的。
+ */
+test('一次性反馈进得了下一步请求，但绝不进历史', async () => {
+  const big = 'x'.repeat(200);
+  const { kernel, mock, dir } = makeKernel([
+    { text: '我来写', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'g.ts', content: big } }], finishReason: 'length' },
+    { text: '改为先写骨架', toolCalls: [{ id: 'w2', name: 'write_file', args: { path: 'g.ts', content: 'export const a = 1;' } }] },
+    { text: '完成' },
+  ]);
+  try {
+    await collect(kernel.prompt('设计一个五子棋', { ...base, permission: 'execute' }));
+    // 第 2 次请求必须带上截断改策略建议（否则「失败即回灌」又断了）
+    const second = mock.requests[1]!.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+    assert.match(second, /截断/, '建议必须送达下一步');
+    // 但它不属于历史：内核持久列里一条 system 都不能有
+    assert.ok(
+      kernel.history.every((m) => m.role !== 'system'),
+      '内核一次性反馈不得进入 this.messages',
+    );
+    // 第 3 次请求里该建议必须已消失（消费即弃，不是永久占位）
+    const third = mock.requests[2]!.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+    assert.ok(!/截断/.test(third), '过期建议不得继续投递给模型');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('换回合不再残留上一回合的内核指令', async () => {
+  const big = 'y'.repeat(200);
+  const { kernel, mock, dir } = makeKernel([
+    { text: '先写', toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'a.ts', content: big } }], finishReason: 'length' },
+    { text: '已改小' },
+    { text: '新话题的回答' },
+  ]);
+  try {
+    await collect(kernel.prompt('写个大文件', { ...base, permission: 'execute' }));
+    const before = mock.requests.length;
+    await collect(kernel.prompt('换个话题，这里有哪些文件', { ...base, permission: 'execute' }));
+    const fresh = mock.requests.slice(before);
+    const leaked = fresh.flatMap((r) => r.messages.filter((m) => m.role === 'system' && /系统提示/.test(m.content)));
+    assert.equal(leaked.length, 0, '新回合不得携带上一回合的一次性指令');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('无进展交代同样不入历史，且收尾轮确实收到它', async () => {
+  const { kernel, mock, dir } = makeKernel([
+    { text: '', toolCalls: [{ id: 'f1', name: 'read_file', args: { path: 'm1.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f2', name: 'read_file', args: { path: 'm2.ts' } }] },
+    { text: '', toolCalls: [{ id: 'f3', name: 'read_file', args: { path: 'm3.ts' } }] },
+    { text: '我三次都失败，需要你确认路径' },
+  ]);
+  try {
+    await collect(kernel.prompt('读这些文件', { ...base, permission: 'execute' }));
+    const last = mock.requests[3]!.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+    assert.match(last, /不要再尝试任何操作/, '交代要求必须送达收尾轮');
+    assert.ok(kernel.history.every((m) => m.role !== 'system'), '交代不得进历史');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('权限拒绝不算失败：用户说 no 是闸门正常工作，不得误判 no_progress', async () => {
   const { kernel, dir } = makeKernel([
     { text: '', toolCalls: [{ id: 'd1', name: 'write_file', args: { path: 'p1.txt', content: 'a' } }] },

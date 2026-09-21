@@ -10,7 +10,8 @@
     "start": "tsx src/cli/main.ts",
     "dev": "tsx watch src/cli/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx test/*.test.ts"
+    "test": "node --test --import tsx test/*.test.ts",
+    "context:audit": "tsx scripts/context-audit.ts"
   },
   "dependencies": {
     "chalk": "^5.3.0",
